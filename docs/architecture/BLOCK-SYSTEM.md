@@ -190,12 +190,25 @@ public class ParticleSystemBlock : ICudaBlock, IDisposable
 ### Kernel Operations
 
 ```csharp
-// Add a kernel from PTX
+// Source 1: Add a kernel from filesystem PTX
 KernelHandle AddKernel(string ptxPath, string entryPoint, string? debugName = null);
 
-// Add with explicit grid config
+// Source 1: Add with explicit grid config
 KernelHandle AddKernel(string ptxPath, string entryPoint, GridConfig grid, string? debugName = null);
+
+// Source 2: Add a kernel from NVRTC-compiled module (patchable kernel)
+KernelHandle AddKernel(CUmodule nvrtcModule, string entryPoint, string? debugName = null);
 ```
+
+### Captured Operations (Library Calls)
+
+```csharp
+// Source 3: Add a library operation via Stream Capture (cuBLAS, cuFFT, cuDNN)
+CapturedHandle AddCaptured(string name, Action<CUstream> captureAction,
+                           CapturedOpDescriptor descriptor);
+```
+
+See `KERNEL-SOURCES.md` for the full three-source architecture.
 
 ### Input Definitions
 

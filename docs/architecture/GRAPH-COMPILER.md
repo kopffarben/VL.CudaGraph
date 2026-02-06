@@ -18,6 +18,7 @@ CudaEngine.Update() detects structureDirty
     │  3. Topological Sort                 │
     │  4. Shape Propagation                │
     │  5. Liveness Analysis                │
+    │  5.5 Stream Capture (CapturedNodes)  │
     │  6. CUDA Graph Build                 │
     │  7. Instantiate                      │
     │                                      │
@@ -109,9 +110,25 @@ Timeline:
 Buffer_A live range: [t0, t2] → can be released after t2
 ```
 
+### Phase 5.5: Stream Capture (CapturedNodes only)
+
+For CapturedNode descriptors (library operations like cuBLAS, cuFFT), the compiler executes Stream Capture to produce child graphs:
+
+```
+For each CapturedNodeDescriptor:
+  cuStreamBeginCapture(stream, RELAXED)
+  descriptor.CaptureAction(stream)     // e.g. cublasSgemm(...)
+  cuStreamEndCapture(stream) → childGraph
+  Store childGraph for Phase 6
+```
+
+This phase only runs for CapturedNodes. KernelNodes (from filesystem PTX or NVRTC) skip this phase entirely. See `KERNEL-SOURCES.md` for the full CapturedNode design.
+
 ### Phase 6: CUDA Graph Build
 
-Constructs the actual CUDA Graph structure from topological order and dependencies.
+Constructs the actual CUDA Graph structure from topological order and dependencies:
+- **KernelNodes**: `cuGraphAddKernelNode` (standard path for both filesystem PTX and NVRTC-compiled kernels)
+- **CapturedNodes**: `cuGraphAddChildGraphNode` (using child graph from Phase 5.5)
 
 ### Phase 7: Instantiate
 
@@ -164,9 +181,12 @@ Regions enable control flow within the graph.
 
 ---
 
-## Update Levels (Hot / Warm / Cold)
+## Update Levels
 
 > See `EXECUTION-MODEL.md` for the full dirty-tracking design.
+> See `KERNEL-SOURCES.md` for the three kernel sources and two node types.
+
+### KernelNode Updates (Filesystem PTX & Patchable Kernels)
 
 | Change | Update Level |
 |--------|--------------|
@@ -175,10 +195,21 @@ Regions enable control flow within the graph.
 | Buffer rebind (same size) | **Warm** — `cuGraphExecKernelNodeSetParams` |
 | Buffer resize | **Warm** + Pool realloc |
 | Grid size changed | **Warm** — `cuGraphExecKernelNodeSetParams` |
+| Patchable kernel logic changed | **Code** — NVRTC recompile → new CUmodule → Cold rebuild of affected block |
 | Node added/removed | **Cold** — Full Rebuild |
 | Edge added/removed | **Cold** — Full Rebuild |
 | Region added/removed | **Cold** — Full Rebuild |
 | PTX changed (hot-reload) | **Cold** — Full Rebuild |
+
+### CapturedNode Updates (Library Operations)
+
+| Change | Update Level |
+|--------|--------------|
+| Scalar or pointer parameter changed | **Recapture** — Re-capture + `cuGraphExecChildGraphNodeSetParams` |
+| Scalar with DEVICE pointer mode* | **Warm** — Buffer write, avoids re-capture |
+| Node added/removed | **Cold** — Full Rebuild |
+
+*With `CUBLAS_POINTER_MODE_DEVICE`, scalar values live in GPU memory and can be updated via buffer writes.
 
 ---
 
@@ -188,11 +219,13 @@ When profiling is enabled, event nodes are inserted:
 
 ```
 With ProfilingLevel.PerKernel:
-  [Event: Start] → [Kernel1] → [Event: Stop]
-  [Event: Start] → [Kernel2] → [Event: Stop]
+  KernelNode:   [Event: Start] → [Kernel1] → [Event: Stop]     ← per-kernel timing
+  CapturedNode: [Event: Start] → [ChildGraph] → [Event: Stop]  ← per-block only (opaque)
 ```
 
 Timing data is collected by CudaEngine and distributed to blocks as DebugInfo.
+
+**CapturedNode profiling limitation:** Library operations in CapturedNodes run opaque internal kernels. Profiling can only measure the total time of the captured child graph, not individual internal kernels. PerKernel profiling degrades to PerBlock for CapturedNodes. See `KERNEL-SOURCES.md` for details.
 
 ---
 

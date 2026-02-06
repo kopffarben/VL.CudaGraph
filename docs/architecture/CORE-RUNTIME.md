@@ -27,7 +27,13 @@ CudaContext is a facade that composes several internal services. These services 
 │  │ ModuleCache   │  (PTX compilation cache)                  │
 │  └──────────────┘                                            │
 │  ┌──────────────┐                                            │
-│  │ DeviceContext │  (CUcontext, stream, device handles)      │
+│  │ NvrtcCache    │  (NVRTC compilation for patchable kernels) │
+│  └──────────────┘                                            │
+│  ┌──────────────────┐                                         │
+│  │LibraryHandleCache│  (cuBLAS/cuFFT handle cache)            │
+│  └──────────────────┘                                         │
+│  ┌──────────────┐                                            │
+│  │ DeviceContext │  (CUcontext, streams, device handles)     │
 │  └──────────────┘                                            │
 │                                                               │
 │  Public API:  DeviceId, Pool, ProfilingLevel                  │
@@ -59,6 +65,8 @@ public class CudaContext : IDisposable
         Device = new DeviceContext(options.DeviceId);
         Pool = new BufferPool(Device);
         Modules = new ModuleCache(Device);
+        Nvrtc = new NvrtcCache(Device);
+        LibHandles = new LibraryHandleCache(Device);
         Registry = new BlockRegistry();
         Topology = new ConnectionGraph();
         Dirty = new DirtyTracker();
@@ -91,10 +99,12 @@ BlockRegistry and ConnectionGraph both trigger structure-dirty independently. Wi
 |---------|---------------|
 | **BlockRegistry** | Block registration/unregistration, NodeContext storage for error routing |
 | **ConnectionGraph** | Topology tracking (edges between blocks), connection validation |
-| **DirtyTracker** | Three-tier dirty flags (structure, parameters, hot) |
+| **DirtyTracker** | Dirty flags per node type (KernelNode: Hot/Warm/Code/Cold; CapturedNode: Recapture/Cold) |
 | **BufferPool** | GPU memory allocation with power-of-2 bucketing |
 | **ModuleCache** | PTX loading, CUmodule caching, kernel descriptor storage |
-| **DeviceContext** | CUcontext, default stream, device properties |
+| **NvrtcCache** | NVRTC compilation cache for patchable kernels (CUDA C++ → PTX) |
+| **LibraryHandleCache** | Cached library handles (cublasHandle_t, cufftHandle, etc.) |
+| **DeviceContext** | CUcontext, default stream, capture stream, device properties |
 
 ### CUDA Context Constraint
 

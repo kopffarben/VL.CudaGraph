@@ -13,7 +13,9 @@ Phase 2: Execution Model & VL Integration
     ↓
 Phase 3: Advanced Features
     ↓
-Phase 4: Libraries & Interop
+Phase 4: Patchable Kernels & Libraries
+    ↓
+Phase 5: Graphics Interop
 ```
 
 ---
@@ -230,32 +232,87 @@ model.SaveToFile("system.json");
 
 ---
 
-## Phase 4: Libraries & Interop
+## Phase 4: Patchable Kernels & Libraries
 
-**Goal**: cuBLAS, cuFFT, DX11 sharing
+**Goal**: NVRTC patchable kernels, cuBLAS/cuFFT via CapturedNode, INodeDescriptor abstraction
+
+> Read `KERNEL-SOURCES.md` before implementing this phase.
 
 ### Tasks
 
 | Task | Description | Depends On |
 |------|-------------|------------|
-| 4.1 | Implement library handle management | - |
-| 4.2 | Implement cuFFT wrapper | 4.1 |
-| 4.3 | Implement cuBLAS wrapper | 4.1 |
-| 4.4 | Implement CaptureToGraph for libraries | 4.3 |
-| 4.5 | Implement DX11 interop | - |
-| 4.6 | Implement SharedBuffer<T> | 4.5 |
-| 4.7 | Implement SharedTexture | 4.5 |
-| 4.8 | VL.Stride integration tests | 4.7 |
+| 4.1 | Define INodeDescriptor, KernelNodeDescriptor, CapturedNodeDescriptor | - |
+| 4.2 | Implement NvrtcCache (CUDA C++ → PTX/cubin compilation caching) | - |
+| 4.3 | Implement AddKernel(CUmodule) overload in BlockBuilder | 4.1, 4.2 |
+| 4.4 | Implement patchable kernel codegen (node-set → CUDA C++) | 4.3 |
+| 4.5 | Implement StreamCaptureHelper | - |
+| 4.6 | Implement LibraryHandleCache | - |
+| 4.7 | Implement AddCaptured() in BlockBuilder | 4.1, 4.5, 4.6 |
+| 4.8 | Implement cuBLAS wrapper (Sgemm via Stream Capture) | 4.7 |
+| 4.9 | Implement cuFFT wrapper (via Stream Capture) | 4.7 |
+| 4.10 | Graph Compiler Phase 5.5 (Stream Capture for CapturedNodes) | 4.7 |
+| 4.11 | Dirty-Tracking: Add Recapture level for CapturedNodes | 4.10 |
+| 4.12 | Dirty-Tracking: Add Code level for NVRTC recompile | 4.4 |
+| 4.13 | CudaEngine.UpdateDirtyNodes() dispatch by node type | 4.11, 4.12 |
+| 4.14 | Patchable kernel + CapturedNode tests | 4.13 |
 
 ### Deliverables
 
 ```csharp
 // Should work:
+
+// Patchable kernel (NVRTC)
+string cudaSource = PatchableCodegen.Generate(nodeSet);
+var module = nvrtcCache.GetOrCompile(cudaSource, "user_kernel", sm75);
+var kernel = builder.AddKernel(module, "user_kernel");
+// Hot/Warm parameter updates work like filesystem PTX
+
+// Library operation (CapturedNode)
+var op = builder.AddCaptured("MatMul", stream =>
+{
+    cublasSetStream(handle, stream);
+    cublasSgemm(handle, ..., stream);
+}, descriptor);
+// Parameter changes trigger Recapture
+
 // cuFFT
 var fft = new FFTBlock(ctx);
 fft.Parameters["Size"].Value = 1024;
+```
 
-// DX11 interop
+### Test Cases
+
+1. NVRTC compile CUDA C++ string → CUmodule
+2. NvrtcCache deduplication (same source → cached module)
+3. Patchable kernel Hot/Warm update (same as filesystem PTX)
+4. Patchable kernel Code update (node-set change → recompile → Cold rebuild)
+5. Stream Capture → ChildGraphNode
+6. CapturedNode Recapture on parameter change
+7. cuBLAS Sgemm in CUDA Graph via CapturedNode
+8. cuFFT forward/inverse via CapturedNode
+9. Mixed graph: KernelNodes + CapturedNodes in same graph
+10. CUBLAS_POINTER_MODE_DEVICE scalar update avoids re-capture
+
+---
+
+## Phase 5: Graphics Interop
+
+**Goal**: DX11/Stride sharing
+
+### Tasks
+
+| Task | Description | Depends On |
+|------|-------------|------------|
+| 5.1 | Implement DX11 interop | - |
+| 5.2 | Implement SharedBuffer<T> | 5.1 |
+| 5.3 | Implement SharedTexture | 5.1 |
+| 5.4 | VL.Stride integration tests | 5.3 |
+
+### Deliverables
+
+```csharp
+// Should work:
 var shared = CudaDX11Interop.RegisterBuffer<Particle>(
     strideBuffer.NativePointer, ctx);
 shared.MapForCuda();
@@ -265,12 +322,9 @@ shared.UnmapFromCuda();
 
 ### Test Cases
 
-1. cuFFT forward/inverse
-2. cuBLAS GEMM
-3. Library in CUDA Graph (CaptureToGraph)
-4. DX11 buffer sharing
-5. DX11 texture sharing
-6. Full pipeline: CUDA compute → Stride render
+1. DX11 buffer sharing
+2. DX11 texture sharing
+3. Full pipeline: CUDA compute → Stride render
 
 ---
 

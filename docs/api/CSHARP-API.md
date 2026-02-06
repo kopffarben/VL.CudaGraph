@@ -58,6 +58,19 @@ VL.Cuda.Core
   │     ParamDirection
   │     PTXLoader
   │     ModuleCache
+  │     NvrtcCache
+  │     
+  ├── Captured
+  │     CapturedHandle
+  │     CapturedNodeDescriptor
+  │     CapturedOpDescriptor
+  │     StreamCaptureHelper
+  │     LibraryHandleCache
+  │     
+  ├── NodeDescriptors
+  │     INodeDescriptor
+  │     KernelNodeDescriptor
+  │     CapturedNodeDescriptor
   │     
   ├── Debug
   │     IDebugInfo
@@ -665,11 +678,19 @@ public class BlockBuilder
     // === Construction (takes block reference for registration) ===
     public BlockBuilder(CudaContext context, ICudaBlock block);
     
-    // === Kernels ===
+    // === Kernels (Source 1: Filesystem PTX) ===
     public KernelHandle AddKernel(string ptxPath, string entryPoint,
                                    string? debugName = null);
     public KernelHandle AddKernel(string ptxPath, string entryPoint,
                                    GridConfig grid, string? debugName = null);
+    
+    // === Kernels (Source 2: NVRTC Patchable Kernel) ===
+    public KernelHandle AddKernel(CUmodule nvrtcModule, string entryPoint,
+                                   string? debugName = null);
+    
+    // === Captured Operations (Source 3: Library Calls) ===
+    public CapturedHandle AddCaptured(string name, Action<CUstream> captureAction,
+                                       CapturedOpDescriptor descriptor);
     
     // === Buffer Inputs ===
     public InputHandle<GpuBuffer<T>> Input<T>(string name, KernelPin pin,
@@ -850,8 +871,19 @@ public class CompiledGraph : IDisposable
     /// </summary>
     public void UpdatePointer(Guid nodeId, int paramIndex, CUdeviceptr newPointer);
     
+    /// <summary>
+    /// Recapture Update: re-capture a CapturedNode's library call and update the child graph.
+    /// Used when CapturedNode parameters change.
+    /// </summary>
+    public void UpdateChildGraph(CapturedNodeDescriptor node, CUgraph newChildGraph);
+    
+    /// <summary>
+    /// Dispatches parameter updates by node type (Hot/Warm for KernelNodes, Recapture for CapturedNodes).
+    /// </summary>
+    public void UpdateKernelParams(KernelNodeDescriptor node);
+    
     public IReadOnlyList<Guid> KernelNodes { get; }
-    public IReadOnlyList<Guid> LibraryNodes { get; }
+    public IReadOnlyList<Guid> CapturedNodes { get; }
     public IReadOnlyDictionary<Guid, GpuBuffer> AllocatedBuffers { get; }
     
     public void Dispose();
@@ -1051,8 +1083,8 @@ public class RegionInfo
 ```csharp
 public enum NodeKind
 {
-    Kernel,
-    Library,
+    Kernel,          // KernelNode (filesystem PTX or NVRTC patchable)
+    CapturedOp,      // CapturedNode (library operation via Stream Capture)
     BufferCreate,
     ResetCount,
     Memset,

@@ -133,13 +133,27 @@ public class EmitterBlock : ICudaBlock
 
 ## Dirty-Tracking
 
-### Three Update Tiers
+### Update Tiers
+
+The system has two node types with different update capabilities. See `KERNEL-SOURCES.md` for the three kernel sources and two node types.
+
+**KernelNode** (filesystem PTX & patchable kernels):
 
 | Tier | Cost | Trigger | Action |
 |------|------|---------|--------|
 | **Hot Update** | Near-zero, no GPU stall | Scalar value changed (gravity, deltaTime) | `cuGraphExecKernelNodeSetParams` for scalar only |
 | **Warm Update** | Cheap, exec-level update | Buffer rebind (different pointer, same size), grid size change | `cuGraphExecKernelNodeSetParams` for pointer/grid |
+| **Code Update** | Medium | Patchable kernel logic changed | NVRTC recompile → new CUmodule → Cold rebuild of affected block |
 | **Cold Rebuild** | Expensive, full graph rebuild | Node added/removed, edge added/removed, PTX hot-reload, block structure changed | Destroy old graph, build new, instantiate |
+
+**CapturedNode** (library operations — cuBLAS, cuFFT, cuDNN):
+
+| Tier | Cost | Trigger | Action |
+|------|------|---------|--------|
+| **Recapture** | Medium | Any parameter changed (scalar or pointer) | Re-capture library call + `cuGraphExecChildGraphNodeSetParams` |
+| **Cold Rebuild** | Expensive, full graph rebuild | Node added/removed, structure changed | Destroy old graph, build new, instantiate |
+
+**Key difference:** KernelNodes support Hot/Warm parameter patching at near-zero cost. CapturedNodes require re-capture for any parameter change because library kernels are opaque. Exception: with `CUBLAS_POINTER_MODE_DEVICE`, scalar-only changes can avoid re-capture.
 
 ### Design Rationale
 
@@ -213,17 +227,18 @@ class CudaEngine
         // 1. Collect current parameter values from all blocks
         CollectParameters();
         
-        // 2. Rebuild or update
+        // 2. Rebuild or update (dispatched by node type)
         if (_cudaContext.IsStructureDirty)
         {
-            ColdRebuild();
-            // Rebuild includes all current parameters,
-            // so parameter dirty flag is also cleared
+            ColdRebuild();  // Full rebuild — both KernelNodes and CapturedNodes
             _cudaContext.ClearStructureDirty();
         }
         else if (_cudaContext.AreParametersDirty)
         {
-            WarmUpdate();
+            // Dispatch update by node type:
+            // - KernelNode params → Hot/Warm (cuGraphExecKernelNodeSetParams)
+            // - CapturedNode params → Recapture (re-capture + cuGraphExecChildGraphNodeSetParams)
+            UpdateDirtyNodes();
             _cudaContext.ClearParametersDirty();
         }
         
@@ -235,6 +250,25 @@ class CudaEngine
         
         // 5. Report diagnostics to VL
         ReportDiagnostics();
+    }
+    
+    private void UpdateDirtyNodes()
+    {
+        foreach (var dirtyNode in _cudaContext.Dirty.GetDirtyNodes())
+        {
+            if (dirtyNode is KernelNodeDescriptor kernelNode)
+            {
+                // Hot/Warm: cuGraphExecKernelNodeSetParams — near-zero cost
+                _compiledGraph.UpdateKernelParams(kernelNode);
+            }
+            else if (dirtyNode is CapturedNodeDescriptor capturedNode)
+            {
+                // Recapture: re-run stream capture + cuGraphExecChildGraphNodeSetParams
+                var childGraph = StreamCaptureHelper.CaptureToGraph(
+                    _cudaContext.Device.CaptureStream, capturedNode.CaptureAction);
+                _compiledGraph.UpdateChildGraph(capturedNode, childGraph);
+            }
+        }
     }
 }
 ```

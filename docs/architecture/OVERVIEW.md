@@ -26,14 +26,14 @@
 │  │  │ Execution Model                                          ││   │
 │  │  │                                                          ││   │
 │  │  │ CudaEngine (active)  ←→  Blocks (passive)               ││   │
-│  │  │ Dirty-Tracking: Hot / Warm / Cold                        ││   │
+│  │  │ Dirty-Tracking: Hot/Warm/Code/Cold + Recapture           ││   │
 │  │  │ See: EXECUTION-MODEL.md                                  ││   │
 │  │  └──────────────────────────────────────────────────────────┘│   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │  ┌────────────────────────┐  ┌────────────────────────────────────┐ │
-│  │   VL.Cuda.Stride       │  │   VL.Cuda.Libraries (later)        │ │
-│  │   (Graphics Interop)   │  │   (cuFFT, cuBLAS, cuRAND, NPP)     │ │
+│  │   VL.Cuda.Stride       │  │   VL.Cuda.Libraries (Phase 4)        │ │
+│  │   (Graphics Interop)   │  │   cuBLAS/cuFFT/cuDNN → CapturedNode│ │
 │  └────────────────────────┘  └────────────────────────────────────┘ │
 └─────────────────────────────────────────────────────────────────────┘
                                     │
@@ -95,7 +95,11 @@ VL.Cuda uses a centralized execution model with three actors:
 |-------|------|---------|--------|
 | **Hot** | ~0 | Scalar value changed | `cuGraphExecKernelNodeSetParams` |
 | **Warm** | Cheap | Buffer pointer changed, grid size changed | `cuGraphExecKernelNodeSetParams` |
+| **Code** | Medium | NVRTC recompile (patchable kernel) | New CUmodule → Cold rebuild of affected block |
 | **Cold** | Expensive | Node/edge added/removed, Hot-Swap, PTX reload | Full `cuGraphInstantiate` |
+| **Recapture** | Medium | CapturedNode parameter changed | Re-capture + `cuGraphExecChildGraphNodeSetParams` |
+
+Hot/Warm/Code/Cold apply to **KernelNodes** (filesystem PTX and patchable kernels). Recapture/Cold apply to **CapturedNodes** (library operations). See `KERNEL-SOURCES.md` for details.
 
 Cold rebuilds happen during development (user editing the VL patch). In an exported application, the graph structure is typically stable and only Hot/Warm updates occur.
 
@@ -103,32 +107,35 @@ Cold rebuilds happen during development (user editing the VL patch). In an expor
 
 ## Data Flow
 
+The system has three kernel sources that feed into the graph. See `KERNEL-SOURCES.md` for the full design.
+
 ```
-Build-Time (any toolchain):
+Source 1 — Filesystem PTX (build-time, any toolchain):
 
-    Kernel Source
-    (.py / .cu / .ptx)         Triton, nvcc, Numba, hand-written, ...
-           │
-           ▼
-    Compile to PTX
-           │
-           ▼
-    ┌─────────────┐
-    │    .ptx     │  +  kernel_name.json (metadata)
-    └─────────────┘
+    Kernel Source (.py / .cu / .ptx)  →  Compile  →  .ptx + .json
 
+Source 2 — Patchable Kernels (runtime, NVRTC):
 
+    VL Node-Set  →  Codegen (CUDA C++)  →  NVRTC compile  →  PTX bytes
+
+Source 3 — Library Operations (runtime, Stream Capture):
+
+    cuBLAS/cuFFT/cuDNN call  →  Stream Capture  →  ChildGraphNode
+```
+
+```
 Runtime (C#/VL):
 
-    PTX + JSON Files
-           │
-           ▼
-    ┌─────────────────┐
-    │   PTX Loader    │
-    │   ModuleCache   │
-    └────────┬────────┘
-             │
-             ▼
+    Source 1: PTX + JSON Files    Source 2: CUDA C++ string
+           │                              │
+           ▼                              ▼
+    ┌─────────────────┐       ┌─────────────────┐
+    │   PTX Loader    │       │   NvrtcCache     │
+    │   ModuleCache   │       │   NVRTC Compile  │
+    └────────┬────────┘       └────────┬────────┘
+             │                       │
+             └───────┬───────────┘
+                     ▼
     ┌─────────────────┐       ┌─────────────────┐
     │   ICudaBlock    │──────▶│   BlockBuilder  │
     │   (passive)     │       │   (Setup)       │
@@ -278,7 +285,8 @@ The CudaEngine is the only active component. This ensures:
 VL.Cuda.Core
     │
     ├── ManagedCuda (NuGet)
-    │   └── CUDA Driver API
+    │   ├── CUDA Driver API
+    │   └── NVRTC (Runtime Compilation, for patchable kernels)
     │
     └── VL.Core
         ├── NodeContext (identity, first ctor parameter by VL convention)
@@ -288,15 +296,15 @@ VL.Cuda.Core
         ├── IResourceProvider<T> (Stride interop boundary only)
         └── PinGroups, TypeRegistry
 
-VL.Cuda.Libraries (optional)
+VL.Cuda.Libraries (optional, for CapturedNode library operations)
     │
     ├── VL.Cuda.Core
     │
     └── ManagedCuda libraries
-        ├── ManagedCuda.CUBLAS
-        ├── ManagedCuda.CUFFT
-        ├── ManagedCuda.CURAND
-        └── ManagedCuda.NPP
+        ├── ManagedCuda.CUBLAS   (Stream Capture → CapturedNode)
+        ├── ManagedCuda.CUFFT    (Stream Capture → CapturedNode)
+        ├── ManagedCuda.CURAND   (Stream Capture → CapturedNode)
+        └── ManagedCuda.NPP      (Stream Capture → CapturedNode)
 
 VL.Cuda.Stride (optional)
     │
@@ -318,7 +326,9 @@ VL.Cuda.Stride (optional)
 | `BufferPool.cs` | Memory pooling with power-of-2 buckets |
 | `GraphCompiler.cs` | Converts description to CUDA Graph |
 | `PTXLoader.cs` | Parses PTX, extracts kernel info |
-| `BlockBuilder.cs` | DSL for block construction |
+| `NvrtcCache.cs` | NVRTC compilation cache for patchable kernels |
+| `StreamCaptureHelper.cs` | Stream Capture wrapper for library operations |
+| `BlockBuilder.cs` | DSL for block construction (AddKernel + AddCaptured) |
 
 ## CUDA Requirements
 
