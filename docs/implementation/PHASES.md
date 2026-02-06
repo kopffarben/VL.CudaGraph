@@ -378,7 +378,7 @@ VL.Cuda.Benchmarks/
 **Total**: ~17 weeks for full implementation
 
 Parallel work possible:
-- PTX tooling (Python/Triton) can be developed alongside
+- PTX tooling and example kernels (Triton, nvcc, etc.) can be developed alongside
 - Documentation can be refined throughout
 - DX11 interop can start during Phase 2
 

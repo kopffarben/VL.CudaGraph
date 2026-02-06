@@ -104,15 +104,16 @@ Cold rebuilds happen during development (user editing the VL patch). In an expor
 ## Data Flow
 
 ```
-Build-Time (Python/Triton):
+Build-Time (any toolchain):
 
-    Triton Kernel (.py)
+    Kernel Source
+    (.py / .cu / .ptx)         Triton, nvcc, Numba, hand-written, ...
            │
            ▼
-    triton.compile()
+    Compile to PTX
            │
            ▼
-    ┌──────┴──────┐
+    ┌─────────────┐
     │    .ptx     │  +  kernel_name.json (metadata)
     └─────────────┘
 

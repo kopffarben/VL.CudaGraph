@@ -2,7 +2,7 @@
 
 ## Project Overview
 
-VL.Cuda brings GPU-accelerated computing to vvvv gamma through NVIDIA's CUDA Graph API. The system allows visual programmers to build and execute GPU compute pipelines using a node-based interface, with kernels authored in Triton (Python) and compiled to PTX.
+VL.Cuda brings GPU-accelerated computing to vvvv gamma through NVIDIA's CUDA Graph API. The system allows visual programmers to build and execute GPU compute pipelines using a node-based interface. Kernels are consumed as PTX + JSON metadata — the runtime is agnostic to how PTX is produced.
 
 ### Core Philosophy
 
@@ -17,12 +17,17 @@ Passive blocks — blocks describe work, they don't execute it
 ### Technology Stack
 
 ```
-Triton (Python)     → PTX generation (compile-time)
-PTX + JSON          → Kernel metadata + entry points
+PTX + JSON          → Kernel binary + metadata (runtime input)
 ManagedCuda         → .NET CUDA bindings
 VL.Cuda.Core        → Graph compiler, buffer pool, blocks
 VL.Stride           → Graphics interop (DX11)
 ```
+
+PTX can be produced by any toolchain:
+- **Triton** (Python) — recommended for rapid prototyping, auto-tuning
+- **CUDA C/C++** (nvcc) — full control, industry standard
+- **Hand-written PTX** — maximum control, niche use
+- **Numba** (Python) — lightweight Python → PTX path
 
 ## Quick Start for Implementation
 
@@ -61,7 +66,7 @@ docs/
     GRAPH-COMPILER.md                  ← Graph building & execution
     VL-INTEGRATION.md                  ← VL-specific patterns
     BLOCK-SYSTEM.md                    ← ICudaBlock, composition
-    PTX-LOADER.md                      ← PTX parsing, Triton workflow
+    PTX-LOADER.md                      ← PTX parsing, kernel loading
     GRAPHICS-INTEROP.md                ← DX11/Stride integration
   api/
     CSHARP-API.md                      ← Complete C# API reference
@@ -82,7 +87,7 @@ src/
 | Passive blocks (no GPU work) | Blocks are descriptions; Engine does all GPU work |
 | Three-level dirty tracking | Hot/Warm/Cold updates minimize rebuild cost |
 | Handle-flow through VL links | Visual dataflow, no invisible mutations |
-| PTX from Triton | High-level kernel authoring, automatic optimization |
+| PTX-agnostic runtime | Consumes PTX + JSON; source toolchain is user's choice |
 | Composition (not inheritance) | VL doesn't support inheritance well |
 | Buffer pool with power-of-2 | Fast allocation, predictable memory |
 | JSON alongside PTX | Human-readable metadata, editable without recompile |
@@ -158,7 +163,7 @@ ResourceProvider, IVLRuntime, etc.) and ManagedCuda APIs actually work.
 ## File Conventions
 
 ```
-*.ptx       — Compiled CUDA kernels (from Triton)
+*.ptx       — Compiled CUDA kernels (from Triton, nvcc, or any PTX source)
 *.json      — Kernel metadata (beside PTX, same name)
 *.vl        — VL patches using VL.Cuda
 ```
