@@ -1,0 +1,56 @@
+//
+// vector_add: C[i] = A[i] + B[i]
+// Hand-written PTX for Phase 0 testing. SM 7.5+, 64-bit addressing.
+//
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry vector_add(
+    .param .u64 param_A,
+    .param .u64 param_B,
+    .param .u64 param_C,
+    .param .u32 param_N
+)
+{
+    .reg .pred  %p<2>;
+    .reg .f32   %f<4>;
+    .reg .b32   %r<4>;
+    .reg .b64   %rd<8>;
+
+    // tid = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %r0, %tid.x;
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mad.lo.s32      %r0, %r1, %r2, %r0;
+
+    // bounds check: if (tid >= N) return
+    ld.param.u32    %r3, [param_N];
+    setp.ge.u32     %p1, %r0, %r3;
+    @%p1 bra        EXIT;
+
+    // offset = tid * 4 (sizeof float)
+    cvt.u64.u32     %rd0, %r0;
+    shl.b64         %rd0, %rd0, 2;
+
+    // load A[tid]
+    ld.param.u64    %rd1, [param_A];
+    add.u64         %rd1, %rd1, %rd0;
+    ld.global.f32   %f1, [%rd1];
+
+    // load B[tid]
+    ld.param.u64    %rd2, [param_B];
+    add.u64         %rd2, %rd2, %rd0;
+    ld.global.f32   %f2, [%rd2];
+
+    // C[tid] = A[tid] + B[tid]
+    add.f32         %f3, %f1, %f2;
+
+    // store C[tid]
+    ld.param.u64    %rd3, [param_C];
+    add.u64         %rd3, %rd3, %rd0;
+    st.global.f32   [%rd3], %f3;
+
+EXIT:
+    ret;
+}
