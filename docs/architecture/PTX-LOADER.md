@@ -2,7 +2,7 @@
 
 ## Overview
 
-The PTX Loader handles loading, parsing, and caching CUDA kernels from PTX files. It works with accompanying JSON files that provide human-readable metadata.
+The PTX Loader handles loading, parsing, and caching CUDA kernels from PTX files. It works with accompanying JSON files that provide human-readable metadata. This covers **Source 1 (Filesystem PTX)** of the three kernel sources — see `KERNEL-SOURCES.md` for the full picture including NVRTC Patchable Kernels (Source 2) and Library Operations via Stream Capture (Source 3).
 
 **The runtime is agnostic to how PTX is produced.** Any toolchain that outputs valid PTX works:
 - **Triton** (Python) — recommended for rapid prototyping, auto-tuning

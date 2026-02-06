@@ -19,7 +19,7 @@ Passive blocks — blocks describe work, they don't execute it
 ```
 PTX + JSON          → Kernel binary + metadata (runtime input)
 NVRTC               → Runtime CUDA C++ compilation (patchable kernels)
-Stream Capture      → Library operation integration (cuBLAS, cuFFT, cuDNN)
+Stream Capture      → Library Call integration (cuBLAS, cuFFT, cuDNN)
 ManagedCuda         → .NET CUDA bindings (includes NVRTC module)
 VL.Cuda.Core        → Graph compiler, buffer pool, blocks
 VL.Stride           → Graphics interop (DX11)
@@ -34,7 +34,7 @@ The system supports three kernel sources that map to two CUDA Graph node types:
                                                    ├→ KernelNode (Hot/Warm/Code/Cold)
 2. Patchable Kernel (VL Node-Set → NVRTC codegen) ─┘
 
-3. Library Operation (cuBLAS, cuFFT, cuDNN)        → CapturedNode (Recapture/Cold)
+3. Library Call (cuBLAS, cuFFT, cuDNN)              → CapturedNode (Recapture/Cold)
 ```
 
 See `docs/architecture/KERNEL-SOURCES.md` for the full design.
@@ -109,10 +109,10 @@ src/
 | CUDA Graph API (not streams) | Reduced launch overhead, graph-level optimization |
 | Centralized execution (CudaEngine) | CUDA Graph is atomic — must compile and launch as one unit |
 | Passive blocks (no GPU work) | Blocks are descriptions; Engine does all GPU work |
-| Four-level dirty tracking | Hot/Warm/Code/Cold for KernelNodes; Recapture/Cold for CapturedNodes |
+| Four-level dirty tracking | Hot Update/Warm Update/Code Rebuild/Cold Rebuild for KernelNodes; Recapture/Cold Rebuild for CapturedNodes |
 | Handle-flow through VL links | Visual dataflow, no invisible mutations |
 | PTX-agnostic runtime | Consumes PTX + JSON; source toolchain is user's choice |
-| Three kernel sources, two node types | Filesystem PTX + NVRTC → KernelNode; Libraries → CapturedNode |
+| Three kernel sources, two node types | Filesystem PTX + Patchable Kernel → KernelNode; Library Calls → CapturedNode |
 | NVRTC for patchable kernels | Runtime CUDA C++ compilation from visual node-set |
 | Composition (not inheritance) | VL doesn't support inheritance well |
 | Buffer pool with power-of-2 | Fast allocation, predictable memory |
@@ -149,8 +149,8 @@ Update Levels (KernelNode — Filesystem PTX & Patchable Kernels):
     Code   (NVRTC recompile)        → New CUmodule → Cold rebuild of affected block
     Cold   (structure changed)      → Full graph rebuild, expensive but OK during development
 
-Update Levels (CapturedNode — Library Operations):
-    Recapture (param changed)       → Re-capture + cuGraphExecChildGraphNodeSetParams, medium
+Update Levels (CapturedNode — Library Calls):
+    Recapture (param changed)       → Recapture + cuGraphExecChildGraphNodeSetParams, medium
     Cold      (structure changed)   → Full graph rebuild
 
 Diagnostics:
@@ -164,8 +164,8 @@ Diagnostics:
 ManagedCuda          — CUDA driver API bindings (includes NVRTC module)
 VL.Core              — NodeContext, IVLRuntime, AppHost, ResourceProvider, PinGroups
 VL.Stride (optional) — Graphics interop (ResourceProvider boundary)
-ManagedCuda.CUBLAS   — cuBLAS bindings (optional, for CapturedNode library ops)
-ManagedCuda.CUFFT    — cuFFT bindings (optional, for CapturedNode library ops)
+ManagedCuda.CUBLAS   — cuBLAS bindings (optional, for Library Calls via CapturedNode)
+ManagedCuda.CUFFT    — cuFFT bindings (optional, for Library Calls via CapturedNode)
 ```
 
 ## Reference Submodules (READ-ONLY)
@@ -213,5 +213,10 @@ Key test areas:
 - Graph compilation validation
 - Buffer pool allocation/release
 - Type compatibility checking
-- Dirty-tracking correctness
+- Dirty-tracking correctness (Hot/Warm/Code/Cold + Recapture)
 - Cold rebuild / warm update paths
+- NVRTC compilation and caching (patchable kernels)
+- Stream Capture → CapturedNode lifecycle
+- Recapture for CapturedNode parameter changes
+- Mixed graph execution (KernelNodes + CapturedNodes)
+- cuBLAS/cuFFT integration via CapturedNode

@@ -208,6 +208,24 @@ CapturedHandle AddCaptured(string name, Action<CUstream> captureAction,
                            CapturedOpDescriptor descriptor);
 ```
 
+CapturedNodes define their I/O via the `CapturedOpDescriptor` rather than `KernelPin` references. The BlockBuilder maps descriptor entries to standard BlockPorts:
+
+```csharp
+var op = builder.AddCaptured("MatMul", captureAction, new CapturedOpDescriptor
+{
+    Inputs  = new[] { ("A", typeof(float)), ("B", typeof(float)) },
+    Outputs = new[] { ("C", typeof(float)) },
+    Scalars = new[] { ("M", typeof(int)), ("N", typeof(int)) }
+});
+
+// Descriptor entries become standard BlockPorts:
+// op.In("A")  → InputHandle<GpuBuffer<float>>  (same as KernelPin-based input)
+// op.Out("C") → OutputHandle<GpuBuffer<float>> (same as KernelPin-based output)
+// Scalars become BlockParameter<T> (trigger Recapture instead of Hot Update)
+```
+
+From the outside, CapturedNode ports are indistinguishable from KernelNode ports — the block system stays uniform. The difference is internal: parameter changes on CapturedNodes trigger Recapture instead of Hot Updates/Warm Updates.
+
 See `KERNEL-SOURCES.md` for the full three-source architecture.
 
 ### Input Definitions

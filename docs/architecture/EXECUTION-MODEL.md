@@ -143,23 +143,23 @@ The system has two node types with different update capabilities. See `KERNEL-SO
 |------|------|---------|--------|
 | **Hot Update** | Near-zero, no GPU stall | Scalar value changed (gravity, deltaTime) | `cuGraphExecKernelNodeSetParams` for scalar only |
 | **Warm Update** | Cheap, exec-level update | Buffer rebind (different pointer, same size), grid size change | `cuGraphExecKernelNodeSetParams` for pointer/grid |
-| **Code Update** | Medium | Patchable kernel logic changed | NVRTC recompile → new CUmodule → Cold rebuild of affected block |
+| **Code Rebuild** | Medium | Patchable kernel logic changed | NVRTC recompile → new CUmodule → Cold Rebuild of affected block |
 | **Cold Rebuild** | Expensive, full graph rebuild | Node added/removed, edge added/removed, PTX hot-reload, block structure changed | Destroy old graph, build new, instantiate |
 
-**CapturedNode** (library operations — cuBLAS, cuFFT, cuDNN):
+**CapturedNode** (Library Calls — cuBLAS, cuFFT, cuDNN):
 
 | Tier | Cost | Trigger | Action |
 |------|------|---------|--------|
-| **Recapture** | Medium | Any parameter changed (scalar or pointer) | Re-capture library call + `cuGraphExecChildGraphNodeSetParams` |
+| **Recapture** | Medium | Any parameter changed (scalar or pointer) | Recapture Library Call + `cuGraphExecChildGraphNodeSetParams` |
 | **Cold Rebuild** | Expensive, full graph rebuild | Node added/removed, structure changed | Destroy old graph, build new, instantiate |
 
-**Key difference:** KernelNodes support Hot/Warm parameter patching at near-zero cost. CapturedNodes require re-capture for any parameter change because library kernels are opaque. Exception: with `CUBLAS_POINTER_MODE_DEVICE`, scalar-only changes can avoid re-capture.
+**Key difference:** KernelNodes support Hot Update/Warm Update parameter patching at near-zero cost. CapturedNodes require Recapture for any parameter change because library kernels are opaque. Exception: with `CUBLAS_POINTER_MODE_DEVICE`, scalar-only changes can avoid Recapture.
 
 ### Design Rationale
 
 VL compiles .vl files on-the-fly to C# and supports Hot-Swap: when the user edits a block's code, VL disposes the old instance and creates a new one with the updated code. VL then restores connections by calling `Connect()` again.
 
-Structural changes (Cold Rebuild) happen during development only. During runtime of an exported application, only Hot/Warm updates occur. The graph rebuild may take several milliseconds, which is acceptable during interactive development.
+Structural changes (Cold Rebuild) happen during development only. During runtime of an exported application, only Hot Updates and Warm Updates occur. The graph rebuild may take several milliseconds, which is acceptable during interactive development.
 
 ### Dirty Flags
 
@@ -169,8 +169,9 @@ class CudaContext
     // --- Dirty state (managed by DirtyTracker internally) ---
     // See CORE-RUNTIME.md for the event-based coupling design
 
-    public bool IsStructureDirty { get; }    // Cold Rebuild needed
-    public bool AreParametersDirty { get; }  // Warm/Hot Update needed
+    public bool IsStructureDirty { get; }    // Cold Rebuild (full graph)
+    public bool IsCodeDirty { get; }         // Code Rebuild (NVRTC recompile → targeted Cold rebuild)
+    public bool AreParametersDirty { get; }  // Warm/Hot/Recapture Update
 
     // --- Public facade methods that trigger structure dirty ---
     // These delegate to internal BlockRegistry/ConnectionGraph,
@@ -182,6 +183,12 @@ class CudaContext
     public void Disconnect(Guid srcId, string srcPort, Guid tgtId, string tgtPort);
 
     // BlockBuilder.Commit() also fires StructureChanged if description changed
+
+    // --- These set codeDirty = true (for patchable kernels) ---
+    // Called by patchable kernel blocks when the node-set changes.
+    // Triggers NVRTC recompile → new CUmodule → Cold rebuild of affected block only.
+
+    public void MarkCodeDirty(Guid blockId);  // patchable kernel source changed
 
     // --- These set parametersDirty = true ---
 
@@ -227,17 +234,26 @@ class CudaEngine
         // 1. Collect current parameter values from all blocks
         CollectParameters();
         
-        // 2. Rebuild or update (dispatched by node type)
+        // 2. Rebuild or update (priority: Structure > Code > Parameters)
         if (_cudaContext.IsStructureDirty)
         {
             ColdRebuild();  // Full rebuild — both KernelNodes and CapturedNodes
-            _cudaContext.ClearStructureDirty();
+            _cudaContext.ClearAllDirty();
+        }
+        else if (_cudaContext.IsCodeDirty)
+        {
+            // Patchable kernel source changed → NVRTC recompile → targeted Cold rebuild
+            // Only the affected block(s) need a new CUmodule; the rest of the graph
+            // is rebuilt because CUDA Graph is immutable (full cuGraphInstantiate).
+            // But only the changed block(s) trigger NvrtcCache.GetOrCompile().
+            CodeRebuild(_cudaContext.Dirty.GetCodeDirtyBlockIds());
+            _cudaContext.ClearCodeDirty();
         }
         else if (_cudaContext.AreParametersDirty)
         {
             // Dispatch update by node type:
-            // - KernelNode params → Hot/Warm (cuGraphExecKernelNodeSetParams)
-            // - CapturedNode params → Recapture (re-capture + cuGraphExecChildGraphNodeSetParams)
+            // - KernelNode params → Hot Update/Warm Update (cuGraphExecKernelNodeSetParams)
+            // - CapturedNode params → Recapture (recapture + cuGraphExecChildGraphNodeSetParams)
             UpdateDirtyNodes();
             _cudaContext.ClearParametersDirty();
         }
@@ -252,6 +268,22 @@ class CudaEngine
         ReportDiagnostics();
     }
     
+    private void CodeRebuild(IReadOnlyList<Guid> dirtyBlockIds)
+    {
+        // 1. Recompile only the changed patchable kernel(s) via NvrtcCache
+        foreach (var blockId in dirtyBlockIds)
+        {
+            var block = _cudaContext.Registry.Get(blockId);
+            var newSource = block.GetPatchableSource();  // codegen from current node-set
+            var module = _cudaContext.Nvrtc.GetOrCompile(newSource, block.KernelName, _targetSm);
+            block.UpdateModule(module);  // swap CUmodule reference in descriptor
+        }
+        
+        // 2. Full graph rebuild (CUDA Graph is immutable — can't patch a single node)
+        //    Same as ColdRebuild, but the NvrtcCache hit above means no redundant compilation.
+        ColdRebuild();
+    }
+    
     private void UpdateDirtyNodes()
     {
         foreach (var dirtyNode in _cudaContext.Dirty.GetDirtyNodes())
@@ -263,7 +295,7 @@ class CudaEngine
             }
             else if (dirtyNode is CapturedNodeDescriptor capturedNode)
             {
-                // Recapture: re-run stream capture + cuGraphExecChildGraphNodeSetParams
+                // Recapture: re-run Stream Capture + cuGraphExecChildGraphNodeSetParams
                 var childGraph = StreamCaptureHelper.CaptureToGraph(
                     _cudaContext.Device.CaptureStream, capturedNode.CaptureAction);
                 _compiledGraph.UpdateChildGraph(capturedNode, childGraph);

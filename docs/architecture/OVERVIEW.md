@@ -97,9 +97,9 @@ VL.Cuda uses a centralized execution model with three actors:
 | **Warm** | Cheap | Buffer pointer changed, grid size changed | `cuGraphExecKernelNodeSetParams` |
 | **Code** | Medium | NVRTC recompile (patchable kernel) | New CUmodule → Cold rebuild of affected block |
 | **Cold** | Expensive | Node/edge added/removed, Hot-Swap, PTX reload | Full `cuGraphInstantiate` |
-| **Recapture** | Medium | CapturedNode parameter changed | Re-capture + `cuGraphExecChildGraphNodeSetParams` |
+| **Recapture** | Medium | CapturedNode parameter changed | Recapture + `cuGraphExecChildGraphNodeSetParams` |
 
-Hot/Warm/Code/Cold apply to **KernelNodes** (filesystem PTX and patchable kernels). Recapture/Cold apply to **CapturedNodes** (library operations). See `KERNEL-SOURCES.md` for details.
+Hot Update/Warm Update/Code Rebuild/Cold Rebuild apply to **KernelNodes** (Filesystem PTX and Patchable Kernels). Recapture/Cold Rebuild apply to **CapturedNodes** (Library Calls). See `KERNEL-SOURCES.md` for details.
 
 Cold rebuilds happen during development (user editing the VL patch). In an exported application, the graph structure is typically stable and only Hot/Warm updates occur.
 
@@ -118,7 +118,7 @@ Source 2 — Patchable Kernels (runtime, NVRTC):
 
     VL Node-Set  →  Codegen (CUDA C++)  →  NVRTC compile  →  PTX bytes
 
-Source 3 — Library Operations (runtime, Stream Capture):
+Source 3 — Library Calls (runtime, Stream Capture):
 
     cuBLAS/cuFFT/cuDNN call  →  Stream Capture  →  ChildGraphNode
 ```
@@ -296,15 +296,15 @@ VL.Cuda.Core
         ├── IResourceProvider<T> (Stride interop boundary only)
         └── PinGroups, TypeRegistry
 
-VL.Cuda.Libraries (optional, for CapturedNode library operations)
+VL.Cuda.Libraries (optional, for Library Calls via CapturedNode)
     │
     ├── VL.Cuda.Core
     │
     └── ManagedCuda libraries
-        ├── ManagedCuda.CUBLAS   (Stream Capture → CapturedNode)
-        ├── ManagedCuda.CUFFT    (Stream Capture → CapturedNode)
-        ├── ManagedCuda.CURAND   (Stream Capture → CapturedNode)
-        └── ManagedCuda.NPP      (Stream Capture → CapturedNode)
+        ├── ManagedCuda.CUBLAS   (Library Call → CapturedNode)
+        ├── ManagedCuda.CUFFT    (Library Call → CapturedNode)
+        ├── ManagedCuda.CURAND   (Library Call → CapturedNode)
+        └── ManagedCuda.NPP      (Library Call → CapturedNode)
 
 VL.Cuda.Stride (optional)
     │
@@ -324,10 +324,10 @@ VL.Cuda.Stride (optional)
 | `CudaContext.cs` | Facade: public API over event-coupled internal services |
 | `GpuBuffer.cs` | Type-safe GPU memory wrapper |
 | `BufferPool.cs` | Memory pooling with power-of-2 buckets |
-| `GraphCompiler.cs` | Converts description to CUDA Graph |
+| `GraphCompiler.cs` | Converts description to CUDA Graph (incl. Phase 5.5 Stream Capture for CapturedNodes) |
 | `PTXLoader.cs` | Parses PTX, extracts kernel info |
 | `NvrtcCache.cs` | NVRTC compilation cache for patchable kernels |
-| `StreamCaptureHelper.cs` | Stream Capture wrapper for library operations |
+| `StreamCaptureHelper.cs` | Stream Capture wrapper for Library Calls |
 | `BlockBuilder.cs` | DSL for block construction (AddKernel + AddCaptured) |
 
 ## CUDA Requirements

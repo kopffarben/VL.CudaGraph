@@ -292,7 +292,7 @@ fft.Parameters["Size"].Value = 1024;
 7. cuBLAS Sgemm in CUDA Graph via CapturedNode
 8. cuFFT forward/inverse via CapturedNode
 9. Mixed graph: KernelNodes + CapturedNodes in same graph
-10. CUBLAS_POINTER_MODE_DEVICE scalar update avoids re-capture
+10. CUBLAS_POINTER_MODE_DEVICE scalar update avoids Recapture
 
 ---
 
@@ -388,9 +388,18 @@ VL.Cuda.Core.Tests/
     │   ├── BlockLifecycleTests.cs
     │   ├── CompositeBlockTests.cs
     │   └── DebugInfoTests.cs
-    └── PTX/
-        ├── PTXParserTests.cs
-        └── ModuleCacheTests.cs
+    ├── PTX/
+    │   ├── PTXParserTests.cs
+    │   └── ModuleCacheTests.cs
+    ├── NVRTC/
+    │   ├── NvrtcCacheTests.cs
+    │   ├── NvrtcCompilationTests.cs
+    │   └── PatchableCodegenTests.cs
+    └── Captured/
+        ├── StreamCaptureHelperTests.cs
+        ├── CapturedNodeTests.cs
+        ├── LibraryHandleCacheTests.cs
+        └── RecaptureTests.cs
 ```
 
 ### Integration Tests
@@ -402,9 +411,13 @@ VL.Cuda.Integration.Tests/
     │   ├── ConditionalGraphTests.cs
     │   ├── ParticleSystemTests.cs
     │   └── HotSwapSimulationTests.cs
-    └── VL/
-        ├── PinGroupsTests.cs
-        └── HandleFlowTests.cs
+    ├── VL/
+    │   ├── PinGroupsTests.cs
+    │   └── HandleFlowTests.cs
+    └── MixedGraph/
+        ├── KernelAndCapturedNodeTests.cs
+        ├── NvrtcPatchableKernelTests.cs
+        └── CuBlasCapturedNodeTests.cs
 ```
 
 ### Performance Tests
@@ -428,8 +441,9 @@ VL.Cuda.Benchmarks/
 | Phase 2 | 4 weeks | Phase 1 |
 | Phase 3 | 4 weeks | Phase 2 |
 | Phase 4 | 4 weeks | Phase 3 |
+| Phase 5 | 2 weeks | Phase 2 (can start early) |
 
-**Total**: ~17 weeks for full implementation
+**Total**: ~19 weeks sequential, ~17 weeks with parallel Phase 5
 
 Parallel work possible:
 - PTX tooling and example kernels (Triton, nvcc, etc.) can be developed alongside
@@ -472,7 +486,24 @@ Parallel work possible:
 - [ ] Serialization round-trips
 
 ### Phase 4 Complete
-- [ ] cuFFT/cuBLAS work in graph
+- [ ] INodeDescriptor abstraction with KernelNodeDescriptor and CapturedNodeDescriptor
+- [ ] NvrtcCache compiles CUDA C++ strings and caches CUmodules
+- [ ] AddKernel(CUmodule) overload works in BlockBuilder
+- [ ] Patchable kernel codegen (node-set → CUDA C++) produces valid kernels
+- [ ] StreamCaptureHelper captures library calls into child graphs
+- [ ] LibraryHandleCache caches cuBLAS/cuFFT handles
+- [ ] AddCaptured() works in BlockBuilder
+- [ ] cuBLAS Sgemm works in CUDA Graph via CapturedNode
+- [ ] cuFFT forward/inverse works via CapturedNode
+- [ ] Graph Compiler Phase 5.5 (Stream Capture) runs for CapturedNodes only
+- [ ] Dirty-Tracking: Code level triggers NVRTC recompile → Cold rebuild of affected block
+- [ ] Dirty-Tracking: Recapture level triggers Recapture for CapturedNodes
+- [ ] CudaEngine.UpdateDirtyNodes() dispatches correctly by node type
+- [ ] Mixed graph (KernelNodes + CapturedNodes) compiles and executes
+- [ ] CUBLAS_POINTER_MODE_DEVICE scalar update avoids Recapture
+
+### Phase 5 Complete
 - [ ] DX11 buffer sharing works
+- [ ] DX11 texture sharing works
 - [ ] Can render CUDA output in Stride
-- [ ] Performance acceptable
+- [ ] Full pipeline: CUDA compute → Stride render

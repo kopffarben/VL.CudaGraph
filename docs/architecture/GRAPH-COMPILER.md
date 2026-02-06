@@ -112,7 +112,7 @@ Buffer_A live range: [t0, t2] → can be released after t2
 
 ### Phase 5.5: Stream Capture (CapturedNodes only)
 
-For CapturedNode descriptors (library operations like cuBLAS, cuFFT), the compiler executes Stream Capture to produce child graphs:
+For CapturedNode descriptors (Library Calls like cuBLAS, cuFFT), the compiler executes Stream Capture to produce child graphs:
 
 ```
 For each CapturedNodeDescriptor:
@@ -190,24 +190,24 @@ Regions enable control flow within the graph.
 
 | Change | Update Level |
 |--------|--------------|
-| Scalar value changed | **Hot** — `cuGraphExecKernelNodeSetParams` |
+| Scalar value changed | **Hot Update** — `cuGraphExecKernelNodeSetParams` |
 | Buffer content changed | None needed (data already on GPU) |
-| Buffer rebind (same size) | **Warm** — `cuGraphExecKernelNodeSetParams` |
-| Buffer resize | **Warm** + Pool realloc |
-| Grid size changed | **Warm** — `cuGraphExecKernelNodeSetParams` |
-| Patchable kernel logic changed | **Code** — NVRTC recompile → new CUmodule → Cold rebuild of affected block |
-| Node added/removed | **Cold** — Full Rebuild |
-| Edge added/removed | **Cold** — Full Rebuild |
-| Region added/removed | **Cold** — Full Rebuild |
-| PTX changed (hot-reload) | **Cold** — Full Rebuild |
+| Buffer rebind (same size) | **Warm Update** — `cuGraphExecKernelNodeSetParams` |
+| Buffer resize | **Warm Update** + Pool realloc |
+| Grid size changed | **Warm Update** — `cuGraphExecKernelNodeSetParams` |
+| Patchable kernel logic changed | **Code Rebuild** — NVRTC recompile → new CUmodule → Cold Rebuild of affected block |
+| Node added/removed | **Cold Rebuild** — Full Rebuild |
+| Edge added/removed | **Cold Rebuild** — Full Rebuild |
+| Region added/removed | **Cold Rebuild** — Full Rebuild |
+| PTX changed (hot-reload) | **Cold Rebuild** — Full Rebuild |
 
-### CapturedNode Updates (Library Operations)
+### CapturedNode Updates (Library Calls)
 
 | Change | Update Level |
 |--------|--------------|
-| Scalar or pointer parameter changed | **Recapture** — Re-capture + `cuGraphExecChildGraphNodeSetParams` |
-| Scalar with DEVICE pointer mode* | **Warm** — Buffer write, avoids re-capture |
-| Node added/removed | **Cold** — Full Rebuild |
+| Scalar or pointer parameter changed | **Recapture** — Recapture + `cuGraphExecChildGraphNodeSetParams` |
+| Scalar with DEVICE pointer mode* | **Warm Update** — Buffer write, avoids Recapture |
+| Node added/removed | **Cold Rebuild** — Full Rebuild |
 
 *With `CUBLAS_POINTER_MODE_DEVICE`, scalar values live in GPU memory and can be updated via buffer writes.
 

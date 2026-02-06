@@ -3,6 +3,7 @@
 ## Execution Model
 
 > **See `EXECUTION-MODEL.md` for the full execution model.**
+> **See `KERNEL-SOURCES.md` for the three kernel sources (Filesystem PTX, Patchable Kernels, Library Calls).**
 
 The key insight: Blocks are **passive** — they describe GPU work but never execute it. A single **CudaEngine** node compiles and launches the CUDA Graph each frame.
 

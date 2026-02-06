@@ -17,7 +17,7 @@ KERNEL SOURCES                              NODE TYPE IN GRAPH
    Live or OnSave compilation          ├─ Code:      NVRTC recompile        medium
                                        └─ Cold:      Structure rebuild      expensive
 
-3. Library Operation ───────────────→  CapturedNode (ChildGraphNode)
+3. Library Call ──────────────────→  CapturedNode (ChildGraphNode)
    (cuBLAS, cuFFT, cuDNN, cuRAND)     ├─ Recapture: Param changed          medium
    Stream Capture                      └─ Cold:      Structure rebuild      expensive
 ```
@@ -143,9 +143,9 @@ internal class NvrtcCache
 
 ---
 
-## Source 3: Library Operations (CapturedNode)
+## Source 3: Library Calls (CapturedNode)
 
-NVIDIA library calls (cuBLAS, cuFFT, cuDNN, cuRAND, NPP) that cannot be expressed as explicit kernel nodes. These libraries use internal, opaque kernels that are invisible to the CUDA Graph API.
+Library Calls are invocations of NVIDIA libraries (cuBLAS, cuFFT, cuDNN, cuRAND, NPP) that cannot be expressed as explicit kernel nodes. These libraries use internal, opaque kernels that are invisible to the CUDA Graph API.
 
 **Integration mechanism:** Stream Capture wraps the library call into a ChildGraphNode.
 
@@ -239,13 +239,13 @@ With Host pointer mode, scalar values are baked into the captured graph at captu
 
 ## Comparison
 
-| Aspect | Filesystem PTX | Patchable Kernel | Library Operation |
+| Aspect | Filesystem PTX | Patchable Kernel | Library Call |
 |--------|---------------|-----------------|-------------------|
 | **Source** | .ptx + .json file | VL node-set → NVRTC | cuBLAS/cuFFT/cuDNN |
 | **Node type** | KernelNode | KernelNode | CapturedNode |
-| **Hot update** | ✅ ~0 cost | ✅ ~0 cost | ❌ Re-capture needed |
-| **Warm update** | ✅ cheap | ✅ cheap | ❌ Re-capture needed* |
-| **Code change** | Cold (FileWatcher) | Cold (NVRTC recompile) | Cold |
+| **Hot Update** | ✅ ~0 cost | ✅ ~0 cost | ❌ Recapture needed |
+| **Warm Update** | ✅ cheap | ✅ cheap | ❌ Recapture needed* |
+| **Code Rebuild** | Cold Rebuild (FileWatcher) | Cold Rebuild (NVRTC recompile) | Cold Rebuild |
 | **Profiling** | ✅ Full (PerKernel) | ✅ Full (PerKernel) | ⚠️ PerBlock only (opaque) |
 | **Grid config** | ✅ User-controlled | ✅ User-controlled | ❌ Library decides |
 | **Shape rules** | ✅ Via JSON | ✅ Via codegen | ❌ Hardcoded per op |
@@ -253,7 +253,7 @@ With Host pointer mode, scalar values are baked into the captured graph at captu
 | **Debuggability** | ✅ Single kernel | ✅ Single kernel | ⚠️ Opaque child graph |
 | **Complexity** | Low (just load) | Medium (codegen) | Medium (stream capture) |
 
-*With `CUBLAS_POINTER_MODE_DEVICE`, scalar-only changes can avoid re-capture.
+*With `CUBLAS_POINTER_MODE_DEVICE`, scalar-only changes can avoid Recapture.
 
 ---
 
@@ -261,10 +261,10 @@ With Host pointer mode, scalar values are baked into the captured graph at captu
 
 ```
 Want full control and patchability?          → Filesystem PTX or Patchable Kernel
-Need vendor-optimized FFT/GEMM?             → Library Operation (cuFFT/cuBLAS)
+Need vendor-optimized FFT/GEMM?             → Library Call (cuFFT/cuBLAS)
 Prototyping a new algorithm?                 → Patchable Kernel (fastest iteration)
 Production particle system?                  → Filesystem PTX (Triton, pre-compiled)
-Complex deep learning inference?             → Library Operation (cuDNN)
+Complex deep learning inference?             → Library Call (cuDNN)
 Simple element-wise math?                    → Patchable Kernel (trivial codegen)
 ```
 
@@ -301,7 +301,7 @@ Both node types live in the same block system and graph compiler:
 ┌─────────────────────────────────────────────────────────────┐
 │  Dirty Tracking                                              │
 │                                                              │
-│  KernelNode:    Hot → Warm → Cold                            │
+│  KernelNode:    Hot → Warm → Code → Cold                     │
 │  CapturedNode:  Recapture → Cold                             │
 │                                                              │
 │  Both managed by the same DirtyTracker, dispatched by        │

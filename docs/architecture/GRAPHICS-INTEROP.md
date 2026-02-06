@@ -448,6 +448,8 @@ dx11Context.Wait(dx11Fence, value);
 
 The `ToDX11Buffer` node wraps the internal `GpuBuffer<T>` in an `IResourceProvider` before handing it to Stride. This is the ResourceProvider boundary — see `VL-INTEGRATION.md` for the full boundary design.
 
+> **CapturedNode outputs follow the same path.** A CapturedNode (cuBLAS, cuFFT) produces standard `GpuBuffer<T>` outputs that are indistinguishable from KernelNode outputs. The ToDX11Buffer bridge works identically regardless of which kernel source produced the buffer. See `KERNEL-SOURCES.md` for the three kernel sources.
+
 ### Block: ToDX11Buffer
 
 ```csharp

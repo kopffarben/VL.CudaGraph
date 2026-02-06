@@ -12,7 +12,7 @@ VL.Cuda.Core
   │     
   ├── Context
   │     CudaContext
-  │     CudaContextOptions
+  │     CudaEngineOptions
   │     CudaStream
   │     
   ├── Buffers
@@ -117,7 +117,7 @@ public class CudaEngine : IDisposable
     /// VL calls: new CudaEngine(nodeContext, options)
     /// NodeContext provides: UniqueId (for VL diagnostics), ILogger, AppHost.
     /// </summary>
-    public CudaEngine(NodeContext nodeContext, CudaContextOptions? options = null);
+    public CudaEngine(NodeContext nodeContext, CudaEngineOptions? options = null);
     
     // === Properties ===
     
@@ -198,7 +198,7 @@ Shared state between Engine and Blocks. Manages block registry, connections, dir
 public class CudaContext : IDisposable
 {
     // === Creation (internal — created by CudaEngine) ===
-    internal static CudaContext Create(CudaContextOptions options);
+    internal static CudaContext Create(CudaEngineOptions options);
     
     // === Properties ===
     public int DeviceId { get; }
@@ -275,9 +275,6 @@ public class CudaContext : IDisposable
     /// </summary>
     internal void OnParameterChanged(Guid blockId, string paramName);
     
-    // === Compilation (used by CudaEngine) ===
-    internal CompiledGraph Compile();
-    
     // === Serialization ===
     public GraphModel GetModel();
     public void LoadModel(GraphModel model);
@@ -287,10 +284,10 @@ public class CudaContext : IDisposable
 }
 ```
 
-### CudaContextOptions
+### CudaEngineOptions
 
 ```csharp
-public class CudaContextOptions
+public class CudaEngineOptions
 {
     public int DeviceId { get; set; } = 0;
     public ProfilingLevel Profiling { get; set; } = ProfilingLevel.None;
@@ -872,13 +869,13 @@ public class CompiledGraph : IDisposable
     public void UpdatePointer(Guid nodeId, int paramIndex, CUdeviceptr newPointer);
     
     /// <summary>
-    /// Recapture Update: re-capture a CapturedNode's library call and update the child graph.
+    /// Recapture: re-capture a CapturedNode's Library Call and update the child graph.
     /// Used when CapturedNode parameters change.
     /// </summary>
     public void UpdateChildGraph(CapturedNodeDescriptor node, CUgraph newChildGraph);
     
     /// <summary>
-    /// Dispatches parameter updates by node type (Hot/Warm for KernelNodes, Recapture for CapturedNodes).
+    /// Dispatches parameter updates by node type (Hot Update/Warm Update for KernelNodes, Recapture for CapturedNodes).
     /// </summary>
     public void UpdateKernelParams(KernelNodeDescriptor node);
     
@@ -1084,7 +1081,7 @@ public class RegionInfo
 public enum NodeKind
 {
     Kernel,          // KernelNode (filesystem PTX or NVRTC patchable)
-    CapturedOp,      // CapturedNode (library operation via Stream Capture)
+    Captured,         // CapturedNode (Library Call via Stream Capture)
     BufferCreate,
     ResetCount,
     Memset,

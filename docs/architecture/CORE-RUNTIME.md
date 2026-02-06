@@ -80,6 +80,8 @@ public class CudaContext : IDisposable
     {
         Pool.Dispose();
         Modules.Dispose();
+        Nvrtc.Dispose();
+        LibHandles.Dispose();
         Device.Dispose();
     }
 }
@@ -99,7 +101,7 @@ BlockRegistry and ConnectionGraph both trigger structure-dirty independently. Wi
 |---------|---------------|
 | **BlockRegistry** | Block registration/unregistration, NodeContext storage for error routing |
 | **ConnectionGraph** | Topology tracking (edges between blocks), connection validation |
-| **DirtyTracker** | Dirty flags per node type (KernelNode: Hot/Warm/Code/Cold; CapturedNode: Recapture/Cold) |
+| **DirtyTracker** | Dirty flags per node type (KernelNode: Hot Update/Warm Update/Code Rebuild/Cold Rebuild; CapturedNode: Recapture/Cold Rebuild) |
 | **BufferPool** | GPU memory allocation with power-of-2 bucketing |
 | **ModuleCache** | PTX loading, CUmodule caching, kernel descriptor storage |
 | **NvrtcCache** | NVRTC compilation cache for patchable kernels (CUDA C++ → PTX) |
