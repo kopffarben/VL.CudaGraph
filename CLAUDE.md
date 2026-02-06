@@ -67,6 +67,10 @@ docs/
     CSHARP-API.md                      ← Complete C# API reference
   implementation/
     PHASES.md                          ← Implementation roadmap
+src/
+  References/                          ← READ-ONLY git submodules
+    VL.StandardLibs/                   ← VL.Core source (API reference)
+    managedCuda/                       ← ManagedCuda source (API reference)
 ```
 
 ## Key Design Decisions
@@ -125,6 +129,24 @@ ManagedCuda          — CUDA driver API bindings
 VL.Core              — NodeContext, IVLRuntime, AppHost, ResourceProvider, PinGroups
 VL.Stride (optional) — Graphics interop (ResourceProvider boundary)
 ```
+
+## Reference Submodules (READ-ONLY)
+
+```
+src/References/
+  VL.StandardLibs/     — VL.Core, VL.Stride, etc. (git submodule)
+  managedCuda/         — ManagedCuda CUDA bindings (git submodule)
+```
+
+**Purpose:** These submodules exist solely as API reference for development.
+Search the source code to understand how VL.Core APIs (NodeContext, AppHost,
+ResourceProvider, IVLRuntime, etc.) and ManagedCuda APIs actually work.
+
+**Rules:**
+- ⛔ **NEVER modify any file** in `src/References/` — these are upstream repos
+- ✅ **Search and read** to understand API signatures, patterns, conventions
+- ✅ **Our code** (`src/VL.Cuda.Core/`, etc.) consumes these as **NuGet packages**
+- The submodules are not project references — they are not compiled as part of our solution
 
 ## CUDA Version Requirements
 

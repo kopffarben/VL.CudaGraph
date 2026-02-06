@@ -1,0 +1,8 @@
+[submodule "src/References/VL.StandardLibs"]
+	path = src/References/VL.StandardLibs
+	url = git@github.com:vvvv/VL.StandardLibs.git
+	branch = main
+[submodule "src/References/managedCuda"]
+	path = src/References/managedCuda
+	url = git@github.com:kunzmi/managedCuda.git
+	branch = master
