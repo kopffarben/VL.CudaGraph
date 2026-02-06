@@ -146,18 +146,20 @@ compiled.Launch();
 - Parameter change wiring via reflection delegates (contravariant: `OnChanged(object)` matches `Action<BlockParameter<T>>`)
 - CompiledGraph.Dispose() does NOT dispose KernelNodes — CudaEngine owns their lifetime
 
-### Deferred to Phase 3+
+### Deferred (VL Runtime Integration)
 
-| Task | Description | Notes |
+These items require a running VL instance and are not blockers for Phase 3+.
+They will be addressed when the first real VL patch is built.
+
+| Task | Description | Needs |
 |------|-------------|-------|
-| 2.3 | InputHandle\<T\>/OutputHandle\<T\> | VL handle-flow, needs VL integration |
-| 2.10 | Simple block example with full VL integration | Needs VL.Core NuGet |
-| 2.11 | PinGroups support | Needs VL.Core PinGroupKind |
-| 2.13 | VL.Core: NodeContext in constructors | Done (VL.Core NuGet added) |
-| 2.14 | VL.Core: IVLRuntime diagnostics | Needs VL.Core NuGet |
-| 2.15 | VL.Core: AppHost.TakeOwnership | Needs VL.Core NuGet |
-| 2.16 | VL.Core: ServiceRegistry | Needs VL.Core NuGet |
-| 2.18 | VL integration tests | Needs VL runtime |
+| 2.3 | InputHandle\<T\>/OutputHandle\<T\> (handle-flow) | VL runtime |
+| 2.10 | Simple block example with full VL integration | VL runtime |
+| 2.11 | PinGroups support | VL.Core PinGroupKind |
+| 2.14 | IVLRuntime diagnostics (node colors) | VL runtime |
+| 2.15 | AppHost.TakeOwnership (cleanup on shutdown) | VL runtime |
+| 2.16 | ServiceRegistry | VL runtime |
+| 2.18 | VL integration tests | VL runtime |
 
 ### Deliverables
 
@@ -553,11 +555,13 @@ Parallel work possible:
 - [x] BlockBuilder DSL with deterministic kernel ordering
 - [x] BlockDescription with structural equality for hot-swap detection
 - [x] 90 tests passing (148 total)
-- [ ] PinGroups display (deferred — needs VL.Core)
-- [ ] Hot-Swap simulation (deferred — needs VL runtime)
 - [x] NodeContext in constructors (VL.Core NuGet added)
-- [ ] IVLRuntime diagnostics (deferred — needs VL.Core)
-- [ ] AppHost.TakeOwnership (deferred — needs VL.Core)
+
+Phase 2 VL Runtime Integration (deferred — done when first VL patch is built):
+- [ ] PinGroups display (needs VL.Core PinGroupKind)
+- [ ] Hot-Swap simulation (needs VL runtime)
+- [ ] IVLRuntime diagnostics (needs VL runtime)
+- [ ] AppHost.TakeOwnership (needs VL runtime)
 
 ### Phase 3 Complete
 - [ ] AppendBuffer works with GPU counter
