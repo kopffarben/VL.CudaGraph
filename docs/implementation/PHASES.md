@@ -212,6 +212,31 @@ var info = emitter.DebugInfo;
 
 ---
 
+## VL Integration Gate — REQUIRED BEFORE PHASE 3
+
+**Before continuing with Phase 3+, the existing Phase 0–2 code must be tested in a real VL (vvvv gamma) environment.** Unit tests verify internal correctness, but they cannot validate:
+
+1. **NuGet packaging** — Does VL.Cuda.Core resolve correctly as a VL NuGet?
+2. **NodeContext injection** — Does VL actually inject NodeContext into our constructors?
+3. **ProcessNode lifecycle** — Do CudaEngine.Update() and block constructors/Dispose get called at the right times?
+4. **Handle-flow on links** — Does CudaContext flow through VL links from Engine output to Block inputs?
+5. **GPU on VL's thread** — Do CUDA calls work on VL's main thread? Any context issues?
+6. **Hot-Swap** — Does Dispose → new constructor → reconnect work when editing a block's .vl patch?
+7. **Tooltip display** — Does DebugInfo/ToString show up in VL node tooltips?
+
+### Minimum viable test
+
+Create a simple VL patch with:
+- One `CudaEngine` node
+- One block (e.g. `VectorAdd`) connected to the engine's `CudaContext` output
+- Verify: graph compiles, launches, DebugInfo shows `OK`
+- Verify: changing a scalar parameter triggers Hot Update (no rebuild)
+- Verify: deleting and re-adding a block triggers Cold Rebuild
+
+**If any of these fail, fix before Phase 3.** Assumptions made in Phase 0–2 (thread model, NodeContext shape, handle-flow) could be wrong — better to discover now than after building 3 more phases on top.
+
+---
+
 ## Phase 3: Advanced Features
 
 **Goal**: AppendBuffer, regions, liveness analysis
