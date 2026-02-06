@@ -46,9 +46,9 @@ public interface ICudaBlock : IDisposable
 }
 ```
 
-Note: There is no `Setup()` method in the interface. Setup happens in the **constructor**, which receives `NodeContext` (injected by VL) and `CudaContext` as parameters.
+Note: There is no `Setup()` method in the interface. Setup happens in the **constructor**.
 
-> **NodeContext Convention**: VL injects `NodeContext` as the first constructor parameter automatically — VL users never see it. C# users see it in the signature. See `VL-INTEGRATION.md`.
+> **NodeContext**: VL's `NodeContext` is auto-injected as the first constructor parameter. It provides identity, logging, and app access. See `VL-INTEGRATION.md`.
 
 ---
 
@@ -56,19 +56,19 @@ Note: There is no `Setup()` method in the interface. Setup happens in the **cons
 
 ```
 Constructor(NodeContext nodeContext, CudaContext ctx):
-    1. Store nodeContext (for identity, logging)
-    2. Create BlockBuilder
+    1. Store nodeContext (for identity/logging/app access)
+    2. Create BlockBuilder(ctx, this)
     3. Define kernels, pins, connections (declarative)
-    4. builder.Commit()
-    5. ctx.Registry.Register(this, nodeContext)
+    4. builder.Commit()   ← stores BlockDescription, wires param events
+    5. ctx.RegisterBlock(this)  ← fires StructureChanged → DirtyTracker
 
 VL Update() (every frame, optional):
     → Read DebugInfo for tooltip display
-    → Push parameter value changes to CudaContext
+    → Push parameter value changes (triggers ValueChanged → OnParameterChanged)
     → NO GPU work
 
 Dispose():
-    → ctx.Registry.Unregister(this)
+    → ctx.UnregisterBlock(this.Id)  ← removes from registry + connections + description
 ```
 
 ---
@@ -91,60 +91,56 @@ public class VectorAddBlock : ICudaBlock, IDisposable
 
     public Guid Id { get; } = Guid.NewGuid();
     public string TypeName => "VectorAdd";
+    public NodeContext NodeContext { get; }
 
     public IReadOnlyList<IBlockPort> Inputs => _inputs;
     public IReadOnlyList<IBlockPort> Outputs => _outputs;
     public IReadOnlyList<IBlockParameter> Parameters => _parameters;
     public IBlockDebugInfo DebugInfo { get; set; }
 
-    private List<IBlockPort> _inputs = new();
-    private List<IBlockPort> _outputs = new();
-    private List<IBlockParameter> _parameters = new();
+    private readonly List<IBlockPort> _inputs = new();
+    private readonly List<IBlockPort> _outputs = new();
+    private readonly List<IBlockParameter> _parameters = new();
 
     public VectorAddBlock(NodeContext nodeContext, CudaContext ctx)
     {
         _ctx = ctx;
+        NodeContext = nodeContext;
 
         var builder = new BlockBuilder(ctx, this);
 
-        // Add the kernel
-        var kernel = builder.AddKernel("kernels/vector_add.ptx", "vector_add_f32");
+        // Add the kernel (entry point extracted from JSON metadata)
+        var kernel = builder.AddKernel("kernels/vector_add.ptx");
 
-        // Define inputs (buffer pins)
-        var inA = builder.Input<float>("A", kernel.In(0), "First vector");
-        var inB = builder.Input<float>("B", kernel.In(1), "Second vector");
+        // Define buffer ports bound to kernel parameters
+        _inputs.Add(builder.Input<float>("A", kernel.In(0)));
+        _inputs.Add(builder.Input<float>("B", kernel.In(1)));
+        _outputs.Add(builder.Output<float>("C", kernel.Out(2)));
 
-        // Define output
-        var outSum = builder.Output<float>("Sum", kernel.Out(2), "Result vector");
-
-        // Scalar parameter (becomes a config pin)
-        builder.InputScalar<int>("Count", kernel.In(3), defaultValue: 0);
-
-        // Store for interface
-        _inputs.AddRange(new[] { inA, inB });
-        _outputs.Add(outSum);
+        // Scalar parameter — changes trigger Hot Update (no rebuild)
+        _parameters.Add(builder.InputScalar<uint>("N", kernel.In(3), 1024u));
 
         builder.Commit();
         ctx.RegisterBlock(this);
     }
 
-    public void Dispose() => _ctx.UnregisterBlock(this.Id);
+    public void Dispose() => _ctx.UnregisterBlock(Id);
 }
 ```
 
-### Composite Block Example
+### Composite Block Example *(Phase 3 — not yet implemented)*
 
 ```csharp
 public class ParticleSystemBlock : ICudaBlock, IDisposable
 {
     private readonly CudaContext _ctx;
-    
+
     public Guid Id { get; } = Guid.NewGuid();
     public string TypeName => "ParticleSystem";
     public IBlockDebugInfo DebugInfo { get; set; }
-    
+
     // ... interface implementation ...
-    
+
     public ParticleSystemBlock(NodeContext nodeContext, CudaContext ctx)
     {
         _ctx = ctx;
@@ -188,154 +184,96 @@ public class ParticleSystemBlock : ICudaBlock, IDisposable
 
 ## BlockBuilder Methods
 
-### Kernel Operations
+### Kernel Operations (Implemented)
 
 ```csharp
-// Source 1: Add a kernel from filesystem PTX
-KernelHandle AddKernel(string ptxPath, string entryPoint, string? debugName = null);
-
-// Source 1: Add with explicit grid config
-KernelHandle AddKernel(string ptxPath, string entryPoint, GridConfig grid, string? debugName = null);
-
-// Source 2: Add a kernel from NVRTC-compiled module (patchable kernel)
-KernelHandle AddKernel(CUmodule nvrtcModule, string entryPoint, string? debugName = null);
+// Add a kernel from filesystem PTX (entry point extracted from JSON metadata)
+KernelHandle AddKernel(string ptxPath);
 ```
 
-### Captured Operations (Library Calls)
+Set grid dimensions on the returned handle before `Commit()`:
+```csharp
+var kernel = builder.AddKernel("kernels/my_kernel.ptx");
+kernel.GridDimX = 256;  // default is 1
+```
+
+### Input Definitions (Implemented)
 
 ```csharp
-// Source 3: Add a library operation via Stream Capture (cuBLAS, cuFFT, cuDNN)
-CapturedHandle AddCaptured(string name, Action<CUstream> captureAction,
-                           CapturedOpDescriptor descriptor);
+// Buffer input port bound to a kernel parameter. Returns BlockPort.
+BlockPort Input<T>(string name, KernelPin pin) where T : unmanaged;
+
+// Scalar input parameter. Returns BlockParameter<T> with change tracking.
+BlockParameter<T> InputScalar<T>(string name, KernelPin pin, T defaultValue = default) where T : unmanaged;
 ```
 
-CapturedNodes define their I/O via the `CapturedOpDescriptor` rather than `KernelPin` references. The BlockBuilder maps descriptor entries to standard BlockPorts:
+### Output Definitions (Implemented)
 
 ```csharp
-var op = builder.AddCaptured("MatMul", captureAction, new CapturedOpDescriptor
-{
-    Inputs  = new[] { ("A", typeof(float)), ("B", typeof(float)) },
-    Outputs = new[] { ("C", typeof(float)) },
-    Scalars = new[] { ("M", typeof(int)), ("N", typeof(int)) }
-});
-
-// Descriptor entries become standard BlockPorts:
-// op.In("A")  → InputHandle<GpuBuffer<float>>  (same as KernelPin-based input)
-// op.Out("C") → OutputHandle<GpuBuffer<float>> (same as KernelPin-based output)
-// Scalars become BlockParameter<T> (trigger Recapture instead of Hot Update)
+// Buffer output port bound to a kernel parameter. Returns BlockPort.
+BlockPort Output<T>(string name, KernelPin pin) where T : unmanaged;
 ```
 
-From the outside, CapturedNode ports are indistinguishable from KernelNode ports — the block system stays uniform. The difference is internal: parameter changes on CapturedNodes trigger Recapture instead of Hot Updates/Warm Updates.
+### Internal Connections (Implemented)
+
+```csharp
+// Connect two kernel parameters within this block (via KernelPin references)
+void Connect(KernelPin source, KernelPin target);
+```
+
+### Planned (Phase 3+)
+
+The following BlockBuilder methods are designed but not yet implemented:
+
+```csharp
+// Phase 3: Composite blocks
+T AddChild<T>() where T : ICudaBlock;
+void ConnectChildren(ICudaBlock source, string sourcePort, ICudaBlock target, string targetPort);
+InputHandle<T> ExposeInput<T>(string name, InputHandle<T> childInput);
+OutputHandle<T> ExposeOutput<T>(string name, OutputHandle<T> childOutput);
+BlockParameter<T> ExposeParameter<T>(string name, ICudaBlock child, string childParamName);
+
+// Phase 4a: Library Calls via Stream Capture
+CapturedHandle AddCaptured(string name, Action<CUstream> captureAction, CapturedOpDescriptor descriptor);
+
+// Phase 4b: Patchable Kernels (ILGPU IR + NVRTC)
+KernelHandle AddKernel(CUmodule ilgpuModule, string entryPoint);
+KernelHandle AddKernel(CUmodule nvrtcModule, string entryPoint, bool isNvrtc = true);
+```
 
 See `KERNEL-SOURCES.md` for the full three-source architecture.
-
-### Input Definitions
-
-```csharp
-// Buffer input
-InputHandle<GpuBuffer<T>> Input<T>(string name, KernelPin pin, string? description = null);
-
-// AppendBuffer input
-InputHandle<AppendBuffer<T>> InputAppend<T>(string name, KernelPin pin, string? description = null);
-
-// Scalar input (becomes parameter)
-void InputScalar<T>(string name, KernelPin pin, T defaultValue = default, string? description = null);
-```
-
-### Output Definitions
-
-```csharp
-// Buffer output
-OutputHandle<GpuBuffer<T>> Output<T>(string name, KernelPin pin, string? description = null);
-
-// AppendBuffer output
-OutputHandle<AppendBuffer<T>> OutputAppend<T>(string name, KernelPin pin, string? description = null);
-```
-
-### Internal Connections
-
-```csharp
-// Connect output to input within block
-void Connect<T>(OutputHandle<T> source, InputHandle<T> target);
-```
-
-### Child Block Operations
-
-```csharp
-// Add child block (child receives same CudaContext)
-T AddChild<T>() where T : ICudaBlock;
-ICudaBlock AddChild(Type blockType);
-
-// Connect between children
-void ConnectChildren<T>(OutputHandle<T> source, InputHandle<T> target);
-void ConnectChildren(ICudaBlock source, string sourcePort, ICudaBlock target, string targetPort);
-```
-
-### Exposing Ports
-
-```csharp
-// Expose child input as block input
-InputHandle<T> ExposeInput<T>(string name, InputHandle<T> childInput);
-InputHandle<T> ExposeInput<T>(InputHandle<T> childInput);  // Keep original name
-
-// Expose child output as block output
-OutputHandle<T> ExposeOutput<T>(string name, OutputHandle<T> childOutput);
-OutputHandle<T> ExposeOutput<T>(OutputHandle<T> childOutput);  // Keep original name
-
-// Expose child parameter
-BlockParameter<T> ExposeParameter<T>(string name, ICudaBlock child, string childParamName);
-```
 
 ---
 
 ## KernelHandle
 
-Represents a kernel added to a block:
+Represents a kernel added to a block via `BlockBuilder.AddKernel()`:
 
 ```csharp
-public class KernelHandle
+public sealed class KernelHandle
 {
     public Guid Id { get; }
-    public string PTXPath { get; }
-    public string EntryPoint { get; }
-    public string DebugName { get; }
-    
-    // Grid configuration
-    public GridConfig Grid { get; set; }
-    
-    // Access kernel pins
-    public KernelPin In(int index);   // Input parameter
-    public KernelPin Out(int index);  // Output parameter
-    
-    // Metadata
+    public string PtxPath { get; }
     public KernelDescriptor Descriptor { get; }
+
+    // Grid dimensions (default 1×1×1). Set before Commit().
+    public uint GridDimX { get; set; }
+    public uint GridDimY { get; set; }
+    public uint GridDimZ { get; set; }
+
+    // Access kernel pins by parameter index
+    public KernelPin In(int index);   // → KernelPin(this.Id, index)
+    public KernelPin Out(int index);  // → KernelPin(this.Id, index)
 }
 ```
 
-### Grid Configuration
+> **Note**: `In()` and `Out()` return the same `KernelPin` type — the semantic difference (input vs output) is captured by how the pin is used in `builder.Input<T>()` vs `builder.Output<T>()`.
 
-```csharp
-public class GridConfig
-{
-    // Thread block dimensions
-    public int[] BlockDim { get; set; } = new[] { 256 };
-    
-    // How to determine grid size
-    public GridSizeMode Mode { get; set; } = GridSizeMode.Auto;
-    
-    // For Fixed mode
-    public int[]? FixedGridDim { get; set; }
-    
-    // For Auto mode: which parameter determines size
-    public int? AutoSizeFromParam { get; set; }
-}
+### Grid Configuration (Phase 2)
 
-public enum GridSizeMode
-{
-    Fixed,  // Use FixedGridDim
-    Auto    // Calculate from buffer size
-}
-```
+Phase 2 uses simple `uint GridDimX/Y/Z` on KernelHandle. These are stored in `KernelEntry` within `BlockDescription` and applied to `KernelNode` during `ColdRebuild`.
+
+**Planned (Phase 3+):** `GridConfig` class with `GridSizeMode.Auto` (calculate from buffer size) and `GridSizeMode.Fixed`.
 
 ---
 
@@ -346,24 +284,28 @@ public enum GridSizeMode
 ```csharp
 public interface IBlockPort
 {
+    Guid BlockId { get; }
     string Name { get; }
+    PortDirection Direction { get; }
     PinType Type { get; }
-    string? Description { get; }
 }
 ```
 
-### BlockPort<T>
+### BlockPort
+
+Non-generic concrete port — maps a named port to a specific kernel node's parameter.
 
 ```csharp
-public class BlockPort<T> : IBlockPort
+public sealed class BlockPort : IBlockPort
 {
+    public Guid BlockId { get; }
     public string Name { get; }
+    public PortDirection Direction { get; }
     public PinType Type { get; }
-    public string? Description { get; }
-    
-    // Internal: which node/pin this maps to
-    internal Guid NodeId { get; }
-    internal int PinIndex { get; }
+
+    // Internal: which kernel node/param this maps to (set by BlockBuilder)
+    internal Guid KernelNodeId { get; set; }
+    internal int KernelParamIndex { get; set; }
 }
 ```
 
@@ -379,20 +321,25 @@ public interface IBlockParameter
     string Name { get; }
     Type ValueType { get; }
     object Value { get; set; }
-    object DefaultValue { get; }
-    string? Description { get; }
+    bool IsDirty { get; }
+    void ClearDirty();
 }
 
-public class BlockParameter<T> : IBlockParameter
+public sealed class BlockParameter<T> : IBlockParameter where T : unmanaged
 {
     public string Name { get; }
-    public T Value { get; set; }
-    public T DefaultValue { get; }
-    public string? Description { get; }
+    public Type ValueType => typeof(T);
+    public T TypedValue { get; set; }        // Fires ValueChanged on change
+    public event Action<BlockParameter<T>>? ValueChanged;
+    public bool IsDirty { get; }
+    public void ClearDirty();
+
+    internal Guid KernelNodeId { get; set; }     // mapped kernel
+    internal int KernelParamIndex { get; set; }  // mapped param index
 }
 ```
 
-When a parameter value changes, the block notifies the CudaContext (parametersDirty = true). The CudaEngine picks this up in its next Update() and applies a Hot Update — no graph rebuild needed.
+When `TypedValue` is set, the `ValueChanged` event fires → `BlockBuilder.Commit()` wired it to call `CudaContext.OnParameterChanged(blockId, paramName)` → `DirtyTracker.MarkParameterDirty()`. CudaEngine picks this up in its next `Update()` and applies a Hot Update — no graph rebuild needed.
 
 Usage in VL:
 ```
@@ -411,23 +358,21 @@ Usage in VL:
 
 Written by CudaEngine after each frame launch:
 
+**Current implementation (Phase 2):**
+
 ```csharp
 public interface IBlockDebugInfo
 {
-    // Timing
-    TimeSpan LastExecutionTime { get; }
-    TimeSpan AverageExecutionTime { get; }
-    
-    // Resources
-    IReadOnlyList<BufferInfo> Buffers { get; }
-    IReadOnlyList<KernelDebugInfo> Kernels { get; }
-    
-    // State
     BlockState State { get; }
     string? StateMessage { get; }
-    
-    // Hierarchy
-    IReadOnlyList<IBlockDebugInfo> Children { get; }
+    TimeSpan LastExecutionTime { get; }
+}
+
+public sealed class BlockDebugInfo : IBlockDebugInfo
+{
+    public BlockState State { get; set; } = BlockState.NotCompiled;
+    public string? StateMessage { get; set; }
+    public TimeSpan LastExecutionTime { get; set; }
 }
 
 public enum BlockState
@@ -439,9 +384,11 @@ public enum BlockState
 }
 ```
 
+**Planned additions (Phase 3+):** `AverageExecutionTime`, `Buffers`, `Kernels`, `Children` lists for hierarchical profiling.
+
 ---
 
-## Composition Patterns
+## Composition Patterns *(Phase 3 — not yet implemented)*
 
 ### Sequential Pipeline
 

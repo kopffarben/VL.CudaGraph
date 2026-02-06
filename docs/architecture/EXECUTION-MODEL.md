@@ -46,24 +46,28 @@ Every VL-created instance receives a `NodeContext` as its first constructor para
 ### Block Lifecycle
 
 ```
-VL creates Block:
+Block created:
     new EmitterBlock(NodeContext nodeContext, CudaContext cudaContext)
         │
-        ├── nodeContext stored (for identity, logging)
-        ├── Setup() called (defines kernels, pins, connections)
+        ├── nodeContext stored (for identity/logging/app access)
+        ├── BlockBuilder(cudaContext, this) created
+        ├── Define kernels, ports, params (declarative)
+        ├── builder.Commit()   → wires param events, stores BlockDescription
         ├── cudaContext.RegisterBlock(this)   // facade: delegates to Registry
         └── Registry fires StructureChanged → DirtyTracker marks structure dirty
 
-VL calls every frame:
+VL calls every frame (optional):
     block.Update()
         │
-        └── Only updates debug display (ToString)
+        └── Only updates debug display (reads DebugInfo)
+            Push parameter changes (TypedValue = ...) → ValueChanged fires
             No GPU work happens here
 
-VL Hot-Swap (code change):
+Hot-Swap (code change):
     block.Dispose()
         │
-        ├── cudaContext.UnregisterBlock(this.Id)   // facade: delegates to Registry
+        ├── cudaContext.UnregisterBlock(this.Id)
+        │     → removes from Registry + ConnectionGraph + BlockDescriptions
         └── Registry fires StructureChanged → DirtyTracker marks structure dirty
 
     new EmitterBlock(nodeContext, cudaContext)   ← new instance, new code
@@ -73,50 +77,50 @@ VL Hot-Swap (code change):
 ### CudaEngine Lifecycle
 
 ```
-VL creates Engine:
-    new CudaEngine(NodeContext nodeContext, CudaEngineOptions options)
+Engine created:
+    new CudaEngine(CudaEngineOptions? options)
         │
-        ├── _runtime = IVLRuntime.Current
-        ├── _logger = nodeContext.GetLogger()
-        └── _cudaContext = new CudaContext(options)
+        └── Context = new CudaContext(options)
+            _stream = new ManagedCuda.CudaStream()
 
-VL calls every frame:
+Called every frame:
     cudaEngine.Update()
         │
-        ├── 1. Collect parameters from all blocks
-        ├── 2. Dirty-check (structure / parameters)
-        ├── 3. Cold Rebuild or Warm Update
-        ├── 4. Graph Launch
-        ├── 5. Collect profiling data (async)
-        ├── 6. Update debug cache
-        └── 7. Report diagnostics to VL (warnings/errors on nodes)
+        ├── 1. IsStructureDirty → ColdRebuild → ClearStructureDirty
+        ├── 2. Else AreParametersDirty → UpdateParameters → ClearParametersDirty
+        ├── 3. If compiled graph exists: Launch + Synchronize
+        └── 4. Distribute DebugInfo to all blocks (BlockState + LastExecutionTime)
+
+Dispose:
+    → Disposes CompiledGraph, owned KernelNodes, stream, CudaContext
 ```
 
 ### Constructor Signatures
 
 ```csharp
-public class CudaEngine
+public sealed class CudaEngine : IDisposable
 {
+    // Production constructor. NodeContext is injected by VL as first parameter.
     public CudaEngine(NodeContext nodeContext, CudaEngineOptions? options = null)
     {
-        _nodeContext = nodeContext;
-        _runtime = IVLRuntime.Current;
-        _logger = nodeContext.GetLogger();
-        _cudaContext = new CudaContext(options ?? new CudaEngineOptions());
-
-        // Ensure cleanup on app shutdown, even if user forgets to Dispose
-        nodeContext.AppHost.TakeOwnership(this);
+        NodeContext = nodeContext;
+        Context = new CudaContext(options ?? new CudaEngineOptions());
+        _stream = new ManagedCuda.CudaStream();
     }
+
+    // Test-friendly constructor with injected CudaContext
+    internal CudaEngine(CudaContext context);
 }
 
 public class EmitterBlock : ICudaBlock
 {
     public EmitterBlock(NodeContext nodeContext, CudaContext cudaContext)
     {
-        _nodeContext = nodeContext;
-        _logger = nodeContext.GetLogger();
+        NodeContext = nodeContext;
 
-        Setup(new BlockBuilder(cudaContext, this));
+        var builder = new BlockBuilder(cudaContext, this);
+        // ... define kernels, pins ...
+        builder.Commit();
         cudaContext.RegisterBlock(this);
     }
 
@@ -127,7 +131,10 @@ public class EmitterBlock : ICudaBlock
 }
 ```
 
-> **Note on NodeContext**: VL injects `nodeContext` automatically as the first constructor parameter — VL users never see it in the patch. Only C# users who code against the API directly see this parameter. See `VL-INTEGRATION.md` for details.
+**Future VL integration** will add:
+- `IVLRuntime` diagnostics (AddMessage, AddPersistentMessage)
+- `AppHost.TakeOwnership(this)` for cleanup on app shutdown
+- `nodeContext.GetLogger()` for structured logging
 
 ---
 
@@ -163,147 +170,122 @@ Structural changes (Cold Rebuild) happen during development only. During runtime
 
 ### Dirty Flags
 
+**Current implementation (Phase 2):**
+
 ```csharp
+// CudaContext is a facade — dirty state lives in DirtyTracker
 class CudaContext
 {
-    // --- Dirty state (managed by DirtyTracker internally) ---
-    // See CORE-RUNTIME.md for the event-based coupling design
+    // Service properties
+    public DirtyTracker Dirty { get; }
+    public BlockRegistry Registry { get; }
+    public ConnectionGraph Connections { get; }
 
-    public bool IsStructureDirty { get; }    // Cold Rebuild (full graph)
-    public bool IsCodeDirty { get; }         // Code Rebuild (NVRTC recompile → targeted Cold rebuild)
-    public bool AreParametersDirty { get; }  // Warm/Hot/Recapture Update
-
-    // --- Public facade methods that trigger structure dirty ---
-    // These delegate to internal BlockRegistry/ConnectionGraph,
-    // which fire StructureChanged events → DirtyTracker subscribes
-
-    public void RegisterBlock(ICudaBlock block);              // block.NodeContext used for identity
+    // --- Facade methods that trigger structure dirty ---
+    // Delegate to Registry/ConnectionGraph, which fire StructureChanged → DirtyTracker subscribes
+    public void RegisterBlock(ICudaBlock block);
     public void UnregisterBlock(Guid blockId);
     public void Connect(Guid srcId, string srcPort, Guid tgtId, string tgtPort);
     public void Disconnect(Guid srcId, string srcPort, Guid tgtId, string tgtPort);
 
-    // BlockBuilder.Commit() also fires StructureChanged if description changed
+    // --- Parameter dirty (called by BlockParameter.ValueChanged event wiring) ---
+    public void OnParameterChanged(Guid blockId, string paramName);
+}
 
-    // --- These set codeDirty = true (for patchable kernels) ---
-    // Called by patchable kernel blocks when the node-set changes.
-    // Triggers NVRTC recompile → new CUmodule → Cold rebuild of affected block only.
+// DirtyTracker (subscribes to Registry + ConnectionGraph events)
+class DirtyTracker
+{
+    public bool IsStructureDirty { get; }    // starts true → first build
+    public bool AreParametersDirty { get; }  // true if any dirty params
 
-    public void MarkCodeDirty(Guid blockId);  // patchable kernel source changed
-
-    // --- These set parametersDirty = true ---
-
-    public void SetParameter<T>(Guid blockId, string name, T value);
-    public void RebindBuffer(Guid blockId, string pinName, CUdeviceptr newPointer);
+    public void Subscribe(BlockRegistry registry, ConnectionGraph connectionGraph);
+    public void MarkParameterDirty(DirtyParameter param);
+    public IReadOnlySet<DirtyParameter> GetDirtyParameters();
+    public void ClearStructureDirty();   // also clears params (rebuild applies all)
+    public void ClearParametersDirty();
 }
 ```
 
+**Planned additions (Phase 4b):**
+- `IsCodeDirty` / `MarkCodeDirty(Guid blockId)` — patchable kernel recompile tracking
+
 ### Block Structure Change Detection
 
-When VL hot-swaps a block, the new instance calls `Setup()` in its constructor. The `BlockBuilder` produces a `BlockDescription` (list of kernels, pins, internal connections). This is compared against the previous description for the same block ID:
+When VL hot-swaps a block, the new instance calls `BlockBuilder.Commit()` in its constructor. The `BlockBuilder` produces a `BlockDescription` (ordered list of `KernelEntry` objects, ports, internal connections). This is compared against the previous description for the same block ID:
 
 ```csharp
 class BlockBuilder
 {
     public void Commit()
     {
-        var newDescription = BuildDescription();
-        var oldDescription = _context.GetBlockDescription(_blockId);
-        
-        if (!newDescription.StructuralEquals(oldDescription))
-        {
-            _context.OnBlockStructureChanged(_blockId);
-        }
-        
-        _context.SetBlockDescription(_blockId, newDescription);
+        var description = BuildDescription();
+        var oldDescription = _context.GetBlockDescription(_block.Id);
+
+        // If structure changed, the Register/Unregister cycle already
+        // fires StructureChanged via BlockRegistry. This catches in-place changes.
+
+        _context.SetBlockDescription(_block.Id, description);
     }
 }
 ```
 
-`BlockDescription` structural equality checks:
-- Same kernel set (ptxPath + entryPoint, in order)
-- Same pin set (name + type + direction)
-- Same internal connections
+`BlockDescription.StructuralEquals()` checks:
+- Same `KernelEntry` list (PtxPath + EntryPoint + GridDimX/Y/Z, in order — HandleId ignored)
+- Same port set (Name + Direction + PinType)
+- Same internal connections (using kernel indices, not GUIDs — stable across reconstruction)
 
 ### Execution Flow Per Frame
+
+**Current implementation (Phase 2):**
 
 ```csharp
 class CudaEngine
 {
     public void Update()
     {
-        // 1. Collect current parameter values from all blocks
-        CollectParameters();
-        
-        // 2. Rebuild or update (priority: Structure > Code > Parameters)
-        if (_cudaContext.IsStructureDirty)
+        // Priority: Structure > Parameters > Launch
+        if (Context.Dirty.IsStructureDirty)
         {
-            ColdRebuild();  // Full rebuild — both KernelNodes and CapturedNodes
-            _cudaContext.ClearAllDirty();
+            ColdRebuild();
+            Context.Dirty.ClearStructureDirty();
         }
-        else if (_cudaContext.IsCodeDirty)
+        else if (Context.Dirty.AreParametersDirty)
         {
-            // Patchable kernel source changed → ILGPU IR recompile → targeted Cold rebuild
-            // Only the affected block(s) need a new CUmodule; the rest of the graph
-            // is rebuilt because CUDA Graph is immutable (full cuGraphInstantiate).
-            // But only the changed block(s) trigger IlgpuCompiler.GetOrCompile().
-            CodeRebuild(_cudaContext.Dirty.GetCodeDirtyBlockIds());
-            _cudaContext.ClearCodeDirty();
-        }
-        else if (_cudaContext.AreParametersDirty)
-        {
-            // Dispatch update by node type:
-            // - KernelNode params → Hot Update/Warm Update (cuGraphExecKernelNodeSetParams)
-            // - CapturedNode params → Recapture (recapture + cuGraphExecChildGraphNodeSetParams)
-            UpdateDirtyNodes();
-            _cudaContext.ClearParametersDirty();
-        }
-        
-        // 3. Launch
-        _compiledGraph.Launch(_cudaContext.DefaultStream);
-        
-        // 4. Profiling (async collection)
-        _profilingPipeline.OnPostLaunch();
-        
-        // 5. Report diagnostics to VL
-        ReportDiagnostics();
-    }
-    
-    private void CodeRebuild(IReadOnlyList<Guid> dirtyBlockIds)
-    {
-        // 1. Recompile only the changed patchable kernel(s) via IlgpuCompiler
-        foreach (var blockId in dirtyBlockIds)
-        {
-            var block = _cudaContext.Registry.Get(blockId);
-            var irDesc = block.GetIRDescription();  // current node-set → IR description
-            var module = _cudaContext.Ilgpu.GetOrCompile(irDesc, _targetSm);
-            block.UpdateModule(module);  // swap CUmodule reference in descriptor
+            UpdateParameters();  // Hot Update via CompiledGraph.UpdateScalar
+            Context.Dirty.ClearParametersDirty();
         }
 
-        // 2. Full graph rebuild (CUDA Graph is immutable — can't patch a single node)
-        //    Same as ColdRebuild, but the IlgpuCompiler cache hit means no redundant compilation.
-        ColdRebuild();
-    }
-    
-    private void UpdateDirtyNodes()
-    {
-        foreach (var dirtyNode in _cudaContext.Dirty.GetDirtyNodes())
+        if (_compiledGraph != null)
         {
-            if (dirtyNode is KernelNodeDescriptor kernelNode)
+            _compiledGraph.Launch(_stream);
+            _stream.Synchronize();
+            DistributeDebugInfo(BlockState.OK);
+        }
+    }
+
+    private void UpdateParameters()
+    {
+        foreach (var dirty in Context.Dirty.GetDirtyParameters())
+        {
+            var block = Context.Registry.Get(dirty.BlockId);
+            var param = block?.Parameters.FirstOrDefault(p => p.Name == dirty.ParamName);
+            if (param == null) continue;
+
+            if (_paramMapping.TryGetValue((dirty.BlockId, dirty.ParamName), out var mapping))
             {
-                // Hot/Warm: cuGraphExecKernelNodeSetParams — near-zero cost
-                _compiledGraph.UpdateKernelParams(kernelNode);
-            }
-            else if (dirtyNode is CapturedNodeDescriptor capturedNode)
-            {
-                // Recapture: re-run Stream Capture + cuGraphExecChildGraphNodeSetParams
-                var childGraph = StreamCaptureHelper.CaptureToGraph(
-                    _cudaContext.Device.CaptureStream, capturedNode.CaptureAction);
-                _compiledGraph.UpdateChildGraph(capturedNode, childGraph);
+                // Hot Update via CompiledGraph.UpdateScalar — near-zero cost
+                _compiledGraph.UpdateScalar(mapping.KernelNodeId, mapping.ParamIndex, param.Value);
             }
         }
     }
 }
 ```
+
+**Planned additions (Phase 4a+):**
+- `CodeRebuild()` — ILGPU IR recompile → targeted Cold rebuild (Phase 4b)
+- `UpdateDirtyNodes()` — dispatch by node type: KernelNode → Hot/Warm, CapturedNode → Recapture (Phase 4a)
+- `ProfilingPipeline.OnPostLaunch()` — async GPU event readback (Phase 3+)
+- `ReportDiagnostics()` — IVLRuntime integration (Phase 3+)
 
 ---
 

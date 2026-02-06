@@ -11,5 +11,6 @@
   <ItemGroup>
     <PackageReference Include="ManagedCuda-13" Version="13.0.*" />
     <PackageReference Include="System.Text.Json" Version="8.*" />
+    <PackageReference Include="VL.Core" Version="2025.7.*" />
   </ItemGroup>
 </Project>

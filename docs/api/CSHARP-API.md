@@ -1,101 +1,88 @@
 # C# API Reference
 
+> **Status**: Phase 0 + Phase 1 + Phase 2 implemented and tested (148 tests).
+> Types marked *(Phase 3+)* are planned but not yet implemented.
+
 ## Module Structure
 
 ```
 VL.Cuda.Core
   ├── Engine
   │     CudaEngine
-  │     ProfilingPipeline
-  │     FrameDebugData
-  │     BlockDebugSnapshot
-  │     
+  │
   ├── Context
   │     CudaContext
   │     CudaEngineOptions
-  │     CudaStream
-  │     
+  │
+  ├── Context.Services
+  │     BlockRegistry
+  │     ConnectionGraph
+  │     Connection
+  │     DirtyTracker
+  │     DirtyParameter
+  │
   ├── Buffers
   │     GpuBuffer<T>
-  │     AppendBuffer<T>
   │     BufferPool
-  │     BufferShape
   │     DType
-  │     BufferLifetime
-  │     BufferState
-  │     
-  ├── Handles
-  │     IHandle
-  │     IInputHandle
-  │     IOutputHandle
-  │     InputHandle<T>
-  │     OutputHandle<T>
-  │     PinType
-  │     PinTypeKind
-  │     
+  │
   ├── Blocks
   │     ICudaBlock
   │     IBlockPort
+  │     BlockPort
   │     IBlockParameter
-  │     BlockPort<T>
   │     BlockParameter<T>
+  │     IBlockDebugInfo
+  │     BlockDebugInfo
+  │     PortDirection
+  │     PinType
+  │     PinKind
+  │     BlockState
+  │
+  ├── Blocks.Builder
   │     BlockBuilder
-  │     
-  ├── Graph
-  │     GraphCompiler
-  │     CompiledGraph
-  │     GraphModel
-  │     BlockModel
-  │     ConnectionModel
-  │     
-  ├── Kernel
   │     KernelHandle
   │     KernelPin
+  │     KernelEntry
+  │     BlockDescription
+  │
+  ├── Graph
+  │     KernelNode
+  │     Edge
+  │     GraphBuilder
+  │     GraphCompiler
+  │     CompiledGraph
+  │     GraphDescription
+  │     ValidationResult
+  │
+  ├── PTX
+  │     PtxLoader
+  │     ModuleCache
+  │     PtxMetadata
   │     KernelDescriptor
   │     KernelParamDescriptor
-  │     GridConfig
-  │     GridSizeMode
-  │     ParamDirection
-  │     PTXLoader
-  │     ModuleCache
-  │     IlgpuCompiler
-  │     NvrtcCache
-  │     
-  ├── Captured
-  │     CapturedHandle
-  │     CapturedNodeDescriptor
-  │     CapturedOpDescriptor
-  │     StreamCaptureHelper
-  │     LibraryHandleCache
-  │     
-  ├── NodeDescriptors
-  │     INodeDescriptor
-  │     KernelNodeDescriptor
-  │     CapturedNodeDescriptor
-  │     
-  ├── Debug
-  │     IDebugInfo
-  │     IBlockDebugInfo
-  │     RegionTiming
-  │     KernelTiming
-  │     KernelDebugInfo
-  │     BufferInfo
-  │     GraphStructure
-  │     NodeInfo
-  │     EdgeInfo
-  │     RegionInfo
-  │     DiagnosticMessage
-  │     NodeKind
-  │     RegionKind
-  │     BlockState
-  │     DiagnosticLevel
-  │     ProfilingLevel
-  │     
-  └── Interop
+  │     LoadedKernel
+  │
+  ├── Device
+  │     DeviceContext
+  │
+  ├── Handles (Phase 3+)
+  │     IHandle, IInputHandle, IOutputHandle
+  │     InputHandle<T>, OutputHandle<T>
+  │
+  ├── Captured (Phase 4a)
+  │     CapturedHandle, CapturedNodeDescriptor
+  │     StreamCaptureHelper, LibraryHandleCache
+  │
+  ├── Debug (Phase 3+)
+  │     IDebugInfo, ProfilingPipeline
+  │     RegionTiming, KernelTiming, KernelDebugInfo
+  │     GraphStructure, NodeInfo, EdgeInfo
+  │     DiagnosticMessage, DiagnosticLevel
+  │
+  └── Interop (Phase 5)
         IDX11SharedResource
-        SharedBuffer<T>
-        SharedTexture2D<T>
-        SharedTexture3D<T>
+        SharedBuffer<T>, SharedTexture2D<T>
         CudaDX11Interop
 ```
 
@@ -110,82 +97,77 @@ The single active ProcessNode. The ONLY component that does GPU work.
 > See `EXECUTION-MODEL.md` for the full execution model.
 
 ```csharp
-public class CudaEngine : IDisposable
+public sealed class CudaEngine : IDisposable
 {
     // === Creation ===
-    
+
     /// <summary>
-    /// VL calls: new CudaEngine(nodeContext, options)
-    /// NodeContext provides: UniqueId (for VL diagnostics), ILogger, AppHost.
+    /// Production constructor. NodeContext is injected by VL as first parameter.
     /// </summary>
     public CudaEngine(NodeContext nodeContext, CudaEngineOptions? options = null);
-    
+
+    /// <summary>
+    /// Test-friendly constructor with injected CudaContext.
+    /// </summary>
+    internal CudaEngine(CudaContext context);
+
     // === Properties ===
-    
+
     /// <summary>
     /// The CudaContext managed by this engine.
-    /// Exposed as output pin in VL — flows to all blocks.
+    /// Exposed as output — flows to all blocks.
     /// </summary>
     public CudaContext Context { get; }
-    
+
     /// <summary>
-    /// Current profiling level. Controls debug data collection overhead.
-    /// Can be changed at runtime via VL pin.
+    /// The VL NodeContext for this engine. Null when created via test constructor.
     /// </summary>
-    public ProfilingLevel ProfilingLevel { get; set; }
-    
+    public NodeContext? NodeContext { get; }
+
     /// <summary>
-    /// Debug info for the engine itself (total frame time, GPU memory, etc.)
-    /// Displayed as tooltip on the CudaEngine node in VL.
+    /// Whether a compiled graph is ready for launch.
     /// </summary>
-    public IDebugInfo DebugInfo { get; }
-    
-    // === Execution (called every frame by VL) ===
-    
+    public bool IsCompiled { get; }
+
     /// <summary>
-    /// Main update method. Called once per frame.
-    /// 1. Collects parameter values from all registered blocks
-    /// 2. Checks dirty state (structure vs parameters)
-    /// 3. Cold Rebuild or Hot/Warm Update as needed
-    /// 4. Launches the CUDA Graph
-    /// 5. Collects profiling data (async, based on ProfilingLevel)
-    /// 6. Distributes debug info back to blocks
-    /// 7. Reports diagnostics to VL (warnings/errors on nodes via IVLRuntime)
-    /// 
-    /// This is the ONLY place where GPU work happens.
+    /// Duration of the last Cold Rebuild.
+    /// </summary>
+    public TimeSpan LastRebuildTime { get; }
+
+    // === Execution (called every frame) ===
+
+    /// <summary>
+    /// Main update method. Call once per frame.
+    /// Priority: Structure dirty → Cold Rebuild; Parameters dirty → Hot Update; then Launch.
+    ///
+    /// 1. If IsStructureDirty → ColdRebuild (GraphBuilder → Compile → new CompiledGraph)
+    /// 2. Else if AreParametersDirty → Hot/Warm Update (CompiledGraph.UpdateScalar)
+    /// 3. If compiled graph exists → Launch + Synchronize + Distribute DebugInfo
     /// </summary>
     public void Update();
-    
-    /// <summary>
-    /// Update with explicit stream.
-    /// </summary>
-    public void Update(CudaStream stream);
-    
-    // === State ===
-    
-    /// <summary>
-    /// True if the last Update() performed a Cold Rebuild.
-    /// Useful for VL to show rebuild indicator.
-    /// </summary>
-    public bool DidRebuildLastFrame { get; }
-    
-    /// <summary>
-    /// Number of frames since last Cold Rebuild.
-    /// </summary>
-    public int FramesSinceLastRebuild { get; }
-    
-    // === ToString (VL Tooltip) ===
-    
-    /// <summary>
-    /// VL calls ToString() on hover. Shows engine summary.
-    /// Example: "CudaEngine: 4 blocks, 12 kernels\n  Launch: 2.1ms\n  Pool: 12 MB / 64 MB"
-    /// </summary>
-    public override string ToString();
-    
+
     // === Dispose ===
+
+    /// <summary>
+    /// Disposes compiled graph, owned kernel nodes, stream, and CudaContext.
+    /// </summary>
     public void Dispose();
 }
 ```
+
+**ColdRebuild pipeline** (internal):
+1. Dispose old CompiledGraph + KernelNodes
+2. For each registered block: iterate `BlockDescription.KernelEntries` → create KernelNodes (via GraphBuilder) with grid dims
+3. Add intra-block connections (from `BlockDescription.InternalConnections` using kernel indices)
+4. Add inter-block connections (from `ConnectionGraph` using BlockPort → KernelNode mapping)
+5. Apply external buffer bindings
+6. Apply current parameter values to KernelNodes
+7. Compile via GraphCompiler → new CompiledGraph
+8. Distribute debug info (BlockState.OK or BlockState.Error) to all blocks
+
+**Hot/Warm Update** (internal):
+- Iterates `DirtyTracker.GetDirtyParameters()`
+- For each dirty param: finds block → finds parameter → looks up `_paramMapping` → calls `CompiledGraph.UpdateScalar()`
 
 ---
 
@@ -193,93 +175,72 @@ public class CudaEngine : IDisposable
 
 ### CudaContext
 
-Shared state between Engine and Blocks. Manages block registry, connections, dirty-tracking, and buffer pool.
+Facade over all CUDA pipeline services. Created and owned by CudaEngine.
 
 ```csharp
-public class CudaContext : IDisposable
+public sealed class CudaContext : IDisposable
 {
-    // === Creation (internal — created by CudaEngine) ===
-    internal static CudaContext Create(CudaEngineOptions options);
-    
-    // === Properties ===
-    public int DeviceId { get; }
-    public CudaStream DefaultStream { get; }
-    public IDebugInfo Debug { get; }
-    public ProfilingLevel Profiling { get; set; }
+    // === Creation ===
+
+    /// <summary>
+    /// Standard constructor from engine options.
+    /// </summary>
+    public CudaContext(CudaEngineOptions options);
+
+    /// <summary>
+    /// Test-friendly constructor: inject a pre-existing DeviceContext.
+    /// </summary>
+    internal CudaContext(DeviceContext device);
+
+    // === Service Properties ===
+
+    public DeviceContext Device { get; }
     public BufferPool Pool { get; }
-    
-    // === Block Registry ===
-    
+    public ModuleCache ModuleCache { get; }
+    public BlockRegistry Registry { get; }
+    public ConnectionGraph Connections { get; }
+    public DirtyTracker Dirty { get; }
+
+    // === Block Registry Facade ===
+
     /// <summary>
     /// Register a block. Called by block constructors.
-    /// Sets structureDirty = true.
+    /// Delegates to Registry.Register → fires StructureChanged → DirtyTracker marks structure dirty.
     /// </summary>
     public void RegisterBlock(ICudaBlock block);
-    
+
     /// <summary>
     /// Unregister a block. Called by block Dispose().
-    /// Sets structureDirty = true.
+    /// Also removes connections and block description.
     /// </summary>
     public void UnregisterBlock(Guid blockId);
-    
+
+    // === Connection Facade ===
+
+    public void Connect(Guid srcBlockId, string srcPort, Guid tgtBlockId, string tgtPort);
+    public void Disconnect(Guid srcBlockId, string srcPort, Guid tgtBlockId, string tgtPort);
+
+    // === Parameter Tracking ===
+
     /// <summary>
-    /// All currently registered blocks.
+    /// Called by BlockParameter.ValueChanged → BlockBuilder event wiring.
+    /// Marks the parameter dirty for Hot/Warm Update.
     /// </summary>
-    public IReadOnlyDictionary<Guid, ICudaBlock> Blocks { get; }
-    
-    // === Connections (called by VL when user draws/removes links) ===
-    
+    public void OnParameterChanged(Guid blockId, string paramName);
+
+    // === Block Descriptions (for structure change detection) ===
+
+    public void SetBlockDescription(Guid blockId, BlockDescription description);
+    public BlockDescription? GetBlockDescription(Guid blockId);
+
+    // === External Buffer Bindings ===
+
     /// <summary>
-    /// Connect two block ports. Sets structureDirty = true.
+    /// Bind an external buffer to a block port. Used for graph inputs managed by the user.
     /// </summary>
-    public void Connect(Guid sourceBlockId, string sourcePort,
-                        Guid targetBlockId, string targetPort);
-    
-    /// <summary>
-    /// Disconnect two block ports. Sets structureDirty = true.
-    /// </summary>
-    public void Disconnect(Guid sourceBlockId, string sourcePort,
-                           Guid targetBlockId, string targetPort);
-    
-    /// <summary>
-    /// All current connections.
-    /// </summary>
-    public IReadOnlyList<ConnectionModel> Connections { get; }
-    
-    // === Dirty Tracking ===
-    
-    /// <summary>
-    /// True if graph structure changed (blocks added/removed, connections changed).
-    /// Requires Cold Rebuild.
-    /// </summary>
-    public bool IsStructureDirty { get; }
-    
-    /// <summary>
-    /// True if parameter values changed (scalars, buffer pointers).
-    /// Requires Hot/Warm Update.
-    /// </summary>
-    public bool AreParametersDirty { get; }
-    
-    /// <summary>
-    /// Called by CudaEngine after rebuild.
-    /// </summary>
-    internal void ClearStructureDirty();
-    
-    /// <summary>
-    /// Called by CudaEngine after parameter update.
-    /// </summary>
-    internal void ClearParametersDirty();
-    
-    /// <summary>
-    /// Called by blocks when a parameter value changes.
-    /// Sets parametersDirty = true.
-    /// </summary>
-    internal void OnParameterChanged(Guid blockId, string paramName);
-    
-    // === Serialization ===
-    public GraphModel GetModel();
-    public void LoadModel(GraphModel model);
-    
+    public void SetExternalBuffer(Guid blockId, string portName, CUdeviceptr pointer);
+    public IReadOnlyDictionary<(Guid BlockId, string PortName), CUdeviceptr> ExternalBuffers { get; }
+
     // === Dispose ===
     public void Dispose();
 }
@@ -288,256 +249,147 @@ public class CudaContext : IDisposable
 ### CudaEngineOptions
 
 ```csharp
-public class CudaEngineOptions
+public sealed class CudaEngineOptions
 {
-    public int DeviceId { get; set; } = 0;
-    public ProfilingLevel Profiling { get; set; } = ProfilingLevel.None;
-    public int BufferPoolInitialSizeMB { get; set; } = 256;
-    public bool EnableDebug { get; set; } = true;
+    /// <summary>
+    /// CUDA device ordinal (default: 0 = first GPU).
+    /// </summary>
+    public int DeviceId { get; init; }
 }
 ```
 
-### CudaStream
+---
+
+## Context Services
+
+### BlockRegistry
 
 ```csharp
-public class CudaStream : IDisposable
+public sealed class BlockRegistry
 {
-    public static CudaStream Create(CudaContext context);
-    
-    public IntPtr Handle { get; }
-    public CudaContext Context { get; }
-    
-    public void Synchronize();
-    public Task SynchronizeAsync();
-    
-    public void Dispose();
+    /// <summary>
+    /// Fired when a block is registered or unregistered. DirtyTracker subscribes.
+    /// </summary>
+    public event Action? StructureChanged;
+
+    public IReadOnlyDictionary<Guid, ICudaBlock> Blocks { get; }
+    public int Count { get; }
+    public IEnumerable<ICudaBlock> All { get; }
+
+    public void Register(ICudaBlock block);
+    public bool Unregister(Guid blockId);
+    public ICudaBlock? Get(Guid blockId);
 }
 ```
 
-### ProfilingLevel
+### ConnectionGraph
 
 ```csharp
-public enum ProfilingLevel
+public sealed class ConnectionGraph
 {
-    None,       // Zero overhead. Only state (OK/Warning/Error).
-    Summary,    // 1 event pair around entire graph. Async, 1 frame latency.
-    PerBlock,   // Event pair per block. Buffer sizes on link tooltips. Async.
-    PerKernel,  // Event pair per kernel within blocks. Async.
-    DeepAsync,  // + AppendBuffer count readbacks, occupancy. Async, 1-2 frame latency.
-    DeepSync    // Same as DeepAsync but synchronous GPU readback. Exact values, causes GPU stall.
+    public event Action? StructureChanged;
+
+    public IReadOnlyList<Connection> Connections { get; }
+    public int Count { get; }
+
+    public void Connect(Guid srcBlockId, string srcPort, Guid tgtBlockId, string tgtPort);
+    public bool Disconnect(Guid srcBlockId, string srcPort, Guid tgtBlockId, string tgtPort);
+    public int RemoveBlock(Guid blockId);
+    public IEnumerable<Connection> GetOutgoing(Guid blockId);
+    public IEnumerable<Connection> GetIncoming(Guid blockId);
 }
+```
+
+### Connection
+
+```csharp
+public sealed record Connection(
+    Guid SourceBlockId,
+    string SourcePort,
+    Guid TargetBlockId,
+    string TargetPort);
+```
+
+### DirtyTracker
+
+```csharp
+public sealed class DirtyTracker
+{
+    public bool IsStructureDirty { get; }       // starts true → first build
+    public bool AreParametersDirty { get; }     // true if any parameters dirty
+
+    public void Subscribe(BlockRegistry registry, ConnectionGraph connectionGraph);
+    public void MarkParameterDirty(DirtyParameter param);
+    public IReadOnlySet<DirtyParameter> GetDirtyParameters();
+
+    /// <summary>
+    /// Clear structure dirty. Also clears parameters since rebuild applies all values.
+    /// </summary>
+    public void ClearStructureDirty();
+
+    /// <summary>
+    /// Clear parameter dirty flags after Hot/Warm Update.
+    /// </summary>
+    public void ClearParametersDirty();
+}
+```
+
+### DirtyParameter
+
+```csharp
+public readonly record struct DirtyParameter(Guid BlockId, string ParamName);
 ```
 
 ---
 
 ## Buffers
 
-### GpuBuffer<T>
+### GpuBuffer\<T\>
 
 ```csharp
-public class GpuBuffer<T> : IDisposable where T : unmanaged
+public sealed class GpuBuffer<T> : IDisposable where T : unmanaged
 {
-    // === Identity ===
     public Guid Id { get; }
-    
-    // === Memory ===
     public CUdeviceptr Pointer { get; }
     public long SizeInBytes { get; }
     public int ElementCount { get; }
-    
-    // === Type ===
-    public DType ElementType { get; }
-    public BufferShape Shape { get; }
-    
-    // === Lifecycle ===
-    public BufferLifetime Lifetime { get; }
-    public BufferState State { get; }
-    
-    // === Data Transfer ===
-    public void Upload(ReadOnlySpan<T> data, CudaStream? stream = null);
-    public void Download(Span<T> destination, CudaStream? stream = null);
-    public Task<T[]> DownloadAsync(CudaStream? stream = null);
-    
-    // === Views ===
-    public GpuBuffer<T> Slice(int offset, int count);
-    public GpuBuffer<TNew> Reinterpret<TNew>() where TNew : unmanaged;
-    
-    // === Internal ===
-    internal int RefCount { get; }
-    internal void AddRef();
-    internal void Release();
-    
-    // === Dispose ===
+
+    public void Upload(ReadOnlySpan<T> data);
+    public void Download(Span<T> destination);
+
     public void Dispose();
-}
-```
-
-### AppendBuffer<T>
-
-```csharp
-public class AppendBuffer<T> : GpuBuffer<T> where T : unmanaged
-{
-    public int MaxCapacity { get; }
-    public CUdeviceptr CountPointer { get; }
-    
-    public int ReadCount(CudaStream? stream = null);
-    public Task<int> ReadCountAsync(CudaStream? stream = null);
-    public void ResetCount(CudaStream? stream = null);
-}
-```
-
-### BufferShape
-
-```csharp
-public readonly struct BufferShape
-{
-    public int Rank { get; }
-    public int Dim0 { get; }
-    public int Dim1 { get; }
-    public int Dim2 { get; }
-    public int Stride0 { get; }
-    public int Stride1 { get; }
-    public int Stride2 { get; }
-    public long TotalElements { get; }
-    
-    public BufferShape(int dim0);
-    public BufferShape(int dim0, int dim1);
-    public BufferShape(int dim0, int dim1, int dim2);
-    public BufferShape(int[] dims, int[]? strides = null);
-    
-    public BufferShape WithStride(int[] strides);
-    public BufferShape Transpose();
-    public BufferShape Flatten();
 }
 ```
 
 ### BufferPool
 
 ```csharp
-public class BufferPool : IDisposable
+public sealed class BufferPool : IDisposable
 {
-    public BufferPool(CudaContext context, int initialSizeMB = 256);
-    
-    public GpuBuffer<T> Acquire<T>(int elementCount, BufferLifetime lifetime) 
-        where T : unmanaged;
-    public GpuBuffer<T> Acquire<T>(BufferShape shape, BufferLifetime lifetime)
-        where T : unmanaged;
-    public AppendBuffer<T> AcquireAppend<T>(int maxCapacity, BufferLifetime lifetime)
-        where T : unmanaged;
-    
-    public void Release(GpuBuffer buffer);
-    
+    public BufferPool(DeviceContext device);
+
+    public GpuBuffer<T> Acquire<T>(int elementCount) where T : unmanaged;
+    public void Release<T>(GpuBuffer<T> buffer) where T : unmanaged;
+
     public long TotalAllocatedBytes { get; }
-    public long CurrentlyUsedBytes { get; }
-    public int BufferCount { get; }
-    public IReadOnlyDictionary<int, int> BucketStats { get; }
-    
+    public int RentedCount { get; }
+
     public void Dispose();
 }
 ```
 
-### Enums
+### DType
 
 ```csharp
 public enum DType
 {
-    U8, U16, U32, U64,
-    S8, S16, S32, S64,
-    F16, F32, F64,
-    BF16,
-    Complex64, Complex128
+    F32, F64, S32, U32, S64, U64, S16, U16, S8, U8
 }
 
-public enum BufferLifetime
+public static class DTypeExtensions
 {
-    External,   // User-managed
-    Graph,      // Lives with graph
-    Region      // Temporary
-}
-
-public enum BufferState
-{
-    Valid,
-    Uninitialized,
-    Released
-}
-```
-
----
-
-## Handles
-
-### Interfaces
-
-```csharp
-public interface IHandle
-{
-    Guid SourceBlockId { get; }
-    string PinName { get; }
-    PinType Type { get; }
-}
-
-public interface IInputHandle : IHandle
-{
-    IOutputHandle? Source { get; set; }
-}
-
-public interface IOutputHandle : IHandle
-{
-}
-```
-
-### InputHandle<T>
-
-```csharp
-public class InputHandle<T> : IInputHandle
-{
-    public Guid SourceBlockId { get; }
-    public string PinName { get; }
-    public PinType Type { get; }
-    
-    public OutputHandle<T>? Source { get; set; }
-    
-    IOutputHandle? IInputHandle.Source
-    {
-        get => Source;
-        set => Source = (OutputHandle<T>?)value;
-    }
-}
-```
-
-### OutputHandle<T>
-
-```csharp
-public class OutputHandle<T> : IOutputHandle
-{
-    public Guid SourceBlockId { get; }
-    public string PinName { get; }
-    public PinType Type { get; }
-}
-```
-
-### PinType
-
-```csharp
-public class PinType
-{
-    public PinTypeKind Kind { get; }
-    public DType ElementType { get; }
-    public int? Channels { get; }
-    
-    public static PinType Buffer<T>() where T : unmanaged;
-    public static PinType AppendBuffer<T>() where T : unmanaged;
-    public static PinType Scalar<T>() where T : unmanaged;
-    
-    public bool IsCompatible(PinType other);
-}
-
-public enum PinTypeKind
-{
-    Buffer,
-    AppendBuffer,
-    Scalar
+    public static int SizeInBytes(this DType dtype);
+    public static DType FromClrType<T>() where T : unmanaged;
 }
 ```
 
@@ -552,57 +404,21 @@ public interface ICudaBlock : IDisposable
 {
     Guid Id { get; }
     string TypeName { get; }
-    
+
+    /// <summary>
+    /// VL NodeContext — auto-injected by VL as first constructor parameter.
+    /// Provides identity, logging, and app access.
+    /// </summary>
+    NodeContext NodeContext { get; }
+
     IReadOnlyList<IBlockPort> Inputs { get; }
     IReadOnlyList<IBlockPort> Outputs { get; }
     IReadOnlyList<IBlockParameter> Parameters { get; }
-    
+
     /// <summary>
     /// Debug info written by CudaEngine after each frame.
     /// </summary>
     IBlockDebugInfo DebugInfo { get; set; }
-    
-    /// <summary>
-    /// VL NodeContext for this block instance.
-    /// Used by CudaEngine to report warnings/errors on the correct VL node.
-    /// </summary>
-    NodeContext NodeContext { get; }
-}
-```
-
-#### Constructor Pattern
-
-All blocks follow this constructor pattern. VL provides `NodeContext` as the first parameter:
-
-```csharp
-public class MyBlock : ICudaBlock
-{
-    public MyBlock(NodeContext nodeContext, CudaContext cudaContext)
-    {
-        NodeContext = nodeContext;
-        _logger = nodeContext.GetLogger();
-        
-        // Declarative setup (no GPU work)
-        var builder = new BlockBuilder(cudaContext, this);
-        // ... define kernels, pins ...
-        builder.Commit();
-        
-        cudaContext.RegisterBlock(this, nodeContext);
-    }
-    
-    public NodeContext NodeContext { get; }
-    
-    /// <summary>
-    /// VL calls ToString() on hover. Reads from profiling cache only — no GPU access.
-    /// </summary>
-    public override string ToString()
-    {
-        var info = _cudaContext.Profiling.GetCached(this.Id);
-        if (info == null) return $"{TypeName}: {DebugInfo?.State ?? BlockState.OK}";
-        return $"{TypeName}: {info.State}, {info.Timing?.TotalMilliseconds:F2}ms";
-    }
-    
-    public void Dispose() => _cudaContext.UnregisterBlock(this);
 }
 ```
 
@@ -611,9 +427,34 @@ public class MyBlock : ICudaBlock
 ```csharp
 public interface IBlockPort
 {
+    Guid BlockId { get; }
     string Name { get; }
+    PortDirection Direction { get; }
     PinType Type { get; }
-    string? Description { get; }
+}
+```
+
+### BlockPort
+
+```csharp
+public sealed class BlockPort : IBlockPort
+{
+    public Guid BlockId { get; }
+    public string Name { get; }
+    public PortDirection Direction { get; }
+    public PinType Type { get; }
+
+    /// <summary>
+    /// Which kernel handle (→ node) this port maps to. Set by BlockBuilder.
+    /// </summary>
+    internal Guid KernelNodeId { get; set; }
+
+    /// <summary>
+    /// Which parameter index on the kernel this port maps to.
+    /// </summary>
+    internal int KernelParamIndex { get; set; }
+
+    public BlockPort(Guid blockId, string name, PortDirection direction, PinType type);
 }
 ```
 
@@ -625,331 +466,41 @@ public interface IBlockParameter
     string Name { get; }
     Type ValueType { get; }
     object Value { get; set; }
-    object DefaultValue { get; }
-    string? Description { get; }
+    bool IsDirty { get; }
+    void ClearDirty();
 }
 ```
 
-### BlockPort<T>
+### BlockParameter\<T\>
 
 ```csharp
-public class BlockPort<T> : IBlockPort
-{
-    public string Name { get; }
-    public PinType Type { get; }
-    public string? Description { get; }
-    
-    internal Guid NodeId { get; }
-    internal int PinIndex { get; }
-}
-```
-
-### BlockParameter<T>
-
-```csharp
-public class BlockParameter<T> : IBlockParameter
+public sealed class BlockParameter<T> : IBlockParameter where T : unmanaged
 {
     public string Name { get; }
     public Type ValueType => typeof(T);
-    public T Value { get; set; }
-    public T DefaultValue { get; }
-    public string? Description { get; }
-    
-    object IBlockParameter.Value
-    {
-        get => Value!;
-        set => Value = (T)value;
-    }
-    object IBlockParameter.DefaultValue => DefaultValue!;
-}
-```
 
-### BlockBuilder
-
-```csharp
-public class BlockBuilder
-{
-    // === Context ===
-    public CudaContext Context { get; }
-    public Guid BlockId { get; }
-    
-    // === Construction (takes block reference for registration) ===
-    public BlockBuilder(CudaContext context, ICudaBlock block);
-    
-    // === Kernels (Source 1: Filesystem PTX) ===
-    public KernelHandle AddKernel(string ptxPath, string entryPoint,
-                                   string? debugName = null);
-    public KernelHandle AddKernel(string ptxPath, string entryPoint,
-                                   GridConfig grid, string? debugName = null);
-    
-    // === Kernels (Source 2a: ILGPU Patchable Kernel — primary path) ===
-    public KernelHandle AddKernel(CUmodule ilgpuModule, string entryPoint,
-                                   string? debugName = null);
-
-    // === Kernels (Source 2b: NVRTC User CUDA C++ — escape-hatch) ===
-    public KernelHandle AddKernel(CUmodule nvrtcModule, string entryPoint,
-                                   string? debugName = null, bool isNvrtc = true);
-    
-    // === Captured Operations (Source 3: Library Calls) ===
-    public CapturedHandle AddCaptured(string name, Action<CUstream> captureAction,
-                                       CapturedOpDescriptor descriptor);
-    
-    // === Buffer Inputs ===
-    public InputHandle<GpuBuffer<T>> Input<T>(string name, KernelPin pin,
-                                               string? description = null)
-        where T : unmanaged;
-    public InputHandle<AppendBuffer<T>> InputAppend<T>(string name, KernelPin pin,
-                                                        string? description = null)
-        where T : unmanaged;
-    
-    // === Scalar Inputs ===
-    public void InputScalar<T>(string name, KernelPin pin,
-                                T defaultValue = default,
-                                string? description = null)
-        where T : unmanaged;
-    
-    // === Outputs ===
-    public OutputHandle<GpuBuffer<T>> Output<T>(string name, KernelPin pin,
-                                                 string? description = null)
-        where T : unmanaged;
-    public OutputHandle<AppendBuffer<T>> OutputAppend<T>(string name, KernelPin pin,
-                                                          string? description = null)
-        where T : unmanaged;
-    
-    // === Internal Connections ===
-    public void Connect<T>(OutputHandle<T> source, InputHandle<T> target);
-    
-    // === Child Blocks ===
-    public T AddChild<T>() where T : ICudaBlock;
-    public ICudaBlock AddChild(Type blockType);
-    
-    // === Child Connections ===
-    public void ConnectChildren<T>(OutputHandle<T> source, InputHandle<T> target);
-    public void ConnectChildren(ICudaBlock source, string sourcePort,
-                                 ICudaBlock target, string targetPort);
-    
-    // === Expose Ports ===
-    public InputHandle<T> ExposeInput<T>(string name, InputHandle<T> childInput);
-    public InputHandle<T> ExposeInput<T>(InputHandle<T> childInput);
-    
-    public OutputHandle<T> ExposeOutput<T>(string name, OutputHandle<T> childOutput);
-    public OutputHandle<T> ExposeOutput<T>(OutputHandle<T> childOutput);
-    
-    // === Expose Parameters ===
-    public BlockParameter<T> ExposeParameter<T>(string name, 
-                                                 ICudaBlock child, 
-                                                 string childParamName);
-    
-    // === Finalize ===
-    public void Commit();
-}
-```
-
----
-
-## Kernel
-
-### KernelHandle
-
-```csharp
-public class KernelHandle
-{
-    public Guid Id { get; }
-    public string PTXPath { get; }
-    public string EntryPoint { get; }
-    public string DebugName { get; }
-    public GridConfig Grid { get; set; }
-    
-    public KernelPin In(int index);
-    public KernelPin Out(int index);
-    
-    public KernelDescriptor Descriptor { get; }
-}
-```
-
-### KernelPin
-
-```csharp
-public readonly struct KernelPin
-{
-    public Guid KernelId { get; }
-    public int Index { get; }
-    public bool IsOutput { get; }
-    public KernelParamDescriptor Descriptor { get; }
-}
-```
-
-### GridConfig
-
-```csharp
-public class GridConfig
-{
-    public int[] BlockDim { get; set; } = new[] { 256 };
-    public GridSizeMode Mode { get; set; } = GridSizeMode.Auto;
-    public int[]? FixedGridDim { get; set; }
-    public int? AutoSizeFromParam { get; set; }
-}
-
-public enum GridSizeMode
-{
-    Fixed,
-    Auto
-}
-```
-
-### KernelDescriptor
-
-```csharp
-public class KernelDescriptor
-{
-    public string PTXPath { get; }
-    public string EntryPoint { get; }
-    public string? Name { get; }
-    public string? Version { get; }
-    public string? Category { get; }
-    public string? Summary { get; }
-    public string[]? Tags { get; }
-    
-    public IReadOnlyList<KernelParamDescriptor> Parameters { get; }
-    
-    public int[]? MaxThreads { get; }
-    public int[]? ReqThreads { get; }
-    public int SharedMemoryStatic { get; }
-    public bool UsesDynamicShared { get; }
-    
-    public bool Generated { get; }
-    public bool NeedsReview { get; }
-    public string? PtxVersion { get; }
-    public string? TargetSM { get; }
-}
-```
-
-### KernelParamDescriptor
-
-```csharp
-public class KernelParamDescriptor
-{
-    public int Index { get; }
-    public string PtxType { get; }
-    public bool IsPointer { get; }
-    public int? Alignment { get; }
-    public string? ElementType { get; }
-    public ParamDirection Direction { get; }
-    public string? Name { get; }
-    public string? Semantic { get; }
-    public string? ShapeRule { get; }
-}
-
-public enum ParamDirection
-{
-    In,
-    Out,
-    InOut,
-    Unknown
-}
-```
-
----
-
-## Graph
-
-### CompiledGraph
-
-```csharp
-public class CompiledGraph : IDisposable
-{
-    public Guid Id { get; }
-    public bool IsValid { get; }
-    
-    public void Launch(CudaStream? stream = null);
-    
     /// <summary>
-    /// Hot Update: change scalar value without rebuild.
+    /// Typed value with change tracking. Setting fires ValueChanged event.
     /// </summary>
-    public void SetScalar<T>(Guid nodeId, int paramIndex, T value) where T : unmanaged;
-    
+    public T TypedValue { get; set; }
+
     /// <summary>
-    /// Warm Update: change buffer pointer without rebuild.
+    /// Fired when value changes. BlockBuilder wires this → CudaContext.OnParameterChanged.
     /// </summary>
-    public void UpdatePointer(Guid nodeId, int paramIndex, CUdeviceptr newPointer);
-    
+    public event Action<BlockParameter<T>>? ValueChanged;
+
+    public bool IsDirty { get; }
+    public void ClearDirty();
+
     /// <summary>
-    /// Recapture: re-capture a CapturedNode's Library Call and update the child graph.
-    /// Used when CapturedNode parameters change.
+    /// IBlockParameter explicit implementation (boxes).
     /// </summary>
-    public void UpdateChildGraph(CapturedNodeDescriptor node, CUgraph newChildGraph);
-    
-    /// <summary>
-    /// Dispatches parameter updates by node type (Hot Update/Warm Update for KernelNodes, Recapture for CapturedNodes).
-    /// </summary>
-    public void UpdateKernelParams(KernelNodeDescriptor node);
-    
-    public IReadOnlyList<Guid> KernelNodes { get; }
-    public IReadOnlyList<Guid> CapturedNodes { get; }
-    public IReadOnlyDictionary<Guid, GpuBuffer> AllocatedBuffers { get; }
-    
-    public void Dispose();
-}
-```
+    object IBlockParameter.Value { get; set; }
 
-### GraphModel
+    internal Guid KernelNodeId { get; set; }
+    internal int KernelParamIndex { get; set; }
 
-```csharp
-public class GraphModel
-{
-    public string Version { get; set; } = "1.0";
-    public List<BlockModel> Blocks { get; set; } = new();
-    public List<ConnectionModel> Connections { get; set; } = new();
-    
-    public string ToJson();
-    public static GraphModel FromJson(string json);
-    
-    public void SaveToFile(string path);
-    public static GraphModel LoadFromFile(string path);
-}
-
-public class BlockModel
-{
-    public Guid Id { get; set; }
-    public string TypeName { get; set; } = "";
-    public Dictionary<string, object> Parameters { get; set; } = new();
-}
-
-public class ConnectionModel
-{
-    public Guid SourceBlockId { get; set; }
-    public string SourcePort { get; set; } = "";
-    public Guid TargetBlockId { get; set; }
-    public string TargetPort { get; set; } = "";
-}
-```
-
----
-
-## Debug
-
-### IDebugInfo
-
-```csharp
-public interface IDebugInfo
-{
-    IReadOnlyDictionary<Guid, TimeSpan> LastFrameTiming { get; }
-    RegionTiming GetHierarchicalTiming();
-    
-    IReadOnlyList<BufferInfo> AllocatedBuffers { get; }
-    Task<T[]> ReadbackAsync<T>(GpuBuffer<T> buffer) where T : unmanaged;
-    Task<T[]> ReadbackRangeAsync<T>(GpuBuffer<T> buffer, int offset, int count)
-        where T : unmanaged;
-    int ReadAppendCount<T>(AppendBuffer<T> buffer) where T : unmanaged;
-    
-    GraphStructure GetGraphStructure();
-    
-    IReadOnlyList<DiagnosticMessage> Messages { get; }
-    event Action<DiagnosticMessage>? OnMessage;
-    void ClearMessages();
-    
-    IReadOnlyDictionary<Guid, object> CurrentScalars { get; }
-    IReadOnlyDictionary<Guid, bool> ConditionalStates { get; }
+    public BlockParameter(string name, T defaultValue = default);
 }
 ```
 
@@ -958,210 +509,479 @@ public interface IDebugInfo
 ```csharp
 public interface IBlockDebugInfo
 {
-    TimeSpan LastExecutionTime { get; }
-    TimeSpan AverageExecutionTime { get; }
-    
-    IReadOnlyList<BufferInfo> Buffers { get; }
-    IReadOnlyList<KernelDebugInfo> Kernels { get; }
-    
     BlockState State { get; }
     string? StateMessage { get; }
-    
-    IReadOnlyList<IBlockDebugInfo> Children { get; }
-}
-
-public enum BlockState
-{
-    OK,
-    Warning,
-    Error,
-    NotCompiled
+    TimeSpan LastExecutionTime { get; }
 }
 ```
 
-### Timing Classes
+### BlockDebugInfo
 
 ```csharp
-public class RegionTiming
+public sealed class BlockDebugInfo : IBlockDebugInfo
 {
-    public Guid BlockId { get; }
-    public string Name { get; }
-    public TimeSpan TotalTime { get; }
-    public TimeSpan SelfTime { get; }
-    
-    public IReadOnlyList<RegionTiming> Children { get; }
-    public IReadOnlyList<KernelTiming> Kernels { get; }
-}
-
-public class KernelTiming
-{
-    public Guid KernelId { get; }
-    public string Name { get; }
-    public TimeSpan Time { get; }
-}
-
-public class KernelDebugInfo
-{
-    public string Name { get; }
-    public string PTXPath { get; }
-    public string EntryPoint { get; }
-    
-    public TimeSpan LastExecutionTime { get; }
-    public TimeSpan MinTime { get; }
-    public TimeSpan MaxTime { get; }
-    public TimeSpan AvgTime { get; }
-    
-    public int[] GridDim { get; }
-    public int[] BlockDim { get; }
-    public int TotalThreads { get; }
-    
-    public float TheoreticalOccupancy { get; }
-    public float AchievedOccupancy { get; }
-    
-    public int SharedMemoryBytes { get; }
-    public int RegistersPerThread { get; }
-}
-```
-
-### Structure Classes
-
-```csharp
-public class BufferInfo
-{
-    public Guid Id { get; }
-    public string? Name { get; }
-    public DType ElementType { get; }
-    public long SizeInBytes { get; }
-    public int[] Shape { get; }
-    public BufferLifetime Lifetime { get; }
-    public BufferState State { get; }
-    
-    public bool IsAppendBuffer { get; }
-    public int? CurrentCount { get; }
-    public int? MaxCapacity { get; }
-    
-    public int PoolBucket { get; }
-    public bool IsReused { get; }
-}
-
-public class GraphStructure
-{
-    public IReadOnlyList<NodeInfo> Nodes { get; }
-    public IReadOnlyList<EdgeInfo> Edges { get; }
-    public IReadOnlyList<RegionInfo> Regions { get; }
-}
-
-public class NodeInfo
-{
-    public Guid Id { get; }
-    public string Name { get; }
-    public NodeKind Kind { get; }
-    public Guid? ParentRegionId { get; }
-    public int TopoLevel { get; }
-}
-
-public class EdgeInfo
-{
-    public Guid SourceNodeId { get; }
-    public int SourcePinIndex { get; }
-    public Guid TargetNodeId { get; }
-    public int TargetPinIndex { get; }
-    public string ElementType { get; }
-    public bool IsBufferReused { get; }
-}
-
-public class RegionInfo
-{
-    public Guid Id { get; }
-    public string Name { get; }
-    public RegionKind Kind { get; }
-    public Guid? ParentId { get; }
-    public IReadOnlyList<Guid> ChildNodes { get; }
+    public BlockState State { get; set; } = BlockState.NotCompiled;
+    public string? StateMessage { get; set; }
+    public TimeSpan LastExecutionTime { get; set; }
 }
 ```
 
 ### Enums
 
 ```csharp
-public enum NodeKind
-{
-    Kernel,          // KernelNode (filesystem PTX, ILGPU patchable, or NVRTC user code)
-    Captured,         // CapturedNode (Library Call via Stream Capture)
-    BufferCreate,
-    ResetCount,
-    Memset,
-    Cast
-}
+public enum PortDirection { Input, Output }
 
-public enum RegionKind
-{
-    Root,
-    If,
-    IfElse,
-    While,
-    For,
-    Delegate
-}
+public enum PinKind { Buffer, Scalar }
 
-public class DiagnosticMessage
-{
-    public DiagnosticLevel Level { get; }
-    public Guid? BlockId { get; }
-    public Guid? KernelId { get; }
-    public string Message { get; }
-    public string? Details { get; }
-    public DateTime Timestamp { get; }
-}
+public enum BlockState { OK, Warning, Error, NotCompiled }
+```
 
-public enum DiagnosticLevel
+### PinType
+
+```csharp
+public sealed class PinType : IEquatable<PinType>
 {
-    Info,
-    Warning,
-    Error
+    public PinKind Kind { get; }
+    public DType DataType { get; }
+
+    public PinType(PinKind kind, DType dataType);
+
+    public static PinType Buffer(DType dataType);
+    public static PinType Scalar(DType dataType);
+    public static PinType Buffer<T>() where T : unmanaged;
+    public static PinType Scalar<T>() where T : unmanaged;
+
+    /// <summary>
+    /// Both must be same kind and same data type.
+    /// </summary>
+    public bool IsCompatible(PinType other);
+
+    public bool Equals(PinType? other);
+    public override int GetHashCode();
 }
 ```
 
 ---
 
-## Interop
+## Blocks.Builder
 
-### IDX11SharedResource
+### BlockBuilder
+
+DSL for describing a block's kernels, ports, parameters, and internal connections. Used in block constructors. Call `Commit()` when done.
 
 ```csharp
-public interface IDX11SharedResource : IDisposable
+public sealed class BlockBuilder
 {
-    IntPtr DX11Resource { get; }
-    CUdeviceptr CudaPointer { get; }
-    
-    void MapForCuda(CudaStream? stream = null);
-    void UnmapFromCuda(CudaStream? stream = null);
-    
-    bool IsMappedForCuda { get; }
+    public BlockBuilder(CudaContext context, ICudaBlock block);
+
+    // === Add Kernel (Filesystem PTX) ===
+
+    /// <summary>
+    /// Add a kernel from a PTX file path. Returns a handle for binding ports.
+    /// Automatically loads PTX and extracts entry point from metadata.
+    /// </summary>
+    public KernelHandle AddKernel(string ptxPath);
+
+    // === Buffer Ports ===
+
+    /// <summary>
+    /// Define a buffer input port bound to a kernel parameter.
+    /// </summary>
+    public BlockPort Input<T>(string name, KernelPin pin) where T : unmanaged;
+
+    /// <summary>
+    /// Define a buffer output port bound to a kernel parameter.
+    /// </summary>
+    public BlockPort Output<T>(string name, KernelPin pin) where T : unmanaged;
+
+    // === Scalar Parameters ===
+
+    /// <summary>
+    /// Define a scalar input parameter bound to a kernel parameter.
+    /// Changes trigger Hot Update, not graph rebuild.
+    /// </summary>
+    public BlockParameter<T> InputScalar<T>(string name, KernelPin pin, T defaultValue = default)
+        where T : unmanaged;
+
+    // === Internal Connections ===
+
+    /// <summary>
+    /// Connect two kernel parameters within this block (output of one kernel → input of another).
+    /// </summary>
+    public void Connect(KernelPin source, KernelPin target);
+
+    // === Finalize ===
+
+    /// <summary>
+    /// Finalize the block description. Wires parameter change events to CudaContext dirty tracking.
+    /// Stores BlockDescription for structure change detection. Throws on double-commit.
+    /// </summary>
+    public void Commit();
+
+    // === Read-only access ===
+
+    public IReadOnlyList<KernelHandle> Kernels { get; }
+    public IReadOnlyList<BlockPort> Inputs { get; }
+    public IReadOnlyList<BlockPort> Outputs { get; }
+    public IReadOnlyList<IBlockParameter> Parameters { get; }
+    public IReadOnlyList<(Guid SrcKernel, int SrcParam, Guid TgtKernel, int TgtParam)> InternalConnections { get; }
 }
 ```
 
-### CudaDX11Interop
+### KernelHandle
 
 ```csharp
-public static class CudaDX11Interop
+public sealed class KernelHandle
 {
-    public static SharedBuffer<T> RegisterBuffer<T>(
-        IntPtr dx11Buffer, CudaContext ctx,
-        CUgraphicsRegisterFlags flags = CUgraphicsRegisterFlags.None)
-        where T : unmanaged;
-    
-    public static SharedTexture2D<T> RegisterTexture2D<T>(
-        IntPtr dx11Texture, CudaContext ctx,
-        CUgraphicsRegisterFlags flags = CUgraphicsRegisterFlags.None)
-        where T : unmanaged;
-    
-    public static SharedTexture3D<T> RegisterTexture3D<T>(
-        IntPtr dx11Texture, CudaContext ctx,
-        CUgraphicsRegisterFlags flags = CUgraphicsRegisterFlags.None)
-        where T : unmanaged;
-    
-    public static SharedBuffer<T> CreateSharedBuffer<T>(
-        int elementCount, CudaContext ctx, ID3D11Device dx11Device)
-        where T : unmanaged;
+    public Guid Id { get; }
+    public string PtxPath { get; }
+    public KernelDescriptor Descriptor { get; }
+
+    /// <summary>
+    /// Grid dimensions (default 1×1×1). Set before Commit() to configure launch grid.
+    /// </summary>
+    public uint GridDimX { get; set; }
+    public uint GridDimY { get; set; }
+    public uint GridDimZ { get; set; }
+
+    /// <summary>
+    /// Reference to an input parameter by index.
+    /// </summary>
+    public KernelPin In(int index);
+
+    /// <summary>
+    /// Reference to an output parameter by index.
+    /// </summary>
+    public KernelPin Out(int index);
+
+    public KernelHandle(string ptxPath, KernelDescriptor descriptor);
 }
 ```
+
+### KernelPin
+
+```csharp
+public readonly struct KernelPin
+{
+    public Guid KernelHandleId { get; }
+    public int ParamIndex { get; }
+
+    public KernelPin(Guid kernelHandleId, int paramIndex);
+}
+```
+
+### KernelEntry
+
+```csharp
+/// <summary>
+/// A kernel entry in a BlockDescription. Stores everything the engine
+/// needs to recreate the KernelNode during ColdRebuild.
+/// </summary>
+public sealed class KernelEntry
+{
+    public Guid HandleId { get; }
+    public string PtxPath { get; }
+    public string EntryPoint { get; }
+    public uint GridDimX { get; }
+    public uint GridDimY { get; }
+    public uint GridDimZ { get; }
+
+    public KernelEntry(Guid handleId, string ptxPath, string entryPoint,
+        uint gridDimX, uint gridDimY, uint gridDimZ);
+
+    /// <summary>
+    /// Structural equality ignores HandleId (changes every construction).
+    /// Compares PTX path, entry point, and grid dimensions.
+    /// </summary>
+    public bool StructuralEquals(KernelEntry? other);
+}
+```
+
+### BlockDescription
+
+```csharp
+/// <summary>
+/// Immutable snapshot of a block's structural description.
+/// Used for change detection (Hot-Swap) and graph rebuilding.
+/// </summary>
+public sealed class BlockDescription
+{
+    /// <summary>
+    /// Kernel entries in AddKernel order. Deterministic, ordered list.
+    /// </summary>
+    public IReadOnlyList<KernelEntry> KernelEntries { get; }
+
+    /// <summary>
+    /// Port entries: (Name, Direction, PinType).
+    /// </summary>
+    public IReadOnlyList<(string Name, PortDirection Direction, PinType Type)> Ports { get; }
+
+    /// <summary>
+    /// Internal connections using kernel indices (not GUIDs) for stable comparison.
+    /// (SrcKernelIndex, SrcParam, TgtKernelIndex, TgtParam)
+    /// </summary>
+    public IReadOnlyList<(int SrcKernelIndex, int SrcParam, int TgtKernelIndex, int TgtParam)> InternalConnections { get; }
+
+    public BlockDescription(
+        IReadOnlyList<KernelEntry> kernelEntries,
+        IReadOnlyList<(string Name, PortDirection Direction, PinType Type)> ports,
+        IReadOnlyList<(int SrcKernelIndex, int SrcParam, int TgtKernelIndex, int TgtParam)> internalConnections);
+
+    /// <summary>
+    /// Structural equality: same kernels (path + grid), ports, and connections.
+    /// HandleIds are ignored — they change every construction.
+    /// </summary>
+    public bool StructuralEquals(BlockDescription? other);
+}
+```
+
+---
+
+## Graph (Phase 0 + Phase 1)
+
+### KernelNode
+
+```csharp
+public sealed class KernelNode : IDisposable
+{
+    public Guid Id { get; }
+    public string DebugName { get; }
+    public CUfunction Function { get; }
+
+    public uint GridDimX { get; set; }
+    public uint GridDimY { get; set; }
+    public uint GridDimZ { get; set; }
+    public uint BlockDimX { get; set; }
+    public uint BlockDimY { get; set; }
+    public uint BlockDimZ { get; set; }
+    public uint SharedMemBytes { get; set; }
+
+    public void SetPointer(int index, CUdeviceptr pointer);
+    public void SetScalar<T>(int index, T value) where T : unmanaged;
+    public CUDA_KERNEL_NODE_PARAMS BuildNodeParams();
+
+    public void Dispose(); // frees pinned native memory
+}
+```
+
+### Edge
+
+```csharp
+public sealed record Edge(
+    Guid SourceNodeId,
+    int SourceParamIndex,
+    Guid TargetNodeId,
+    int TargetParamIndex);
+```
+
+### GraphBuilder
+
+```csharp
+public sealed class GraphBuilder
+{
+    public GraphBuilder(DeviceContext device, ModuleCache moduleCache);
+
+    public KernelNode AddKernel(LoadedKernel loaded, string? debugName = null);
+    public void AddEdge(KernelNode source, int sourceParam, KernelNode target, int targetParam);
+    public void SetExternalBuffer(KernelNode node, int paramIndex, CUdeviceptr pointer);
+
+    public IReadOnlyList<KernelNode> Nodes { get; }
+    public IReadOnlyList<Edge> Edges { get; }
+
+    public ValidationResult Validate();
+}
+```
+
+### GraphCompiler
+
+```csharp
+public sealed class GraphCompiler
+{
+    public GraphCompiler(DeviceContext device, BufferPool pool);
+
+    /// <summary>
+    /// Validates, topologically sorts, allocates intermediate buffers, compiles to CUDA Graph.
+    /// </summary>
+    public CompiledGraph Compile(GraphBuilder builder);
+}
+```
+
+### CompiledGraph
+
+```csharp
+public sealed class CompiledGraph : IDisposable
+{
+    public Guid Id { get; }
+
+    public void Launch(ManagedCuda.CudaStream stream);
+
+    /// <summary>
+    /// Hot Update: change scalar value without rebuild.
+    /// </summary>
+    public void UpdateScalar<T>(Guid nodeId, int paramIndex, T value) where T : unmanaged;
+
+    /// <summary>
+    /// Warm Update: change buffer pointer without rebuild.
+    /// </summary>
+    public void UpdatePointer(Guid nodeId, int paramIndex, CUdeviceptr newPointer);
+
+    /// <summary>
+    /// Warm Update: change grid dimensions without rebuild.
+    /// </summary>
+    public void UpdateGrid(Guid nodeId, uint gridX, uint gridY, uint gridZ);
+
+    /// <summary>
+    /// Disposes CUgraph and CUgraphExec. Does NOT dispose KernelNodes.
+    /// KernelNode lifetime is owned by CudaEngine.
+    /// </summary>
+    public void Dispose();
+}
+```
+
+---
+
+## PTX
+
+### PtxLoader
+
+```csharp
+public static class PtxLoader
+{
+    /// <summary>
+    /// Load a PTX file + companion JSON metadata. Returns LoadedKernel.
+    /// </summary>
+    public static LoadedKernel Load(DeviceContext device, string ptxPath);
+}
+```
+
+### ModuleCache
+
+```csharp
+public sealed class ModuleCache : IDisposable
+{
+    public ModuleCache(DeviceContext device);
+
+    public LoadedKernel GetOrLoad(string ptxPath);
+    public bool Contains(string ptxPath);
+
+    public void Dispose();
+}
+```
+
+### KernelDescriptor
+
+```csharp
+public sealed class KernelDescriptor
+{
+    public string EntryPoint { get; }
+    public IReadOnlyList<KernelParamDescriptor> Parameters { get; }
+    public int BlockSizeX { get; }
+    public int SharedMemoryBytes { get; }
+
+    // ... constructed from JSON metadata
+}
+```
+
+### KernelParamDescriptor
+
+```csharp
+public sealed class KernelParamDescriptor
+{
+    public int Index { get; }
+    public string PtxType { get; }
+    public bool IsPointer { get; }
+    public int? Alignment { get; }
+    public string? Name { get; }
+}
+```
+
+---
+
+## Device
+
+### DeviceContext
+
+```csharp
+public sealed class DeviceContext : IDisposable
+{
+    public DeviceContext(int deviceId = 0);
+
+    public ManagedCuda.CudaContext CudaContext { get; }
+    public int DeviceId { get; }
+    public string DeviceName { get; }
+    public long TotalMemory { get; }
+
+    public CUmodule LoadModule(string ptxPath);
+    public CUfunction GetFunction(CUmodule module, string entryPoint);
+
+    public void Dispose();
+}
+```
+
+---
+
+## Constructor Pattern (Blocks)
+
+All blocks follow this pattern. In VL, `NodeContext` is injected automatically as the first constructor parameter.
+
+```csharp
+public class VectorAddBlock : ICudaBlock, IDisposable
+{
+    private readonly CudaContext _ctx;
+
+    public Guid Id { get; } = Guid.NewGuid();
+    public string TypeName => "VectorAdd";
+    public NodeContext NodeContext { get; }
+
+    public IReadOnlyList<IBlockPort> Inputs => _inputs;
+    public IReadOnlyList<IBlockPort> Outputs => _outputs;
+    public IReadOnlyList<IBlockParameter> Parameters => _parameters;
+    public IBlockDebugInfo DebugInfo { get; set; }
+
+    private readonly List<IBlockPort> _inputs = new();
+    private readonly List<IBlockPort> _outputs = new();
+    private readonly List<IBlockParameter> _parameters = new();
+
+    public VectorAddBlock(NodeContext nodeContext, CudaContext ctx)
+    {
+        _ctx = ctx;
+        NodeContext = nodeContext;
+
+        var builder = new BlockBuilder(ctx, this);
+
+        var kernel = builder.AddKernel("kernels/vector_add.ptx");
+
+        _inputs.Add(builder.Input<float>("A", kernel.In(0)));
+        _inputs.Add(builder.Input<float>("B", kernel.In(1)));
+        _outputs.Add(builder.Output<float>("C", kernel.Out(2)));
+        _parameters.Add(builder.InputScalar<uint>("N", kernel.In(3), 1024u));
+
+        builder.Commit();
+        ctx.RegisterBlock(this);
+    }
+
+    public void Dispose() => _ctx.UnregisterBlock(Id);
+}
+```
+
+---
+
+## Planned (Phase 3+)
+
+The following types are designed but not yet implemented:
+
+- **AppendBuffer\<T\>** — GpuBuffer with GPU atomic counter (Phase 3)
+- **InputHandle\<T\> / OutputHandle\<T\>** — VL handle-flow for typed links (Phase 3)
+- **GridConfig / GridSizeMode** — Auto-grid from buffer size (Phase 3)
+- **Regions** — If/While/For conditional graph execution (Phase 3)
+- **Composite blocks** — AddChild / ConnectChildren / ExposeInput/Output (Phase 3)
+- **ProfilingPipeline** — Async GPU event readback (Phase 3+)
+- **IDebugInfo** — Full engine debug info (Phase 3+)
+- **CapturedHandle / StreamCaptureHelper** — cuBLAS/cuFFT via Stream Capture (Phase 4a)
+- **IlgpuCompiler** — ILGPU IR → PTX compilation (Phase 4b)
+- **NvrtcCache** — User CUDA C++ compilation (Phase 4b)
+- **CudaDX11Interop** — DX11/Stride graphics sharing (Phase 5)
+- **ProfilingLevel** — None/Summary/PerBlock/PerKernel/DeepAsync/DeepSync (Phase 3+)
+- **IsCodeDirty / MarkCodeDirty** — Patchable kernel recompile tracking (Phase 4b)
+
+See `PHASES.md` for the implementation roadmap.
