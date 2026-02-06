@@ -6,3 +6,6 @@
 	path = src/References/managedCuda
 	url = git@github.com:kunzmi/managedCuda.git
 	branch = master
+[submodule "src/References/ILGPU"]
+	path = src/References/ILGPU
+	url = git@github.com:m4rs-mt/ILGPU.git
