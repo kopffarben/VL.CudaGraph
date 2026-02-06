@@ -549,3 +549,158 @@ External connections:
 - **Config/Parameters**: VL values → CUDA scalars (including DeltaTime from FrameClock)
 - **Buffers**: Can flow in/out of the graph
 - **Renderer output**: Goes to VL.Stride for visualization (via ResourceProvider wrapping)
+
+---
+
+## Patching UX — ShaderFX Model for Compute
+
+> This section describes how VL.Cuda **feels** to patch, from a VL user's perspective.
+
+### Precedent: ShaderFX
+
+VL already has a GPU patching paradigm: **ShaderFX** (in VL.StandardLibs). Users compose
+shader operations visually — they never write HLSL. The same model applies to VL.Cuda
+compute kernels.
+
+Key principles inherited from ShaderFX:
+- GPU operations are a **closed, finite node-set** (not arbitrary VL code)
+- Pins carry **GPU types** — VL's type system prevents mixing CPU and GPU
+- The user only sees **inputs and outputs** — no intermediate GPU state inspection
+- The patch **describes** work — it doesn't execute it directly
+- Parallelization is **implicit** — the user thinks per-element, not per-thread
+
+### Uniform Block Experience
+
+From the outside, **all four block variants look identical** — a block with typed pins:
+
+```
+From outside (all variants look the same):
+
+┌──────────────┐
+│  VectorScale  │
+│               │
+│  Data ◀───────│  GpuBuffer<float>
+│  Scale ◀──────│  float
+│               │
+│  Result ──────│▶ GpuBuffer<float>
+└──────────────┘
+```
+
+The user doesn't know or care whether the block contains:
+- Filesystem PTX (pre-compiled)
+- ILGPU IR (patchable compute)
+- A library call chain (patchable captured)
+- User CUDA C++ (NVRTC escape-hatch)
+
+### Type System Enforcement
+
+GPU/CPU separation is enforced by VL's type system — no special "GPU mode" needed:
+
+```
+GpuBuffer<float>  ←→  GpuBuffer<float>     ✅ connects
+GpuBuffer<float>  ←→  Spread<float>        ❌ type mismatch, won't connect
+GpuBuffer<float>  ←→  GpuBuffer<int>       ❌ type mismatch, won't connect
+```
+
+To move data between CPU and GPU, the user must use explicit conversion nodes:
+
+```
+┌──────────┐     ┌──────────┐     ┌──────────┐     ┌──────────┐
+│ Spread   │────▶│ Upload   │────▶│ GPU.Mul  │────▶│ Download │──▶ Spread
+│ <float>  │     │ (CPU→GPU)│     │          │     │ (GPU→CPU)│
+└──────────┘     └──────────┘     └──────────┘     └──────────┘
+```
+
+This is intentional — GPU readback is expensive and should be a conscious decision.
+
+### Patchable Compute Kernels (Element-Wise)
+
+When the user opens a patchable compute block, they see GPU operation nodes.
+The abstraction level is **element-wise** — one operation describes what happens
+to a single element. Grid configuration and thread management are invisible.
+
+```
+Inside "ParticleForces" patch:
+
+              ┌───────────┐     ┌───────────────┐
+  Positions ──┤ GPU.Sub   ├────▶┤ GPU.Normalize ├──┐
+  Center ─────┤           │     └───────────────┘  │
+              └───────────┘                         │
+                                                    │  ┌───────────┐
+                                                    ├─▶┤ GPU.Mul   ├── Force
+  Strength ─────────────────────────────────────────┘  │           │
+                                                       └───────────┘
+```
+
+The user patches like they would for CPU math — but with GPU-typed nodes:
+
+| GPU Node | Operation | Analogy |
+|----------|-----------|---------|
+| `GPU.Add` | Element-wise addition | Like `+` but for GPU buffers |
+| `GPU.Mul` | Element-wise multiply | Like `*` but for GPU buffers |
+| `GPU.Sub` | Element-wise subtract | Like `-` but for GPU buffers |
+| `GPU.Normalize` | Normalize vector | Like `Normalize` but GPU |
+| `GPU.Lerp` | Linear interpolation | Like `Lerp` but GPU |
+| `GPU.Sin` / `GPU.Cos` | Trigonometry | Like `Sin`/`Cos` but GPU |
+| `GPU.Clamp` | Clamp to range | Like `Clamp` but GPU |
+| `GPU.Select` | Conditional select | Like `If` but GPU |
+| `GPU.ReduceSum` | Sum all elements | Parallel reduction |
+| `GPU.PrefixSum` | Running sum | Parallel scan |
+
+Each node maps 1:1 to an ILGPU IR operation internally. The user never sees IR,
+PTX, or CUDA concepts. Grid size is derived automatically from buffer dimensions.
+
+### Patchable Library Call Chains
+
+When the user opens a patchable captured block, they see library operation nodes.
+Same principle — place nodes, connect pins:
+
+```
+Inside "MatMulFFT" patch:
+
+          ┌──────────────┐     ┌──────────────┐
+  A ──────┤ cuBLAS.Sgemm ├────▶┤ cuFFT.Forward├── Result
+  B ──────┤              │     │              │
+  M ──────┤              │     │   Size ◀─────│
+  N ──────┤              │     └──────────────┘
+  K ──────┤              │
+          └──────────────┘
+```
+
+Library nodes are a separate closed set:
+
+| Library Node | Operation |
+|-------------|-----------|
+| `cuBLAS.Sgemm` | Matrix multiply (float) |
+| `cuBLAS.Dgemm` | Matrix multiply (double) |
+| `cuBLAS.Saxpy` | Vector scale + add |
+| `cuFFT.Forward` | FFT forward transform |
+| `cuFFT.Inverse` | FFT inverse transform |
+
+From outside, a library chain block looks identical to a compute block — same
+pin types, same connection rules. The difference is purely internal (Stream
+Capture vs ILGPU IR).
+
+### What the User Cannot Do Inside GPU Patches
+
+GPU patches are **not** general-purpose VL patches. The user cannot:
+
+- Use CPU nodes (Spread operations, string manipulation, IO, etc.)
+- Inspect intermediate values via tooltips (data is on GPU)
+- Use VL delegates or stateful operations
+- Create dynamic graph structures (no ForEach, no Reactive)
+
+This is the same constraint as ShaderFX — and VL users already understand it.
+The type system enforces it naturally: CPU-typed pins don't connect to GPU-typed pins.
+
+### Three Levels of GPU Usage
+
+| Level | User | What they do |
+|-------|------|-------------|
+| **Consumer** | Most VL users | Place pre-made blocks, connect pins, tweak parameters |
+| **Composer** | Advanced users | Patch custom GPU logic using GPU nodes (element-wise) |
+| **Author** | C#/CUDA developers | Write PTX (Triton/nvcc), load via filesystem, or write CUDA C++ via NVRTC |
+
+Level 1 (Consumer) requires zero GPU knowledge. Level 2 (Composer) requires
+understanding of element-wise parallel thinking (same as ShaderFX). Level 3
+(Author) requires CUDA expertise but offers maximum control.

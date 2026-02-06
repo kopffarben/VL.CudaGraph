@@ -107,6 +107,31 @@ builder.Output<float>("C", kernel.Out(2));
 
 **Key constraint:** `cuGraphExecKernelNodeSetParams` cannot swap the `CUfunction` itself. A code change always requires a Cold rebuild of the block. However, all parameter updates remain Hot/Warm — only the kernel logic change triggers a rebuild.
 
+### Abstraction Level: Element-Wise (ShaderFX Model)
+
+Patchable kernels use an **element-wise** abstraction — like ShaderFX for compute.
+The user describes what happens to a single element. Grid configuration, thread
+management, and parallelization are invisible and automatic.
+
+```
+VL Patch (user perspective):          CUDA (what actually runs):
+
+  GPU.Mul(A, B) → C                    for each thread i in parallel:
+                                            C[i] = A[i] * B[i]
+```
+
+The user **does not** think about:
+- Thread blocks, grid dimensions, warps
+- Memory coalescing, shared memory, barriers
+- Thread indices, block indices
+
+Grid size is derived automatically from input buffer dimensions. Block size
+defaults to 256 (tunable as an advanced option on the block).
+
+This matches the ShaderFX precedent where VL users compose pixel/vertex operations
+without thinking about GPU execution details. See `VL-INTEGRATION.md` for the
+full patching UX design.
+
 ### Why ILGPU IR (not NVRTC)
 
 | Aspect | ILGPU IR → PTX | NVRTC (CUDA C++ → PTX) |

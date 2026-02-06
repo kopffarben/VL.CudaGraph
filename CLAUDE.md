@@ -137,6 +137,8 @@ src/
 | AppHost.TakeOwnership | Ensures CudaEngine cleanup on app shutdown |
 | ResourceProvider at Stride boundary only | Internal: raw handles. External: VL-compatible lifetime |
 | DeltaTime as normal VL pin | No special CUDA handling, user connects FrameClock |
+| ShaderFX model for patchable kernels | Element-wise, implicit parallelism, GPU type enforcement |
+| Three user levels | Consumer (use blocks), Composer (patch GPU nodes), Author (write PTX) |
 
 ## Execution Model Summary
 
