@@ -27,7 +27,10 @@ CudaContext is a facade that composes several internal services. These services 
 │  │ ModuleCache   │  (PTX compilation cache)                  │
 │  └──────────────┘                                            │
 │  ┌──────────────┐                                            │
-│  │ NvrtcCache    │  (NVRTC compilation for patchable kernels) │
+│  │IlgpuCompiler │  (ILGPU IR → PTX for patchable kernels)    │
+│  └──────────────┘                                            │
+│  ┌──────────────┐                                            │
+│  │ NvrtcCache    │  (NVRTC escape-hatch for user CUDA C++)    │
 │  └──────────────┘                                            │
 │  ┌──────────────────┐                                         │
 │  │LibraryHandleCache│  (cuBLAS/cuFFT handle cache)            │
@@ -65,6 +68,7 @@ public class CudaContext : IDisposable
         Device = new DeviceContext(options.DeviceId);
         Pool = new BufferPool(Device);
         Modules = new ModuleCache(Device);
+        Ilgpu = new IlgpuCompiler(Device);
         Nvrtc = new NvrtcCache(Device);
         LibHandles = new LibraryHandleCache(Device);
         Registry = new BlockRegistry();
@@ -80,6 +84,7 @@ public class CudaContext : IDisposable
     {
         Pool.Dispose();
         Modules.Dispose();
+        Ilgpu.Dispose();
         Nvrtc.Dispose();
         LibHandles.Dispose();
         Device.Dispose();
@@ -104,7 +109,8 @@ BlockRegistry and ConnectionGraph both trigger structure-dirty independently. Wi
 | **DirtyTracker** | Dirty flags per node type (KernelNode: Hot Update/Warm Update/Code Rebuild/Cold Rebuild; CapturedNode: Recapture/Cold Rebuild) |
 | **BufferPool** | GPU memory allocation with power-of-2 bucketing |
 | **ModuleCache** | PTX loading, CUmodule caching, kernel descriptor storage |
-| **NvrtcCache** | NVRTC compilation cache for patchable kernels (CUDA C++ → PTX) |
+| **IlgpuCompiler** | ILGPU IR → PTX compiler for patchable kernels (primary path) |
+| **NvrtcCache** | NVRTC compilation cache for user CUDA C++ (escape-hatch) |
 | **LibraryHandleCache** | Cached library handles (cublasHandle_t, cufftHandle, etc.) |
 | **DeviceContext** | CUcontext, default stream, capture stream, device properties |
 

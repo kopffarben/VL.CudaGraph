@@ -95,7 +95,7 @@ VL.Cuda uses a centralized execution model with three actors:
 |-------|------|---------|--------|
 | **Hot** | ~0 | Scalar value changed | `cuGraphExecKernelNodeSetParams` |
 | **Warm** | Cheap | Buffer pointer changed, grid size changed | `cuGraphExecKernelNodeSetParams` |
-| **Code** | Medium | NVRTC recompile (patchable kernel) | New CUmodule → Cold rebuild of affected block |
+| **Code** | Medium | ILGPU IR recompile (patchable kernel) | New CUmodule → Cold rebuild of affected block |
 | **Cold** | Expensive | Node/edge added/removed, Hot-Swap, PTX reload | Full `cuGraphInstantiate` |
 | **Recapture** | Medium | CapturedNode parameter changed | Recapture + `cuGraphExecChildGraphNodeSetParams` |
 
@@ -114,9 +114,9 @@ Source 1 — Filesystem PTX (build-time, any toolchain):
 
     Kernel Source (.py / .cu / .ptx)  →  Compile  →  .ptx + .json
 
-Source 2 — Patchable Kernels (runtime, NVRTC):
+Source 2 — Patchable Kernels (runtime, ILGPU IR):
 
-    VL Node-Set  →  Codegen (CUDA C++)  →  NVRTC compile  →  PTX bytes
+    VL Node-Set  →  ILGPU IR (programmatic)  →  PTXBackend.Compile()  →  PTX string
 
 Source 3 — Library Calls (runtime, Stream Capture):
 
@@ -126,12 +126,12 @@ Source 3 — Library Calls (runtime, Stream Capture):
 ```
 Runtime (C#/VL):
 
-    Source 1: PTX + JSON Files    Source 2: CUDA C++ string
+    Source 1: PTX + JSON Files    Source 2: VL Node-Set
            │                              │
            ▼                              ▼
     ┌─────────────────┐       ┌─────────────────┐
-    │   PTX Loader    │       │   NvrtcCache     │
-    │   ModuleCache   │       │   NVRTC Compile  │
+    │   PTX Loader    │       │  IlgpuCompiler   │
+    │   ModuleCache   │       │  IR → PTX → Mod  │
     └────────┬────────┘       └────────┬────────┘
              │                       │
              └───────┬───────────┘
@@ -284,9 +284,12 @@ The CudaEngine is the only active component. This ensures:
 ```
 VL.Cuda.Core
     │
-    ├── ManagedCuda (NuGet)
+    ├── ManagedCuda (NuGet) — CUDA 13.0 minimum
     │   ├── CUDA Driver API
-    │   └── NVRTC (Runtime Compilation, for patchable kernels)
+    │   └── NVRTC (escape-hatch for user CUDA C++)
+    │
+    ├── ILGPU (NuGet) — PTX compilation only
+    │   └── PTXBackend (IR → PTX, no CUDA context)
     │
     └── VL.Core
         ├── NodeContext (identity, first ctor parameter by VL convention)
@@ -326,16 +329,17 @@ VL.Cuda.Stride (optional)
 | `BufferPool.cs` | Memory pooling with power-of-2 buckets |
 | `GraphCompiler.cs` | Converts description to CUDA Graph (incl. Phase 5.5 Stream Capture for CapturedNodes) |
 | `PTXLoader.cs` | Parses PTX, extracts kernel info |
-| `NvrtcCache.cs` | NVRTC compilation cache for patchable kernels |
+| `IlgpuCompiler.cs` | ILGPU IR → PTX compiler for patchable kernels |
+| `NvrtcCache.cs` | NVRTC compilation cache (escape-hatch for user CUDA C++) |
 | `StreamCaptureHelper.cs` | Stream Capture wrapper for Library Calls |
 | `BlockBuilder.cs` | DSL for block construction (AddKernel + AddCaptured) |
 
 ## CUDA Requirements
 
-**Minimum: CUDA 12.8 / Driver ≥ 570.x / Compute Capability 7.5 (RTX 20xx+)**
+**Minimum: CUDA 13.0 / Compute Capability 7.5 (RTX 20xx+)**
 
-We target CUDA 12.8 as hard minimum to use the full CUDA Graph feature set
-without version-gating or fallback paths:
+We target CUDA 13.0 as hard minimum (aligned with ManagedCuda NVRTC DLL target)
+to use the full CUDA Graph feature set without version-gating or fallback paths:
 
 | Feature | Available Since | Status |
 |---------|----------------|--------|

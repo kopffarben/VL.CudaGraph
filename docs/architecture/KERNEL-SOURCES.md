@@ -2,33 +2,44 @@
 
 ## Overview
 
-The system supports **three kernel sources** that map to **two CUDA Graph node types**. This design keeps the block system uniform while enabling both custom kernels and NVIDIA library operations.
+The system supports **three kernel sources** that map to **two CUDA Graph node types**. Each node type has a **static** and a **patchable** variant. This design keeps the block system uniform while enabling both custom kernels and NVIDIA library operations.
 
 ```
 KERNEL SOURCES                              NODE TYPE IN GRAPH
 ══════════════                              ══════════════════
 
 1. Filesystem PTX ──────────────┐
-   (Triton, nvcc, hand-written) │
+   (Triton, nvcc, hand-written) │           KernelNode (static)
    .ptx + .json files           │
                                 ├───→  KernelNode
 2. Patchable Kernel ────────────┘      ├─ Hot:       Scalar changed         ~0 cost
-   (VL Node-Set → NVRTC Codegen)      ├─ Warm:      Pointer changed        cheap
-   Live or OnSave compilation          ├─ Code:      NVRTC recompile        medium
+   (VL Node-Set → ILGPU IR → PTX)     ├─ Warm:      Pointer changed        cheap
+   Live or OnSave compilation          ├─ Code:      ILGPU recompile        fast (~1-10ms)
                                        └─ Cold:      Structure rebuild      expensive
 
 3. Library Call ──────────────────→  CapturedNode (ChildGraphNode)
    (cuBLAS, cuFFT, cuDNN, cuRAND)     ├─ Recapture: Param changed          medium
    Stream Capture                      └─ Cold:      Structure rebuild      expensive
+
+   Patchable Captured ────────────→  CapturedNode (chained library calls)
+   (User-composed sequence of            Same update behavior as above,
+    library calls → Stream Capture)      but captures the entire chain
 ```
 
-All three sources are **fully integrated** into the block system. Blocks use `BlockBuilder` to declare their content — the Graph Compiler handles the rest.
+### Static vs Patchable Variants
+
+| | Static | Patchable |
+|--|--------|-----------|
+| **KernelNode** | Filesystem PTX (Triton, nvcc, etc.) | ILGPU IR (user composes ops visually in VL) |
+| **CapturedNode** | Single library call | Chain of library calls (user composes sequence) |
+
+All four variants are **fully integrated** into the block system. Blocks use `BlockBuilder` to declare their content — the Graph Compiler handles the rest.
 
 ---
 
-## Source 1: Filesystem PTX
+## Source 1: Filesystem PTX (Static KernelNode)
 
-Pre-compiled PTX files loaded from disk. This is the primary path for custom kernels.
+Pre-compiled PTX files loaded from disk. This is the primary path for custom kernels and the MVP path.
 
 **Toolchain:** Any — Triton (recommended), nvcc, Numba, hand-written PTX.
 
@@ -55,22 +66,26 @@ builder.InputScalar<int>("Count", kernel.In(3));
 
 ---
 
-## Source 2: Patchable Kernels
+## Source 2: Patchable Kernels (Patchable KernelNode)
 
-Kernels generated at runtime from a visual node-set in VL. The user patches GPU operations visually, and the system generates CUDA C++ source code, compiles it via NVRTC, and loads the result as a normal KernelNode.
+Kernels generated at runtime from a visual node-set in VL. The user patches GPU operations visually, and the system constructs ILGPU IR programmatically, compiles it to PTX, and loads the result as a normal KernelNode.
+
+**NVRTC** is retained as an escape-hatch for users who want to load their own CUDA C++ code at runtime.
+
+### Primary Path: ILGPU IR → PTX
 
 **Flow:**
 ```
 VL Patch:    User edits GPU node-set (GPU.Add, GPU.Mul, GPU.Reduce, ...)
                  │
-                 ▼ Live / OnSave
-Codegen:     Node-set → CUDA C++ source string
-                 │
                  ▼
-NVRTC:       nvrtcCompileProgram() → PTX bytes (or cubin)
-                 │
+IR Build:    Node-set → ILGPU IR (programmatic, type-safe)
+                 │  IRContext.Declare() + Method.Builder + BasicBlock.Builder
                  ▼
-Loader:      cuModuleLoadData(ptxBytes) → CUmodule → CUfunction
+PTX Gen:     PTXBackend.Compile() → PTXCompiledKernel.PTXAssembly (string)
+                 │  Fast: ~1-10ms (IR → PTX, no C++ parsing)
+                 ▼
+Loader:      cuModuleLoadData(ptxString) → CUmodule → CUfunction
                  │
                  ▼
 Graph:       Normal KernelNode — same as Filesystem PTX from here on
@@ -79,8 +94,8 @@ Graph:       Normal KernelNode — same as Filesystem PTX from here on
 **BlockBuilder usage:**
 ```csharp
 // Patchable kernels use the same AddKernel path,
-// but the PTX comes from NVRTC instead of a file.
-var kernel = builder.AddKernel(nvrtcModule, "user_kernel", debugName: "MatMulPatch");
+// but the PTX comes from ILGPU instead of a file.
+var kernel = builder.AddKernel(ilgpuModule, "user_kernel", debugName: "MatMulPatch");
 builder.Input<float>("A", kernel.In(0));
 builder.Input<float>("B", kernel.In(1));
 builder.Output<float>("C", kernel.Out(2));
@@ -88,51 +103,88 @@ builder.Output<float>("C", kernel.Out(2));
 
 **Update behavior:**
 - Hot/Warm: Same as Filesystem PTX — full parameter patchability
-- Code: User edits the node-set → NVRTC recompile → new CUmodule → Cold rebuild of affected block only (not the entire graph)
+- Code: User edits the node-set → ILGPU IR rebuild → new PTX → new CUmodule → Cold rebuild of affected block only (not the entire graph)
 
-**Key constraint:** `cuGraphExecKernelNodeSetParams` cannot swap the `CUfunction` itself. A code change always requires a Cold rebuild of the block. However, all parameter updates remain Hot/Warm — only the kernel logic change is expensive.
+**Key constraint:** `cuGraphExecKernelNodeSetParams` cannot swap the `CUfunction` itself. A code change always requires a Cold rebuild of the block. However, all parameter updates remain Hot/Warm — only the kernel logic change triggers a rebuild.
 
-### NVRTC Integration
+### Why ILGPU IR (not NVRTC)
 
-NVRTC (NVIDIA Runtime Compilation) is available in ManagedCuda as a separate module. It compiles CUDA C++ strings to PTX or cubin at runtime.
+| Aspect | ILGPU IR → PTX | NVRTC (CUDA C++ → PTX) |
+|--------|---------------|------------------------|
+| **Input** | Programmatic API (type-safe) | CUDA C++ string (text) |
+| **VL Mapping** | Direct: VL node → IR operation | Indirect: VL node → C++ codegen → string |
+| **Type Safety** | Compile-time (IR is typed) | None (string concatenation) |
+| **Compile Speed** | ~1-10ms (IR → PTX, no parsing) | ~100ms-2s (C++ parsing + compilation) |
+| **Error Reporting** | Structured (IR validation) | Cryptic C++ compiler errors |
+| **Patchability** | Modify IR nodes, recompile | Regenerate C++ string, recompile |
+| **Dependency** | ILGPU NuGet (~1.5 MB) | NVRTC DLL (CUDA toolkit install) |
+| **.NET Native** | Same language as VL.Cuda | C++ string templates in C# |
+
+### ILGPU Integration: PTX Extraction Only
+
+ILGPU is used **only as a PTX compiler** — no accelerator, no CUDA context, no runtime. The workflow:
+
+1. Construct kernel IR via `IRContext.Declare()` + `Method.Builder`
+2. Compile via `PTXBackend.Compile()` → `PTXCompiledKernel`
+3. Extract PTX string via `.PTXAssembly`
+4. Load into ManagedCuda via `cuModuleLoadData()`
+5. Add to CUDA Graph via `cuGraphAddKernelNode()`
+
+No CUDA context conflict with ManagedCuda because `PTXBackend` does not create a CUDA context.
+
+### VL Node-Set → ILGPU IR Mapping
+
+```
+VL Node               ILGPU IR Builder Call
+═══════               ════════════════════════
+GPU.Add(a, b)     →   CreateArithmetic(a, b, BinaryArithmeticKind.Add)
+GPU.Mul(a, b)     →   CreateArithmetic(a, b, BinaryArithmeticKind.Mul)
+GPU.Sin(x)        →   CreateArithmetic(x, UnaryArithmeticKind.Sin)    (via math intrinsic)
+GPU.Load(ptr)     →   CreateLoad(ptr)
+GPU.Store(ptr, v) →   CreateStore(ptr, v)
+GPU.ThreadIdx.X   →   CreateGroupIndexValue(DeviceConstantDimension3D.X)
+GPU.BlockIdx.X    →   CreateGridIndexValue(DeviceConstantDimension3D.X)
+GPU.SharedMem     →   CreateAlloca(type, MemoryAddressSpace.Shared)
+GPU.Barrier       →   CreateBarrier()
+GPU.AtomicAdd     →   CreateAtomic(AtomicKind.Add, ...)
+GPU.If(cond)      →   CreateIfBranch(cond, trueBlock, falseBlock)
+Constant(42)      →   CreatePrimitiveValue(location, 42)
+```
+
+65 IR ValueKind types available: arithmetic, memory, control flow, atomics, threading, device constants.
+
+### Escape-Hatch: NVRTC for User CUDA C++
+
+For users who want to load their own CUDA C++ code at runtime (not through the VL visual node-set), NVRTC remains available:
 
 ```csharp
-// Simplified flow
-string cudaSource = PatchableCodegen.Generate(nodeSet);
+// User-written CUDA C++ (not generated from VL nodes)
+string userCudaSource = File.ReadAllText("my_kernel.cu");
 
-nvrtcCreateProgram(ref prog, cudaSource, "user_kernel", 0, null, null);
-nvrtcCompileProgram(prog, numOptions, options);  // options: --gpu-architecture=sm_75
-nvrtcGetPTX(prog, ptxBytes);
-
-// From here: standard module loading
-cuModuleLoadData(ref module, ptxBytes);
-cuModuleGetFunction(ref func, module, "user_kernel");
+var module = nvrtcCache.GetOrCompile(userCudaSource, "my_kernel", sm_75);
+var kernel = builder.AddKernel(module, "my_kernel");
 ```
 
-### Codegen Node-Set
-
-The patchable kernel system provides a **closed, finite set** of GPU primitives as VL nodes:
-
-```
-Element-wise:   GPU.Add, GPU.Mul, GPU.Div, GPU.Abs, GPU.Clamp, GPU.Lerp, ...
-Reduction:      GPU.ReduceSum, GPU.ReduceMin, GPU.ReduceMax, ...
-Scan:           GPU.PrefixSum, GPU.ExclusiveScan, ...
-Math:           GPU.Sin, GPU.Cos, GPU.Exp, GPU.Sqrt, GPU.Pow, ...
-Comparison:     GPU.Greater, GPU.Less, GPU.Equal, ...
-Selection:      GPU.Where, GPU.Select, ...
-Memory:         GPU.Gather, GPU.Scatter, ...
-```
-
-These are **not** open VL delegates (VL delegates are always open — they receive context from the VL tracer). Instead, these are a defined set of operations that the codegen knows how to translate to CUDA C++.
+This path uses `NvrtcCache` (CUDA C++ → PTX via `nvrtcCompileProgram()`).
 
 ### Compilation Caching
 
-NVRTC compilation results are cached alongside the ModuleCache:
+Both ILGPU and NVRTC compilation results are cached:
 
 ```csharp
+internal class IlgpuCompiler
+{
+    // Key: hash of IR description (node-set topology + types)
+    // Value: compiled PTX string + CUmodule
+    private ConcurrentDictionary<string, CachedModule> _cache;
+
+    public CUmodule GetOrCompile(IKernelIRDescription irDesc, int targetSM);
+    public void Invalidate(string descriptionHash);
+}
+
 internal class NvrtcCache
 {
-    // Key: hash of generated CUDA source
+    // Key: hash of CUDA C++ source string
     // Value: compiled CUmodule
     private ConcurrentDictionary<string, CachedModule> _cache;
 
@@ -148,6 +200,8 @@ internal class NvrtcCache
 Library Calls are invocations of NVIDIA libraries (cuBLAS, cuFFT, cuDNN, cuRAND, NPP) that cannot be expressed as explicit kernel nodes. These libraries use internal, opaque kernels that are invisible to the CUDA Graph API.
 
 **Integration mechanism:** Stream Capture wraps the library call into a ChildGraphNode.
+
+### Static CapturedNode (Single Library Call)
 
 **Flow:**
 ```
@@ -180,11 +234,60 @@ var op = builder.AddCaptured("MatMul", stream =>
 });
 ```
 
-**Update behavior:**
-- Recapture: Any parameter change (scalar or pointer) requires re-capture of the library call and `cuGraphExecChildGraphNodeSetParams`. This is more expensive than Hot/Warm but avoids a full Cold rebuild.
-- Cold: Structural changes require full rebuild.
+### Patchable CapturedNode (Chained Library Calls)
 
-**Why Stream Capture is necessary:**
+A Patchable CapturedNode composes **multiple library calls into a single block**. The user defines the chain visually in VL — from outside, it's one block/function. Internally, the entire chain is captured via Stream Capture as one ChildGraphNode.
+
+**Flow:**
+```
+VL Patch:    User composes library call sequence visually
+                 │
+                 ▼
+Host-side:   cuStreamBeginCapture(stream, RELAXED)
+                 │
+                 ▼
+Chain:       cublasSgemm(handle, A, B → temp1, stream)     // Step 1
+             cublasSgeam(handle, temp1, C → temp2, stream) // Step 2
+             cufftExecC2C(plan, temp2 → result, stream)    // Step 3
+                 │
+                 ▼
+Host-side:   cuStreamEndCapture(stream) → childGraph
+                 │
+                 ▼
+Graph:       CapturedNode (ChildGraphNode) — one node, multiple ops inside
+```
+
+**BlockBuilder usage:**
+```csharp
+var chain = builder.AddCaptured("MatMulFFT", stream =>
+{
+    // Step 1: Matrix multiply
+    cublasSetStream(blasHandle, stream);
+    cublasSgemm(blasHandle, ..., A, B, temp1);
+
+    // Step 2: Scale result
+    cublasSgeam(blasHandle, ..., temp1, temp2);
+
+    // Step 3: FFT
+    cufftSetStream(fftPlan, stream);
+    cufftExecC2C(fftPlan, temp2, result, CUFFT_FORWARD);
+}, new CapturedOpDescriptor
+{
+    DebugName = "MatMulFFT_Chain",
+    Inputs = new[] { ("A", typeof(float)), ("B", typeof(float)) },
+    Outputs = new[] { ("Result", typeof(float)) },
+    Scalars = new[] { ("M", typeof(int)), ("N", typeof(int)), ("K", typeof(int)) }
+});
+```
+
+**From VL's perspective:** One block with Inputs (A, B) and Output (Result). The internal chain is invisible — it's a patchable expression that compiles to a single CapturedNode.
+
+**Update behavior (both static and patchable):**
+- Recapture: Any parameter change (scalar or pointer) requires re-capture of the entire chain and `cuGraphExecChildGraphNodeSetParams`. More expensive than Hot/Warm but avoids a full Cold rebuild.
+- Cold: Structural changes (chain composition changed) require full rebuild.
+
+### Why Stream Capture is necessary
+
 - cuBLAS, cuFFT, cuDNN are Host-side APIs — they cannot be called from PTX
 - Their internal kernels are opaque — grid config, shared memory, and algorithm selection happen inside the library
 - Stream Capture is the only CUDA-supported mechanism to include library calls in a CUDA Graph
@@ -239,19 +342,19 @@ With Host pointer mode, scalar values are baked into the captured graph at captu
 
 ## Comparison
 
-| Aspect | Filesystem PTX | Patchable Kernel | Library Call |
-|--------|---------------|-----------------|-------------------|
-| **Source** | .ptx + .json file | VL node-set → NVRTC | cuBLAS/cuFFT/cuDNN |
-| **Node type** | KernelNode | KernelNode | CapturedNode |
-| **Hot Update** | ✅ ~0 cost | ✅ ~0 cost | ❌ Recapture needed |
-| **Warm Update** | ✅ cheap | ✅ cheap | ❌ Recapture needed* |
-| **Code Rebuild** | Cold Rebuild (FileWatcher) | Cold Rebuild (NVRTC recompile) | Cold Rebuild |
-| **Profiling** | ✅ Full (PerKernel) | ✅ Full (PerKernel) | ⚠️ PerBlock only (opaque) |
-| **Grid config** | ✅ User-controlled | ✅ User-controlled | ❌ Library decides |
-| **Shape rules** | ✅ Via JSON | ✅ Via codegen | ❌ Hardcoded per op |
-| **Performance** | Depends on author | ~90-95% of library | 100% (vendor-optimized) |
-| **Debuggability** | ✅ Single kernel | ✅ Single kernel | ⚠️ Opaque child graph |
-| **Complexity** | Low (just load) | Medium (codegen) | Medium (stream capture) |
+| Aspect | Filesystem PTX | Patchable Kernel (ILGPU) | User CUDA C++ (NVRTC) | Library Call | Patchable Captured |
+|--------|---------------|--------------------------|----------------------|-------------|-------------------|
+| **Source** | .ptx + .json file | VL node-set → ILGPU IR | User .cu file → NVRTC | Single lib call | Chain of lib calls |
+| **Node type** | KernelNode | KernelNode | KernelNode | CapturedNode | CapturedNode |
+| **Variant** | Static | Patchable | Escape-hatch | Static | Patchable |
+| **Hot Update** | ~0 cost | ~0 cost | ~0 cost | Recapture | Recapture |
+| **Warm Update** | cheap | cheap | cheap | Recapture* | Recapture* |
+| **Code Rebuild** | Cold (FileWatcher) | ILGPU ~1-10ms | NVRTC ~100ms-2s | N/A | N/A |
+| **Compile speed** | N/A (pre-compiled) | Fast (~1-10ms) | Slow (~100ms-2s) | N/A | N/A |
+| **Profiling** | Full (PerKernel) | Full (PerKernel) | Full (PerKernel) | PerBlock only | PerBlock only |
+| **Grid config** | User-controlled | User-controlled | User-controlled | Library decides | Library decides |
+| **Performance** | Depends on author | ~90-95% of library | Depends on author | 100% (vendor) | 100% (vendor) |
+| **Complexity** | Low (just load) | Medium (IR builder) | Medium (NVRTC) | Medium (capture) | Higher (chain + capture) |
 
 *With `CUBLAS_POINTER_MODE_DEVICE`, scalar-only changes can avoid Recapture.
 
@@ -260,41 +363,44 @@ With Host pointer mode, scalar values are baked into the captured graph at captu
 ## When to Use Which
 
 ```
-Want full control and patchability?          → Filesystem PTX or Patchable Kernel
-Need vendor-optimized FFT/GEMM?             → Library Call (cuFFT/cuBLAS)
-Prototyping a new algorithm?                 → Patchable Kernel (fastest iteration)
-Production particle system?                  → Filesystem PTX (Triton, pre-compiled)
-Complex deep learning inference?             → Library Call (cuDNN)
-Simple element-wise math?                    → Patchable Kernel (trivial codegen)
+Want full control over GPU ops?             → Filesystem PTX (Triton/nvcc, pre-compiled)
+Rapid visual prototyping?                   → Patchable Kernel (ILGPU, instant VL iteration)
+Need vendor-optimized FFT/GEMM?            → Library Call (cuFFT/cuBLAS, single op)
+Complex multi-step library pipeline?        → Patchable Captured (chained cuBLAS/cuFFT)
+Loading custom CUDA C++ at runtime?         → User CUDA C++ (NVRTC escape-hatch)
+Simple element-wise math in VL?             → Patchable Kernel (trivial IR construction)
+Production particle system?                 → Filesystem PTX (Triton, pre-compiled, tuned)
 ```
 
 ---
 
 ## Architecture Integration
 
-Both node types live in the same block system and graph compiler:
+Both node types (with both variants) live in the same block system and graph compiler:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │  BlockBuilder                                                │
 │                                                              │
-│  .AddKernel(ptxPath, entry)     → KernelNodeDescriptor       │
-│  .AddKernel(nvrtcModule, entry) → KernelNodeDescriptor       │
-│  .AddCaptured(name, action)     → CapturedNodeDescriptor     │
+│  .AddKernel(ptxPath, entry)       → KernelNodeDescriptor     │  Static KernelNode
+│  .AddKernel(ilgpuModule, entry)   → KernelNodeDescriptor     │  Patchable KernelNode
+│  .AddKernel(nvrtcModule, entry)   → KernelNodeDescriptor     │  User CUDA C++ (escape-hatch)
+│  .AddCaptured(name, action)       → CapturedNodeDescriptor   │  Static CapturedNode
+│  .AddCaptured(name, chainAction)  → CapturedNodeDescriptor   │  Patchable CapturedNode
 │                                                              │
-│  Both produce INodeDescriptor → Graph Compiler handles both  │
+│  All produce INodeDescriptor → Graph Compiler handles all    │
 └─────────────────────────────────────────────────────────────┘
          │
          ▼
 ┌─────────────────────────────────────────────────────────────┐
 │  Graph Compiler                                              │
 │                                                              │
-│  Phase 1-5: Same for both (validation, alloc, topo, shape,  │
+│  Phase 1-5: Same for all (validation, alloc, topo, shape,   │
 │             liveness)                                        │
 │  Phase 5.5: Stream Capture — only for CapturedNodes          │
 │  Phase 6:   CUDA Build — KernelNode via cuGraphAddKernelNode │
 │                          CapturedNode via AddChildGraphNode  │
-│  Phase 7:   Instantiate — same for both                      │
+│  Phase 7:   Instantiate — same for all                       │
 └─────────────────────────────────────────────────────────────┘
          │
          ▼

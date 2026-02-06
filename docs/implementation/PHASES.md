@@ -11,9 +11,11 @@ Phase 1: Graph Basics
     ↓
 Phase 2: Execution Model & VL Integration
     ↓
-Phase 3: Advanced Features
+Phase 3: Advanced Features (Regions, Liveness)
     ↓
-Phase 4: Patchable Kernels & Libraries
+Phase 4a: Library Calls (Stream Capture)
+    ↓
+Phase 4b: Patchable Kernels (ILGPU IR + NVRTC escape-hatch)
     ↓
 Phase 5: Graphics Interop
 ```
@@ -29,7 +31,7 @@ Phase 5: Graphics Interop
 | Task | Description | Depends On |
 |------|-------------|------------|
 | 0.1 | Create solution structure | - |
-| 0.2 | Add ManagedCuda dependency | 0.1 |
+| 0.2 | Add ManagedCuda NuGet dependency, verify CUDA 13.0 compat | 0.1 |
 | 0.3 | Implement CudaContext wrapper | 0.2 |
 | 0.4 | Implement CudaStream wrapper | 0.3 |
 | 0.5 | Implement GpuBuffer<T> | 0.3 |
@@ -232,9 +234,9 @@ model.SaveToFile("system.json");
 
 ---
 
-## Phase 4: Patchable Kernels & Libraries
+## Phase 4a: Library Calls (Stream Capture)
 
-**Goal**: NVRTC patchable kernels, cuBLAS/cuFFT via CapturedNode, INodeDescriptor abstraction
+**Goal**: cuBLAS/cuFFT via CapturedNode (static + patchable chained), INodeDescriptor abstraction
 
 > Read `KERNEL-SOURCES.md` before implementing this phase.
 
@@ -242,39 +244,38 @@ model.SaveToFile("system.json");
 
 | Task | Description | Depends On |
 |------|-------------|------------|
-| 4.1 | Define INodeDescriptor, KernelNodeDescriptor, CapturedNodeDescriptor | - |
-| 4.2 | Implement NvrtcCache (CUDA C++ → PTX/cubin compilation caching) | - |
-| 4.3 | Implement AddKernel(CUmodule) overload in BlockBuilder | 4.1, 4.2 |
-| 4.4 | Implement patchable kernel codegen (node-set → CUDA C++) | 4.3 |
-| 4.5 | Implement StreamCaptureHelper | - |
-| 4.6 | Implement LibraryHandleCache | - |
-| 4.7 | Implement AddCaptured() in BlockBuilder | 4.1, 4.5, 4.6 |
-| 4.8 | Implement cuBLAS wrapper (Sgemm via Stream Capture) | 4.7 |
-| 4.9 | Implement cuFFT wrapper (via Stream Capture) | 4.7 |
-| 4.10 | Graph Compiler Phase 5.5 (Stream Capture for CapturedNodes) | 4.7 |
-| 4.11 | Dirty-Tracking: Add Recapture level for CapturedNodes | 4.10 |
-| 4.12 | Dirty-Tracking: Add Code level for NVRTC recompile | 4.4 |
-| 4.13 | CudaEngine.UpdateDirtyNodes() dispatch by node type | 4.11, 4.12 |
-| 4.14 | Patchable kernel + CapturedNode tests | 4.13 |
+| 4a.1 | Define INodeDescriptor, KernelNodeDescriptor, CapturedNodeDescriptor | - |
+| 4a.2 | Implement StreamCaptureHelper | - |
+| 4a.3 | Implement LibraryHandleCache | - |
+| 4a.4 | Implement AddCaptured() in BlockBuilder (static + chained) | 4a.1, 4a.2, 4a.3 |
+| 4a.5 | Implement cuBLAS wrapper (Sgemm via Stream Capture) | 4a.4 |
+| 4a.6 | Implement cuFFT wrapper (via Stream Capture) | 4a.4 |
+| 4a.7 | Graph Compiler Phase 5.5 (Stream Capture for CapturedNodes) | 4a.4 |
+| 4a.8 | Dirty-Tracking: Add Recapture level for CapturedNodes | 4a.7 |
+| 4a.9 | CudaEngine.UpdateDirtyNodes() dispatch by node type | 4a.8 |
+| 4a.10 | Patchable CapturedNode: chained library call sequence | 4a.4 |
+| 4a.11 | CapturedNode tests | 4a.10 |
 
 ### Deliverables
 
 ```csharp
 // Should work:
 
-// Patchable kernel (NVRTC)
-string cudaSource = PatchableCodegen.Generate(nodeSet);
-var module = nvrtcCache.GetOrCompile(cudaSource, "user_kernel", sm75);
-var kernel = builder.AddKernel(module, "user_kernel");
-// Hot/Warm parameter updates work like filesystem PTX
-
-// Library operation (CapturedNode)
+// Static CapturedNode (single library call)
 var op = builder.AddCaptured("MatMul", stream =>
 {
     cublasSetStream(handle, stream);
     cublasSgemm(handle, ..., stream);
 }, descriptor);
 // Parameter changes trigger Recapture
+
+// Patchable CapturedNode (chained library calls)
+var chain = builder.AddCaptured("MatMulFFT", stream =>
+{
+    cublasSgemm(handle, ..., A, B, temp1);
+    cufftExecC2C(plan, temp1, result, CUFFT_FORWARD);
+}, chainDescriptor);
+// From outside: one block. Recapture on any param change.
 
 // cuFFT
 var fft = new FFTBlock(ctx);
@@ -283,16 +284,64 @@ fft.Parameters["Size"].Value = 1024;
 
 ### Test Cases
 
-1. NVRTC compile CUDA C++ string → CUmodule
-2. NvrtcCache deduplication (same source → cached module)
-3. Patchable kernel Hot/Warm update (same as filesystem PTX)
-4. Patchable kernel Code update (node-set change → recompile → Cold rebuild)
-5. Stream Capture → ChildGraphNode
-6. CapturedNode Recapture on parameter change
-7. cuBLAS Sgemm in CUDA Graph via CapturedNode
-8. cuFFT forward/inverse via CapturedNode
-9. Mixed graph: KernelNodes + CapturedNodes in same graph
-10. CUBLAS_POINTER_MODE_DEVICE scalar update avoids Recapture
+1. Stream Capture → ChildGraphNode
+2. CapturedNode Recapture on parameter change
+3. cuBLAS Sgemm in CUDA Graph via CapturedNode
+4. cuFFT forward/inverse via CapturedNode
+5. Chained library calls as single CapturedNode
+6. Mixed graph: KernelNodes + CapturedNodes in same graph
+7. CUBLAS_POINTER_MODE_DEVICE scalar update avoids Recapture
+
+---
+
+## Phase 4b: Patchable Kernels (ILGPU IR + NVRTC)
+
+**Goal**: ILGPU IR for VL-generated patchable kernels, NVRTC as escape-hatch for user CUDA C++
+
+> Read `KERNEL-SOURCES.md` for the ILGPU IR vs NVRTC comparison.
+
+### Tasks
+
+| Task | Description | Depends On |
+|------|-------------|------------|
+| 4b.1 | Add ILGPU NuGet dependency | - |
+| 4b.2 | Implement IlgpuCompiler (IR → PTX → CUmodule, with caching) | 4b.1 |
+| 4b.3 | Implement IR construction layer (VL node-set → ILGPU IR) | 4b.2 |
+| 4b.4 | Implement AddKernel(ilgpuModule) overload in BlockBuilder | 4b.3 |
+| 4b.5 | Implement NvrtcCache (CUDA C++ → PTX, escape-hatch) | - |
+| 4b.6 | Implement AddKernel(nvrtcModule) overload in BlockBuilder | 4b.5 |
+| 4b.7 | Dirty-Tracking: Add Code level for ILGPU/NVRTC recompile | 4b.4 |
+| 4b.8 | Define GPU primitive node-set (GPU.Add, GPU.Mul, GPU.Reduce, etc.) | 4b.3 |
+| 4b.9 | Patchable kernel tests | 4b.8 |
+
+### Deliverables
+
+```csharp
+// Should work:
+
+// Patchable kernel via ILGPU IR (primary path)
+var irDesc = IlgpuIRBuilder.FromNodeSet(nodeSet);  // VL node-set → IR description
+var module = ilgpuCompiler.GetOrCompile(irDesc, sm_75);
+var kernel = builder.AddKernel(module, "user_kernel");
+// Hot/Warm parameter updates work like filesystem PTX
+// Code update: ILGPU recompile ~1-10ms → Cold rebuild of affected block
+
+// User CUDA C++ via NVRTC (escape-hatch)
+string userCode = File.ReadAllText("my_kernel.cu");
+var module = nvrtcCache.GetOrCompile(userCode, "my_kernel", sm_75);
+var kernel = builder.AddKernel(module, "my_kernel");
+```
+
+### Test Cases
+
+1. ILGPU IR construction from simple node-set (Add, Mul)
+2. ILGPU compile → PTX string → CUmodule via ManagedCuda
+3. IlgpuCompiler cache deduplication
+4. Patchable kernel Hot/Warm update (same as filesystem PTX)
+5. Patchable kernel Code update (node-set change → ILGPU recompile → Cold rebuild)
+6. NVRTC compile CUDA C++ string → CUmodule (escape-hatch)
+7. NvrtcCache deduplication (same source → cached module)
+8. Mixed graph: Filesystem PTX + ILGPU patchable + CapturedNodes
 
 ---
 
@@ -332,7 +381,8 @@ shared.UnmapFromCuda();
 
 ```
 VL.Cuda.Core
-    └── ManagedCuda (NuGet)
+    └── ManagedCuda (NuGet) — CUDA 13.0 minimum
+    └── ILGPU (NuGet) — PTX compilation only, no accelerator
     └── VL.Core (NodeContext, IVLRuntime, AppHost, ResourceProvider, PinGroups)
 
 VL.Cuda.Libraries
@@ -351,11 +401,12 @@ VL.Cuda.Stride
 
 | Risk | Mitigation |
 |------|------------|
-| ManagedCuda CUDA Graph support | Verify API coverage early, may need to extend |
-| Conditional nodes (CUDA 12.8) | Hard minimum — no fallback paths, verify ManagedCuda support |
+| ManagedCuda NuGet vs CUDA 13.0 | Verify latest NuGet compat in Phase 0, fall back to source-build |
+| ILGPU IR as internal API | Pin ILGPU NuGet version, fork if breaking changes |
+| Conditional nodes (CUDA 12.4+) | CUDA 13.0 minimum guarantees support |
 | DX11 interop complexity | Prototype early with simple buffer |
 | VL PinGroups integration | Test with VL team early |
-| Performance (graph rebuild) | Profile Cold Rebuild cost at realistic graph sizes |
+| Performance (graph rebuild) | Profile Cold Rebuild cost, add stream fallback only if needed |
 | Hot-Swap correctness | Test Dispose → new Constructor → reconnect cycle |
 
 ---
@@ -391,10 +442,11 @@ VL.Cuda.Core.Tests/
     ├── PTX/
     │   ├── PTXParserTests.cs
     │   └── ModuleCacheTests.cs
-    ├── NVRTC/
+    ├── Patchable/
+    │   ├── IlgpuCompilerTests.cs
+    │   ├── IlgpuIRConstructionTests.cs
     │   ├── NvrtcCacheTests.cs
-    │   ├── NvrtcCompilationTests.cs
-    │   └── PatchableCodegenTests.cs
+    │   └── NvrtcCompilationTests.cs
     └── Captured/
         ├── StreamCaptureHelperTests.cs
         ├── CapturedNodeTests.cs
@@ -416,7 +468,8 @@ VL.Cuda.Integration.Tests/
     │   └── HandleFlowTests.cs
     └── MixedGraph/
         ├── KernelAndCapturedNodeTests.cs
-        ├── NvrtcPatchableKernelTests.cs
+        ├── IlgpuPatchableKernelTests.cs
+        ├── ChainedCapturedNodeTests.cs
         └── CuBlasCapturedNodeTests.cs
 ```
 
@@ -434,16 +487,15 @@ VL.Cuda.Benchmarks/
 
 ## Timeline Estimate
 
-| Phase | Duration | Dependencies |
-|-------|----------|--------------|
-| Phase 0 | 2 weeks | - |
-| Phase 1 | 3 weeks | Phase 0 |
-| Phase 2 | 4 weeks | Phase 1 |
-| Phase 3 | 4 weeks | Phase 2 |
-| Phase 4 | 4 weeks | Phase 3 |
-| Phase 5 | 2 weeks | Phase 2 (can start early) |
-
-**Total**: ~19 weeks sequential, ~17 weeks with parallel Phase 5
+| Phase | Dependencies |
+|-------|--------------|
+| Phase 0 | - |
+| Phase 1 | Phase 0 |
+| Phase 2 | Phase 1 |
+| Phase 3 | Phase 2 |
+| Phase 4a | Phase 2 (can overlap Phase 3) |
+| Phase 4b | Phase 2 (can overlap Phase 3/4a) |
+| Phase 5 | Phase 2 (can start early) |
 
 Parallel work possible:
 - PTX tooling and example kernels (Triton, nvcc, etc.) can be developed alongside
@@ -485,22 +537,30 @@ Parallel work possible:
 - [ ] Composite blocks compose properly
 - [ ] Serialization round-trips
 
-### Phase 4 Complete
+### Phase 4a Complete
 - [ ] INodeDescriptor abstraction with KernelNodeDescriptor and CapturedNodeDescriptor
-- [ ] NvrtcCache compiles CUDA C++ strings and caches CUmodules
-- [ ] AddKernel(CUmodule) overload works in BlockBuilder
-- [ ] Patchable kernel codegen (node-set → CUDA C++) produces valid kernels
 - [ ] StreamCaptureHelper captures library calls into child graphs
 - [ ] LibraryHandleCache caches cuBLAS/cuFFT handles
-- [ ] AddCaptured() works in BlockBuilder
+- [ ] AddCaptured() works in BlockBuilder (static + chained)
 - [ ] cuBLAS Sgemm works in CUDA Graph via CapturedNode
 - [ ] cuFFT forward/inverse works via CapturedNode
+- [ ] Patchable CapturedNode: chained library calls as single block
 - [ ] Graph Compiler Phase 5.5 (Stream Capture) runs for CapturedNodes only
-- [ ] Dirty-Tracking: Code level triggers NVRTC recompile → Cold rebuild of affected block
 - [ ] Dirty-Tracking: Recapture level triggers Recapture for CapturedNodes
 - [ ] CudaEngine.UpdateDirtyNodes() dispatches correctly by node type
 - [ ] Mixed graph (KernelNodes + CapturedNodes) compiles and executes
 - [ ] CUBLAS_POINTER_MODE_DEVICE scalar update avoids Recapture
+
+### Phase 4b Complete
+- [ ] ILGPU NuGet added, PTXBackend accessible
+- [ ] IlgpuCompiler builds IR → PTX → CUmodule with caching
+- [ ] IR construction layer maps VL node-set to ILGPU IR operations
+- [ ] AddKernel(ilgpuModule) overload works in BlockBuilder
+- [ ] GPU primitive node-set defined (GPU.Add, GPU.Mul, etc.)
+- [ ] Dirty-Tracking: Code level triggers ILGPU recompile → Cold rebuild
+- [ ] NvrtcCache compiles user CUDA C++ strings (escape-hatch)
+- [ ] AddKernel(nvrtcModule) overload works (escape-hatch)
+- [ ] Mixed graph: Filesystem PTX + ILGPU patchable + CapturedNodes all work together
 
 ### Phase 5 Complete
 - [ ] DX11 buffer sharing works

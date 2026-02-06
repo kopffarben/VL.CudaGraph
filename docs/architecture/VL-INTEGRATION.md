@@ -251,10 +251,10 @@ public class KernelBlock : ICudaBlock, IDisposable
 {
     private readonly CudaContext _ctx;
 
-    [PinGroup("Inputs", PinGroupKind.Dynamic)]
+    [Pin(PinGroupKind = PinGroupKind.Collection)]
     public IEnumerable<IBlockPort> Inputs => _inputs;
 
-    [PinGroup("Outputs", PinGroupKind.Dynamic)]
+    [Pin(PinGroupKind = PinGroupKind.Collection)]
     public IEnumerable<IBlockPort> Outputs => _outputs;
 
     private List<BlockPort> _inputs;

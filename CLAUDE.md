@@ -18,23 +18,28 @@ Passive blocks — blocks describe work, they don't execute it
 
 ```
 PTX + JSON          → Kernel binary + metadata (runtime input)
-NVRTC               → Runtime CUDA C++ compilation (patchable kernels)
+ILGPU IR → PTX      → Patchable kernel compilation (primary, type-safe, ~1-10ms)
+NVRTC               → User CUDA C++ compilation (escape-hatch)
 Stream Capture      → Library Call integration (cuBLAS, cuFFT, cuDNN)
-ManagedCuda         → .NET CUDA bindings (includes NVRTC module)
+ManagedCuda         → .NET CUDA bindings (CUDA 13.0 minimum)
+ILGPU               → PTX backend only (no accelerator, no CUDA context)
 VL.Cuda.Core        → Graph compiler, buffer pool, blocks
 VL.Stride           → Graphics interop (DX11)
 ```
 
-### Three Kernel Sources → Two Node Types
+### Three Kernel Sources → Two Node Types (Static + Patchable)
 
-The system supports three kernel sources that map to two CUDA Graph node types:
+The system supports three kernel sources that map to two CUDA Graph node types. Each node type has a static and a patchable variant:
 
 ```
 1. Filesystem PTX  (Triton, nvcc, hand-written)  ─┐
                                                    ├→ KernelNode (Hot/Warm/Code/Cold)
-2. Patchable Kernel (VL Node-Set → NVRTC codegen) ─┘
+2. Patchable Kernel (VL Node-Set → ILGPU IR → PTX)─┘  Static: from file
+   + NVRTC escape-hatch for user CUDA C++              Patchable: from ILGPU IR
 
 3. Library Call (cuBLAS, cuFFT, cuDNN)              → CapturedNode (Recapture/Cold)
+   + Patchable Captured (chained library calls)        Static: single call
+                                                       Patchable: chained sequence
 ```
 
 See `docs/architecture/KERNEL-SOURCES.md` for the full design.
@@ -67,11 +72,17 @@ Filesystem PTX can be produced by any toolchain:
 1. Read `docs/architecture/GRAPH-COMPILER.md#regions` — Conditional nodes
 2. Implement: AppendBuffer, Regions (If, While), Liveness analysis
 
-### Phase 4: Libraries & Patchable Kernels
-1. Read `docs/architecture/KERNEL-SOURCES.md` — CapturedNode, NVRTC integration
+### Phase 4a: Library Calls (Stream Capture)
+1. Read `docs/architecture/KERNEL-SOURCES.md` — CapturedNode, static + patchable
 2. Implement: `StreamCaptureHelper`, `CapturedNodeDescriptor`, `AddCaptured()`
-3. Implement: `NvrtcCache`, patchable kernel codegen, `AddKernel(nvrtcModule)`
-4. Implement: `LibraryHandleCache`, cuBLAS/cuFFT wrappers
+3. Implement: `LibraryHandleCache`, cuBLAS/cuFFT wrappers
+4. Implement: Patchable CapturedNode (chained library call sequences)
+
+### Phase 4b: Patchable Kernels (ILGPU IR + NVRTC)
+1. Read `docs/architecture/KERNEL-SOURCES.md` — ILGPU IR vs NVRTC comparison
+2. Implement: `IlgpuCompiler` (IR → PTX → CUmodule, with caching)
+3. Implement: IR construction layer (VL node-set → ILGPU IR)
+4. Implement: `NvrtcCache` (escape-hatch for user CUDA C++)
 
 ### Phase 5: Graphics Interop
 1. Read `docs/architecture/GRAPHICS-INTEROP.md` — DX11/Stride sharing
@@ -89,7 +100,7 @@ docs/
     GRAPH-COMPILER.md                  ← Graph building & execution
     VL-INTEGRATION.md                  ← VL-specific patterns
     BLOCK-SYSTEM.md                    ← ICudaBlock, composition
-    KERNEL-SOURCES.md                  ← Three kernel sources, two node types ★
+    KERNEL-SOURCES.md                  ← Three sources, two node types, static + patchable ★
     PTX-LOADER.md                      ← PTX file parsing, kernel loading
     GRAPHICS-INTEROP.md                ← DX11/Stride integration
   api/
@@ -100,6 +111,7 @@ src/
   References/                          ← READ-ONLY git submodules
     VL.StandardLibs/                   ← VL.Core source (API reference)
     managedCuda/                       ← ManagedCuda source (API reference)
+    ILGPU/                             ← ILGPU compiler source (API reference)
 ```
 
 ## Key Design Decisions
@@ -112,8 +124,10 @@ src/
 | Four-level dirty tracking | Hot Update/Warm Update/Code Rebuild/Cold Rebuild for KernelNodes; Recapture/Cold Rebuild for CapturedNodes |
 | Handle-flow through VL links | Visual dataflow, no invisible mutations |
 | PTX-agnostic runtime | Consumes PTX + JSON; source toolchain is user's choice |
-| Three kernel sources, two node types | Filesystem PTX + Patchable Kernel → KernelNode; Library Calls → CapturedNode |
-| NVRTC for patchable kernels | Runtime CUDA C++ compilation from visual node-set |
+| Three kernel sources, two node types | Each with static + patchable variant |
+| ILGPU IR for patchable kernels | Type-safe, fast (~1-10ms), .NET native, no NVRTC DLL needed |
+| NVRTC as escape-hatch | For user-written CUDA C++ code loading at runtime |
+| Patchable CapturedNodes | Chained library calls as single block/function |
 | Composition (not inheritance) | VL doesn't support inheritance well |
 | Buffer pool with power-of-2 | Fast allocation, predictable memory |
 | JSON alongside PTX | Human-readable metadata, editable without recompile |
@@ -146,10 +160,10 @@ CudaContext = facade over event-coupled services
 Update Levels (KernelNode — Filesystem PTX & Patchable Kernels):
     Hot    (scalar changed)         → cuGraphExecKernelNodeSetParams, ~0 cost
     Warm   (pointer/grid changed)   → cuGraphExecKernelNodeSetParams, cheap
-    Code   (NVRTC recompile)        → New CUmodule → Cold rebuild of affected block
+    Code   (ILGPU IR recompile)     → ~1-10ms → New CUmodule → Cold rebuild of affected block
     Cold   (structure changed)      → Full graph rebuild, expensive but OK during development
 
-Update Levels (CapturedNode — Library Calls):
+Update Levels (CapturedNode — Library Calls, static + patchable chained):
     Recapture (param changed)       → Recapture + cuGraphExecChildGraphNodeSetParams, medium
     Cold      (structure changed)   → Full graph rebuild
 
@@ -161,11 +175,13 @@ Diagnostics:
 ## Dependencies
 
 ```
-ManagedCuda          — CUDA driver API bindings (includes NVRTC module)
+ManagedCuda          — CUDA driver API bindings (CUDA 13.0 minimum)
+ILGPU                — PTX backend only (IR → PTX compilation, no accelerator)
 VL.Core              — NodeContext, IVLRuntime, AppHost, ResourceProvider, PinGroups
 VL.Stride (optional) — Graphics interop (ResourceProvider boundary)
 ManagedCuda.CUBLAS   — cuBLAS bindings (optional, for Library Calls via CapturedNode)
 ManagedCuda.CUFFT    — cuFFT bindings (optional, for Library Calls via CapturedNode)
+ManagedCuda.NVRTC    — NVRTC bindings (optional, escape-hatch for user CUDA C++)
 ```
 
 ## Reference Submodules (READ-ONLY)
@@ -174,6 +190,7 @@ ManagedCuda.CUFFT    — cuFFT bindings (optional, for Library Calls via Capture
 src/References/
   VL.StandardLibs/     — VL.Core, VL.Stride, etc. (git submodule)
   managedCuda/         — ManagedCuda CUDA bindings (git submodule)
+  ILGPU/               — ILGPU .NET GPU compiler (git submodule)
 ```
 
 **Purpose:** These submodules exist solely as API reference for development.
@@ -188,7 +205,7 @@ ResourceProvider, IVLRuntime, etc.) and ManagedCuda APIs actually work.
 
 ## CUDA Requirements
 
-- **Minimum:** CUDA 12.8 / Driver ≥ 570.x (hard requirement, no fallback paths)
+- **Minimum:** CUDA 13.0 (hard requirement, aligned with ManagedCuda NVRTC DLL)
 - **Compute Capability:** 7.5+ (Turing / RTX 20xx or newer)
 - Full CUDA Graph feature set including improved conditional nodes
 - No version-gating in code — all features assumed available
@@ -215,7 +232,8 @@ Key test areas:
 - Type compatibility checking
 - Dirty-tracking correctness (Hot/Warm/Code/Cold + Recapture)
 - Cold rebuild / warm update paths
-- NVRTC compilation and caching (patchable kernels)
+- ILGPU IR construction and PTX compilation (patchable kernels)
+- NVRTC compilation and caching (user CUDA C++ escape-hatch)
 - Stream Capture → CapturedNode lifecycle
 - Recapture for CapturedNode parameter changes
 - Mixed graph execution (KernelNodes + CapturedNodes)

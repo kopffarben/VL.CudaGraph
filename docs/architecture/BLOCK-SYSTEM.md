@@ -34,12 +34,13 @@ public interface ICudaBlock : IDisposable
     // Identity
     Guid Id { get; }
     string TypeName { get; }
-    
+    NodeContext NodeContext { get; }
+
     // Ports
     IReadOnlyList<IBlockPort> Inputs { get; }
     IReadOnlyList<IBlockPort> Outputs { get; }
     IReadOnlyList<IBlockParameter> Parameters { get; }
-    
+
     // Debug (written by CudaEngine after each frame)
     IBlockDebugInfo DebugInfo { get; set; }
 }

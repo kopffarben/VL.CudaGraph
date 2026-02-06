@@ -58,6 +58,7 @@ VL.Cuda.Core
   │     ParamDirection
   │     PTXLoader
   │     ModuleCache
+  │     IlgpuCompiler
   │     NvrtcCache
   │     
   ├── Captured
@@ -681,9 +682,13 @@ public class BlockBuilder
     public KernelHandle AddKernel(string ptxPath, string entryPoint,
                                    GridConfig grid, string? debugName = null);
     
-    // === Kernels (Source 2: NVRTC Patchable Kernel) ===
-    public KernelHandle AddKernel(CUmodule nvrtcModule, string entryPoint,
+    // === Kernels (Source 2a: ILGPU Patchable Kernel — primary path) ===
+    public KernelHandle AddKernel(CUmodule ilgpuModule, string entryPoint,
                                    string? debugName = null);
+
+    // === Kernels (Source 2b: NVRTC User CUDA C++ — escape-hatch) ===
+    public KernelHandle AddKernel(CUmodule nvrtcModule, string entryPoint,
+                                   string? debugName = null, bool isNvrtc = true);
     
     // === Captured Operations (Source 3: Library Calls) ===
     public CapturedHandle AddCaptured(string name, Action<CUstream> captureAction,
@@ -1080,7 +1085,7 @@ public class RegionInfo
 ```csharp
 public enum NodeKind
 {
-    Kernel,          // KernelNode (filesystem PTX or NVRTC patchable)
+    Kernel,          // KernelNode (filesystem PTX, ILGPU patchable, or NVRTC user code)
     Captured,         // CapturedNode (Library Call via Stream Capture)
     BufferCreate,
     ResetCount,

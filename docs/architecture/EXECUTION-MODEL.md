@@ -143,7 +143,7 @@ The system has two node types with different update capabilities. See `KERNEL-SO
 |------|------|---------|--------|
 | **Hot Update** | Near-zero, no GPU stall | Scalar value changed (gravity, deltaTime) | `cuGraphExecKernelNodeSetParams` for scalar only |
 | **Warm Update** | Cheap, exec-level update | Buffer rebind (different pointer, same size), grid size change | `cuGraphExecKernelNodeSetParams` for pointer/grid |
-| **Code Rebuild** | Medium | Patchable kernel logic changed | NVRTC recompile → new CUmodule → Cold Rebuild of affected block |
+| **Code Rebuild** | Medium | Patchable kernel logic changed | ILGPU IR recompile (~1-10ms) → new CUmodule → Cold Rebuild of affected block |
 | **Cold Rebuild** | Expensive, full graph rebuild | Node added/removed, edge added/removed, PTX hot-reload, block structure changed | Destroy old graph, build new, instantiate |
 
 **CapturedNode** (Library Calls — cuBLAS, cuFFT, cuDNN):
@@ -242,10 +242,10 @@ class CudaEngine
         }
         else if (_cudaContext.IsCodeDirty)
         {
-            // Patchable kernel source changed → NVRTC recompile → targeted Cold rebuild
+            // Patchable kernel source changed → ILGPU IR recompile → targeted Cold rebuild
             // Only the affected block(s) need a new CUmodule; the rest of the graph
             // is rebuilt because CUDA Graph is immutable (full cuGraphInstantiate).
-            // But only the changed block(s) trigger NvrtcCache.GetOrCompile().
+            // But only the changed block(s) trigger IlgpuCompiler.GetOrCompile().
             CodeRebuild(_cudaContext.Dirty.GetCodeDirtyBlockIds());
             _cudaContext.ClearCodeDirty();
         }
@@ -270,17 +270,17 @@ class CudaEngine
     
     private void CodeRebuild(IReadOnlyList<Guid> dirtyBlockIds)
     {
-        // 1. Recompile only the changed patchable kernel(s) via NvrtcCache
+        // 1. Recompile only the changed patchable kernel(s) via IlgpuCompiler
         foreach (var blockId in dirtyBlockIds)
         {
             var block = _cudaContext.Registry.Get(blockId);
-            var newSource = block.GetPatchableSource();  // codegen from current node-set
-            var module = _cudaContext.Nvrtc.GetOrCompile(newSource, block.KernelName, _targetSm);
+            var irDesc = block.GetIRDescription();  // current node-set → IR description
+            var module = _cudaContext.Ilgpu.GetOrCompile(irDesc, _targetSm);
             block.UpdateModule(module);  // swap CUmodule reference in descriptor
         }
-        
+
         // 2. Full graph rebuild (CUDA Graph is immutable — can't patch a single node)
-        //    Same as ColdRebuild, but the NvrtcCache hit above means no redundant compilation.
+        //    Same as ColdRebuild, but the IlgpuCompiler cache hit means no redundant compilation.
         ColdRebuild();
     }
     
