@@ -2,63 +2,50 @@
 
 ## CudaContext
 
-The `CudaContext` is the main entry point for all GPU operations. It manages:
-- CUDA device selection
-- Block registration and connections
-- Graph compilation and execution
+The `CudaContext` is the shared state object for all GPU operations. It is created by `CudaEngine` and passed to blocks via VL pin connections. It manages:
+- Block registry and connection tracking
+- Dirty-tracking (structure + parameters)
 - Buffer pool access
 - Debug information
 
-### Creation
+> **Note:** CudaContext is created internally by CudaEngine. Users don't create it directly. See `EXECUTION-MODEL.md` for the full lifecycle.
+
+### Creation (by CudaEngine)
 
 ```csharp
-// Simple creation (device 0)
-using var ctx = CudaContext.Create();
-
-// With options
-using var ctx = CudaContext.Create(new CudaContextOptions
+// CudaEngine creates the context:
+var engine = new CudaEngine(new CudaContextOptions
 {
     DeviceId = 0,
     Profiling = ProfilingLevel.PerBlock,
     BufferPoolInitialSizeMB = 512,
     EnableDebug = true
 });
+
+// Blocks receive context via VL pin:
+var ctx = engine.Context;
 ```
 
-### Block Management
+### Block Registration
 
 ```csharp
-// Create blocks
-var emitter = ctx.CreateBlock<SphereEmitterBlock>();
-var forces = ctx.CreateBlock<ForcesBlock>();
+// Block constructor registers:
+ctx.RegisterBlock(this);    // → structureDirty = true
 
-// Connect blocks (for runtime/UI scenarios)
-ctx.Connect(emitter.Id, "Particles", forces.Id, "Particles");
+// Block Dispose unregisters:
+ctx.UnregisterBlock(id);    // → structureDirty = true
 
-// Remove blocks
-ctx.RemoveBlock(emitter.Id);
+// VL link drawing triggers:
+ctx.Connect(srcId, "Out", tgtId, "In");     // → structureDirty = true
+ctx.Disconnect(srcId, "Out", tgtId, "In");  // → structureDirty = true
 ```
 
-### Execution Cycle
+### Dirty Tracking
 
 ```csharp
-// Compile (when structure changes)
-if (ctx.NeedsRecompile)
-{
-    ctx.Compile();
-}
-
-// Execute (every frame)
-ctx.Execute();
-```
-
-### Child Contexts
-
-Composite blocks create child contexts to encapsulate their internal graphs:
-
-```csharp
-// Inside a composite block's Setup method
-var childCtx = builder.Context.CreateChildContext(BlockId, "MyBlock");
+// CudaEngine checks each frame:
+if (ctx.IsStructureDirty)    // → Cold Rebuild
+if (ctx.AreParametersDirty)  // → Hot/Warm Update
 ```
 
 ---
@@ -74,7 +61,7 @@ Streams enable asynchronous operations and can be used for:
 using var stream = CudaStream.Create(ctx);
 
 // Execute on stream
-ctx.Execute(stream);
+engine.Update(stream);
 
 // Sync (blocking)
 stream.Synchronize();
@@ -107,19 +94,11 @@ Type-safe wrapper for GPU memory. The generic parameter ensures type safety at c
 ```csharp
 public enum DType
 {
-    // Unsigned integers
     U8, U16, U32, U64,
-    
-    // Signed integers
     S8, S16, S32, S64,
-    
-    // Floating point
     F16, F32, F64,
-    
-    // Special
-    BF16,              // Brain float 16
-    Complex64,         // float + float
-    Complex128         // double + double
+    BF16,
+    Complex64, Complex128
 }
 ```
 
@@ -164,9 +143,9 @@ GpuBuffer<byte> bytes = buffer.Reinterpret<byte>();
 ```csharp
 public enum BufferState
 {
-    Valid,          // Contains valid data
-    Uninitialized,  // Allocated but not written
-    Released        // Returned to pool, do not use
+    Valid,
+    Uninitialized,
+    Released
 }
 ```
 
@@ -190,40 +169,15 @@ A specialized buffer for GPU-side append operations (streaming output).
 └────────────────────┘
 ```
 
-### Usage in Kernels (PTX)
-
-```ptx
-// Kernel appends an element
-.global .u32 counter;
-.global .f32 data[];
-
-// Atomic increment, get old value as index
-atom.global.inc.u32 %idx, [counter], %max_capacity;
-st.global.f32 [data + %idx*4], %value;
-```
-
 ### C# API
 
 ```csharp
-// Create
 var particles = pool.AcquireAppend<Particle>(maxCapacity: 100000, BufferLifetime.Graph);
 
-// Get count (sync readback - use sparingly!)
 int count = particles.ReadCount();
-
-// Get count async
 int count = await particles.ReadCountAsync();
-
-// Reset for next frame
 particles.ResetCount();
 ```
-
-### Properties
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `MaxCapacity` | `int` | Maximum elements |
-| `CountPointer` | `CUdeviceptr` | Pointer to counter |
 
 ---
 
@@ -234,41 +188,17 @@ Describes multi-dimensional buffer layout.
 ### Construction
 
 ```csharp
-// 1D
 var shape1d = new BufferShape(1024);
-
-// 2D (row-major by default)
 var shape2d = new BufferShape(width: 1920, height: 1080);
-
-// 3D
 var shape3d = new BufferShape(64, 64, 64);
-
-// With explicit strides
-var shape = new BufferShape(
-    dims: new[] { 1920, 1080 },
-    strides: new[] { 1, 1920 }  // Column-major
-);
+var shape = new BufferShape(dims: new[] { 1920, 1080 }, strides: new[] { 1, 1920 });
 ```
-
-### Properties
-
-| Property | Type | Description |
-|----------|------|-------------|
-| `Rank` | `int` | Number of dimensions (1-3) |
-| `Dim0`, `Dim1`, `Dim2` | `int` | Dimension sizes |
-| `Stride0`, `Stride1`, `Stride2` | `int` | Element strides |
-| `TotalElements` | `long` | Total element count |
 
 ### Operations
 
 ```csharp
-// Transpose (swap dims/strides)
 var transposed = shape.Transpose();
-
-// Flatten to 1D
 var flat = shape.Flatten();
-
-// Custom strides
 var strided = shape.WithStride(new[] { 1, 2048 });
 ```
 
@@ -286,7 +216,6 @@ Size        Bucket
 <= 256B      → 256B
 <= 512B      → 512B
 <= 1KB       → 1KB
-<= 2KB       → 2KB
 ...
 <= 1GB       → 1GB
 > 1GB        → exact size
@@ -295,16 +224,9 @@ Size        Bucket
 ### Acquire/Release
 
 ```csharp
-// Acquire from pool
 var buffer = pool.Acquire<float>(elementCount: 1024, BufferLifetime.Graph);
-
-// Acquire with shape
 var buffer2d = pool.Acquire<float>(new BufferShape(64, 64), BufferLifetime.Graph);
-
-// Acquire append buffer
 var append = pool.AcquireAppend<Particle>(maxCapacity: 10000, BufferLifetime.Region);
-
-// Release back to pool (usually automatic)
 pool.Release(buffer);
 ```
 
@@ -314,42 +236,4 @@ pool.Release(buffer);
 long totalBytes = pool.TotalAllocatedBytes;
 long usedBytes = pool.CurrentlyUsedBytes;
 int bufferCount = pool.BufferCount;
-
-// Per-bucket stats
-foreach (var (bucketSize, count) in pool.BucketStats)
-{
-    Console.WriteLine($"Bucket {bucketSize}B: {count} buffers");
-}
-```
-
-### Implementation Notes
-
-1. **Power-of-2 bucketing**: Reduces fragmentation
-2. **Best-fit within bucket**: Finds smallest available buffer
-3. **Lazy allocation**: Only allocates when needed
-4. **Reference counting**: Tracks buffer usage across graph
-5. **Automatic release**: Region buffers freed after scope
-
-### Memory Layout
-
-```
-Pool Structure:
-
-Bucket 256B:    [buf][buf][buf][   free   ]
-Bucket 512B:    [buf][  free  ]
-Bucket 1KB:     [buf][buf]
-Bucket 2KB:     [   free   ]
-...
-
-Each buffer:
-┌──────────────────────────────────────┐
-│ Header (internal)                     │
-│ - Id: Guid                           │
-│ - ElementType: DType                 │
-│ - RefCount: int                      │
-│ - State: BufferState                 │
-├──────────────────────────────────────┤
-│ GPU Memory (CUdeviceptr)              │
-│ [data data data data ...]            │
-└──────────────────────────────────────┘
 ```

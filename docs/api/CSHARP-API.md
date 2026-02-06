@@ -4,6 +4,12 @@
 
 ```
 VL.Cuda.Core
+  ├── Engine
+  │     CudaEngine
+  │     ProfilingPipeline
+  │     FrameDebugData
+  │     BlockDebugSnapshot
+  │     
   ├── Context
   │     CudaContext
   │     CudaContextOptions
@@ -81,16 +87,105 @@ VL.Cuda.Core
 
 ---
 
+## Engine
+
+### CudaEngine
+
+The single active ProcessNode. The ONLY component that does GPU work.
+
+> See `EXECUTION-MODEL.md` for the full execution model.
+
+```csharp
+public class CudaEngine : IDisposable
+{
+    // === Creation ===
+    
+    /// <summary>
+    /// VL calls: new CudaEngine(nodeContext, options)
+    /// NodeContext provides: UniqueId (for VL diagnostics), ILogger, AppHost.
+    /// </summary>
+    public CudaEngine(NodeContext nodeContext, CudaContextOptions? options = null);
+    
+    // === Properties ===
+    
+    /// <summary>
+    /// The CudaContext managed by this engine.
+    /// Exposed as output pin in VL — flows to all blocks.
+    /// </summary>
+    public CudaContext Context { get; }
+    
+    /// <summary>
+    /// Current profiling level. Controls debug data collection overhead.
+    /// Can be changed at runtime via VL pin.
+    /// </summary>
+    public ProfilingLevel ProfilingLevel { get; set; }
+    
+    /// <summary>
+    /// Debug info for the engine itself (total frame time, GPU memory, etc.)
+    /// Displayed as tooltip on the CudaEngine node in VL.
+    /// </summary>
+    public IDebugInfo DebugInfo { get; }
+    
+    // === Execution (called every frame by VL) ===
+    
+    /// <summary>
+    /// Main update method. Called once per frame.
+    /// 1. Collects parameter values from all registered blocks
+    /// 2. Checks dirty state (structure vs parameters)
+    /// 3. Cold Rebuild or Hot/Warm Update as needed
+    /// 4. Launches the CUDA Graph
+    /// 5. Collects profiling data (async, based on ProfilingLevel)
+    /// 6. Distributes debug info back to blocks
+    /// 7. Reports diagnostics to VL (warnings/errors on nodes via IVLRuntime)
+    /// 
+    /// This is the ONLY place where GPU work happens.
+    /// </summary>
+    public void Update();
+    
+    /// <summary>
+    /// Update with explicit stream.
+    /// </summary>
+    public void Update(CudaStream stream);
+    
+    // === State ===
+    
+    /// <summary>
+    /// True if the last Update() performed a Cold Rebuild.
+    /// Useful for VL to show rebuild indicator.
+    /// </summary>
+    public bool DidRebuildLastFrame { get; }
+    
+    /// <summary>
+    /// Number of frames since last Cold Rebuild.
+    /// </summary>
+    public int FramesSinceLastRebuild { get; }
+    
+    // === ToString (VL Tooltip) ===
+    
+    /// <summary>
+    /// VL calls ToString() on hover. Shows engine summary.
+    /// Example: "CudaEngine: 4 blocks, 12 kernels\n  Launch: 2.1ms\n  Pool: 12 MB / 64 MB"
+    /// </summary>
+    public override string ToString();
+    
+    // === Dispose ===
+    public void Dispose();
+}
+```
+
+---
+
 ## Context
 
 ### CudaContext
 
+Shared state between Engine and Blocks. Manages block registry, connections, dirty-tracking, and buffer pool.
+
 ```csharp
 public class CudaContext : IDisposable
 {
-    // === Creation ===
-    public static CudaContext Create(int deviceId = 0);
-    public static CudaContext Create(CudaContextOptions options);
+    // === Creation (internal — created by CudaEngine) ===
+    internal static CudaContext Create(CudaContextOptions options);
     
     // === Properties ===
     public int DeviceId { get; }
@@ -99,31 +194,80 @@ public class CudaContext : IDisposable
     public ProfilingLevel Profiling { get; set; }
     public BufferPool Pool { get; }
     
-    // === Block Management ===
-    public T CreateBlock<T>() where T : ICudaBlock, new();
-    public ICudaBlock CreateBlock(Type blockType);
-    public void RemoveBlock(Guid blockId);
+    // === Block Registry ===
     
-    // === Block Connections ===
+    /// <summary>
+    /// Register a block. Called by block constructors.
+    /// Sets structureDirty = true.
+    /// </summary>
+    public void RegisterBlock(ICudaBlock block);
+    
+    /// <summary>
+    /// Unregister a block. Called by block Dispose().
+    /// Sets structureDirty = true.
+    /// </summary>
+    public void UnregisterBlock(Guid blockId);
+    
+    /// <summary>
+    /// All currently registered blocks.
+    /// </summary>
+    public IReadOnlyDictionary<Guid, ICudaBlock> Blocks { get; }
+    
+    // === Connections (called by VL when user draws/removes links) ===
+    
+    /// <summary>
+    /// Connect two block ports. Sets structureDirty = true.
+    /// </summary>
     public void Connect(Guid sourceBlockId, string sourcePort,
                         Guid targetBlockId, string targetPort);
+    
+    /// <summary>
+    /// Disconnect two block ports. Sets structureDirty = true.
+    /// </summary>
     public void Disconnect(Guid sourceBlockId, string sourcePort,
                            Guid targetBlockId, string targetPort);
     
-    // === Compilation ===
-    public CompiledGraph Compile();
-    public bool NeedsRecompile { get; }
-    public int StructureVersion { get; }
+    /// <summary>
+    /// All current connections.
+    /// </summary>
+    public IReadOnlyList<ConnectionModel> Connections { get; }
     
-    // === Execution ===
-    public void Execute(CudaStream? stream = null);
+    // === Dirty Tracking ===
+    
+    /// <summary>
+    /// True if graph structure changed (blocks added/removed, connections changed).
+    /// Requires Cold Rebuild.
+    /// </summary>
+    public bool IsStructureDirty { get; }
+    
+    /// <summary>
+    /// True if parameter values changed (scalars, buffer pointers).
+    /// Requires Hot/Warm Update.
+    /// </summary>
+    public bool AreParametersDirty { get; }
+    
+    /// <summary>
+    /// Called by CudaEngine after rebuild.
+    /// </summary>
+    internal void ClearStructureDirty();
+    
+    /// <summary>
+    /// Called by CudaEngine after parameter update.
+    /// </summary>
+    internal void ClearParametersDirty();
+    
+    /// <summary>
+    /// Called by blocks when a parameter value changes.
+    /// Sets parametersDirty = true.
+    /// </summary>
+    internal void OnParameterChanged(Guid blockId, string paramName);
+    
+    // === Compilation (used by CudaEngine) ===
+    internal CompiledGraph Compile();
     
     // === Serialization ===
     public GraphModel GetModel();
     public void LoadModel(GraphModel model);
-    
-    // === Internal ===
-    internal CudaContext CreateChildContext(Guid ownerId, string name);
     
     // === Dispose ===
     public void Dispose();
@@ -164,11 +308,12 @@ public class CudaStream : IDisposable
 ```csharp
 public enum ProfilingLevel
 {
-    None,       // No profiling
-    Summary,    // Only region totals
-    PerBlock,   // Per-block timing
-    PerKernel,  // Per-kernel timing
-    Deep        // All details
+    None,       // Zero overhead. Only state (OK/Warning/Error).
+    Summary,    // 1 event pair around entire graph. Async, 1 frame latency.
+    PerBlock,   // Event pair per block. Buffer sizes on link tooltips. Async.
+    PerKernel,  // Event pair per kernel within blocks. Async.
+    DeepAsync,  // + AppendBuffer count readbacks, occupancy. Async, 1-2 frame latency.
+    DeepSync    // Same as DeepAsync but synchronous GPU readback. Exact values, causes GPU stall.
 }
 ```
 
@@ -235,7 +380,6 @@ public class AppendBuffer<T> : GpuBuffer<T> where T : unmanaged
 ```csharp
 public readonly struct BufferShape
 {
-    // === Properties ===
     public int Rank { get; }
     public int Dim0 { get; }
     public int Dim1 { get; }
@@ -245,13 +389,11 @@ public readonly struct BufferShape
     public int Stride2 { get; }
     public long TotalElements { get; }
     
-    // === Constructors ===
     public BufferShape(int dim0);
     public BufferShape(int dim0, int dim1);
     public BufferShape(int dim0, int dim1, int dim2);
     public BufferShape(int[] dims, int[]? strides = null);
     
-    // === Operations ===
     public BufferShape WithStride(int[] strides);
     public BufferShape Transpose();
     public BufferShape Flatten();
@@ -265,7 +407,6 @@ public class BufferPool : IDisposable
 {
     public BufferPool(CudaContext context, int initialSizeMB = 256);
     
-    // === Acquire ===
     public GpuBuffer<T> Acquire<T>(int elementCount, BufferLifetime lifetime) 
         where T : unmanaged;
     public GpuBuffer<T> Acquire<T>(BufferShape shape, BufferLifetime lifetime)
@@ -273,10 +414,8 @@ public class BufferPool : IDisposable
     public AppendBuffer<T> AcquireAppend<T>(int maxCapacity, BufferLifetime lifetime)
         where T : unmanaged;
     
-    // === Release ===
     public void Release(GpuBuffer buffer);
     
-    // === Statistics ===
     public long TotalAllocatedBytes { get; }
     public long CurrentlyUsedBytes { get; }
     public int BufferCount { get; }
@@ -398,7 +537,7 @@ public enum PinTypeKind
 ### ICudaBlock
 
 ```csharp
-public interface ICudaBlock
+public interface ICudaBlock : IDisposable
 {
     Guid Id { get; }
     string TypeName { get; }
@@ -407,9 +546,52 @@ public interface ICudaBlock
     IReadOnlyList<IBlockPort> Outputs { get; }
     IReadOnlyList<IBlockParameter> Parameters { get; }
     
-    IBlockDebugInfo DebugInfo { get; }
+    /// <summary>
+    /// Debug info written by CudaEngine after each frame.
+    /// </summary>
+    IBlockDebugInfo DebugInfo { get; set; }
     
-    void Setup(BlockBuilder builder);
+    /// <summary>
+    /// VL NodeContext for this block instance.
+    /// Used by CudaEngine to report warnings/errors on the correct VL node.
+    /// </summary>
+    NodeContext NodeContext { get; }
+}
+```
+
+#### Constructor Pattern
+
+All blocks follow this constructor pattern. VL provides `NodeContext` as the first parameter:
+
+```csharp
+public class MyBlock : ICudaBlock
+{
+    public MyBlock(NodeContext nodeContext, CudaContext cudaContext)
+    {
+        NodeContext = nodeContext;
+        _logger = nodeContext.GetLogger();
+        
+        // Declarative setup (no GPU work)
+        var builder = new BlockBuilder(cudaContext, this);
+        // ... define kernels, pins ...
+        builder.Commit();
+        
+        cudaContext.RegisterBlock(this, nodeContext);
+    }
+    
+    public NodeContext NodeContext { get; }
+    
+    /// <summary>
+    /// VL calls ToString() on hover. Reads from profiling cache only — no GPU access.
+    /// </summary>
+    public override string ToString()
+    {
+        var info = _cudaContext.Profiling.GetCached(this.Id);
+        if (info == null) return $"{TypeName}: {DebugInfo?.State ?? BlockState.OK}";
+        return $"{TypeName}: {info.State}, {info.Timing?.TotalMilliseconds:F2}ms";
+    }
+    
+    public void Dispose() => _cudaContext.UnregisterBlock(this);
 }
 ```
 
@@ -480,6 +662,9 @@ public class BlockBuilder
     public CudaContext Context { get; }
     public Guid BlockId { get; }
     
+    // === Construction (takes block reference for registration) ===
+    public BlockBuilder(CudaContext context, ICudaBlock block);
+    
     // === Kernels ===
     public KernelHandle AddKernel(string ptxPath, string entryPoint,
                                    string? debugName = null);
@@ -512,7 +697,7 @@ public class BlockBuilder
     public void Connect<T>(OutputHandle<T> source, InputHandle<T> target);
     
     // === Child Blocks ===
-    public T AddChild<T>() where T : ICudaBlock, new();
+    public T AddChild<T>() where T : ICudaBlock;
     public ICudaBlock AddChild(Type blockType);
     
     // === Child Connections ===
@@ -531,9 +716,6 @@ public class BlockBuilder
     public BlockParameter<T> ExposeParameter<T>(string name, 
                                                  ICudaBlock child, 
                                                  string childParamName);
-    
-    // === Debug ===
-    public IBlockDebugInfo GetDebugInfo();
     
     // === Finalize ===
     public void Commit();
@@ -654,12 +836,18 @@ public enum ParamDirection
 public class CompiledGraph : IDisposable
 {
     public Guid Id { get; }
-    public int StructureVersion { get; }
     public bool IsValid { get; }
     
     public void Launch(CudaStream? stream = null);
     
+    /// <summary>
+    /// Hot Update: change scalar value without rebuild.
+    /// </summary>
     public void SetScalar<T>(Guid nodeId, int paramIndex, T value) where T : unmanaged;
+    
+    /// <summary>
+    /// Warm Update: change buffer pointer without rebuild.
+    /// </summary>
     public void UpdatePointer(Guid nodeId, int paramIndex, CUdeviceptr newPointer);
     
     public IReadOnlyList<Guid> KernelNodes { get; }

@@ -1,5 +1,33 @@
 # VL Integration
 
+## Execution Model
+
+> **See `EXECUTION-MODEL.md` for the full execution model.**
+
+The key insight: Blocks are **passive** — they describe GPU work but never execute it. A single **CudaEngine** node compiles and launches the CUDA Graph each frame.
+
+```
+VL Patch:
+
+┌──────────────┐
+│  CudaEngine  │──── Context ──────────────────────┐
+│  (active)    │                                    │
+└──────────────┘                                    │
+                                                    │
+       ┌────────────────────────────────────────────┤
+       │              │              │              │
+       ▼              ▼              ▼              │
+┌──────────┐   ┌──────────┐  ┌──────────┐         │
+│ Emitter  │──▶│ Forces   │─▶│Integrate │         │
+│(passive) │   │(passive) │  │(passive) │         │
+│ ctx ◀────────│ ctx ◀───────│ ctx ◀────┘─────────┘
+└──────────┘   └──────────┘  └──────────┘
+```
+
+The CudaContext flows from Engine to Blocks via VL pin connections. Blocks register themselves in their constructor and unregister on Dispose.
+
+---
+
 ## Core Pattern: Handle-Flow
 
 VL (vvvv gamma) is a visual, node-based programming environment. The key principle for VL.Cuda integration is that **data flows visibly through links**.
@@ -107,8 +135,10 @@ VectorAdd kernel:      Particles kernel:
 ### Implementation with PinGroups
 
 ```csharp
-public class KernelBlock : ICudaBlock
+public class KernelBlock : ICudaBlock, IDisposable
 {
+    private readonly CudaContext _ctx;
+    
     [PinGroup("Inputs", PinGroupKind.Dynamic)]
     public IEnumerable<IBlockPort> Inputs => _inputs;
     
@@ -118,9 +148,17 @@ public class KernelBlock : ICudaBlock
     private List<BlockPort> _inputs;
     private List<BlockPort> _outputs;
     
-    public void Setup(BlockBuilder builder)
+    public KernelBlock(CudaContext ctx, string ptxPath, string entryPoint)
     {
-        var kernel = builder.AddKernel(PTXPath, EntryPoint);
+        _ctx = ctx;
+        Setup(ptxPath, entryPoint);
+        _ctx.RegisterBlock(this);
+    }
+    
+    private void Setup(string ptxPath, string entryPoint)
+    {
+        var builder = new BlockBuilder(_ctx, this);
+        var kernel = builder.AddKernel(ptxPath, entryPoint);
         
         // Create pins based on kernel descriptor
         foreach (var param in kernel.Descriptor.Parameters)
@@ -143,7 +181,11 @@ public class KernelBlock : ICudaBlock
                 builder.InputScalar(param.Name, kernel.In(param.Index));
             }
         }
+        
+        builder.Commit();
     }
+    
+    public void Dispose() => _ctx.UnregisterBlock(this);
 }
 ```
 
@@ -230,17 +272,16 @@ VL nodes are created in the visual patch, not in code. The CudaContext API suppo
 
 ```csharp
 // Runtime API for UI-driven composition
-var emitter = ctx.CreateBlock<SphereEmitterBlock>();
-var forces = ctx.CreateBlock<ForcesBlock>();
-var renderer = ctx.CreateBlock<ParticleRendererBlock>();
+// Blocks register themselves via constructor
+var emitter = new SphereEmitterBlock(ctx);
+var forces = new ForcesBlock(ctx);
+var renderer = new ParticleRendererBlock(ctx);
 
 // Connect blocks (like drawing a link, but in code)
 ctx.Connect(emitter.Id, "Particles", forces.Id, "Particles");
 ctx.Connect(forces.Id, "Particles", renderer.Id, "Particles");
 
-// Compile and execute
-ctx.Compile();
-ctx.Execute();
+// CudaEngine handles compile + execute in its Update()
 ```
 
 ---
@@ -258,11 +299,14 @@ VL doesn't support class inheritance well. Use:
 // GOOD: Composition
 public class ComplexBlock : ICudaBlock
 {
-    public void Setup(BlockBuilder builder)
+    public ComplexBlock(CudaContext ctx)
     {
+        var builder = new BlockBuilder(ctx, this);
         var child1 = builder.AddChild<SimpleBlock1>();
         var child2 = builder.AddChild<SimpleBlock2>();
         builder.ConnectChildren(child1.Output, child2.Input);
+        builder.Commit();
+        ctx.RegisterBlock(this);
     }
 }
 
@@ -297,20 +341,31 @@ It does NOT contain:
 
 ## Debug Integration
 
-VL shows debug information in the patch:
+VL shows debug information as tooltips on nodes and pins. The CudaEngine distributes debug info to blocks after each frame:
 
 ```
+Node Tooltip:
 ┌─────────────────────────────────────────┐
 │  ParticleEmitter                        │
 │                                         │
 │  ⏱ 0.42 ms (avg: 0.38 ms)              │
 │  📦 Particles: 45,231 / 100,000        │
-│                                         │
-│  Config ────┐                           │
-│  Seed ──────┤                           │
-│             │                           │
-│             └──── Particles ────────▶   │
-│                                         │
+│  ✅ OK                                  │
+└─────────────────────────────────────────┘
+
+Pin Tooltip:
+┌─────────────────────────────────────────┐
+│  Particles (AppendBuffer<float4>)       │
+│  Count: 45,231 / 100,000               │
+│  Size: 724 KB                           │
+└─────────────────────────────────────────┘
+
+Error Tooltip:
+┌─────────────────────────────────────────┐
+│  Forces                                 │
+│  ❌ Type mismatch on input              │
+│     Expected: GpuBuffer<float3>         │
+│     Got: GpuBuffer<float4>              │
 └─────────────────────────────────────────┘
 ```
 
@@ -327,12 +382,17 @@ block.DebugInfo.State;
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ CUDA Delegate                                                    │
 │                                                                  │
+│  ┌──────────────┐                                               │
+│  │  CudaEngine  │──── Context ─────────────────────────┐        │
+│  │  ⏱ 0.8ms     │                                      │        │
+│  └──────────────┘                                      │        │
+│                                                         │        │
 │  ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐  │
 │  │ Emitter  │───▶│ Forces   │───▶│Integrate │───▶│ Renderer │  │
 │  │          │    │          │    │          │    │          │  │
 │  │ Config ◀─│    │ Gravity◀─│    │ DeltaT ◀─│    │ Camera ◀─│  │
+│  │ ctx   ◀──│────│ ctx   ◀──│────│ ctx   ◀──│────│ ctx   ◀──│  │
 │  └──────────┘    └──────────┘    └──────────┘    └──────────┘  │
 │       ▲               ▲               ▲               │         │
 │       │               │               │               ▼         │
@@ -343,6 +403,7 @@ block.DebugInfo.State;
 ```
 
 External connections:
+- **Context**: CudaEngine → all blocks (registration)
 - **Config/Parameters**: VL values → CUDA scalars
-- **Buffers**: Can flow in/out of the delegate
+- **Buffers**: Can flow in/out of the graph
 - **Renderer output**: Goes to VL.Stride for visualization

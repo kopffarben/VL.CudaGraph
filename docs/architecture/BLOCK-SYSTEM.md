@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Block System provides a composable way to build GPU compute pipelines. Blocks encapsulate kernels and their connections, exposing clean interfaces to the outside.
+The Block System provides a composable way to describe GPU compute pipelines. Blocks are **passive data-containers** that encapsulate kernels and their connections. They do not execute GPU work — that is the responsibility of the `CudaEngine` (see `EXECUTION-MODEL.md`).
 
 ```
 Block Hierarchy:
@@ -17,6 +17,9 @@ SimpleBlock              CompositeBlock
 │  exposed directly│     │       │              ▼              │
 │                  │     │  Exposed Input   Exposed Output     │
 └──────────────────┘     └──────────────────────────────────────┘
+
+Blocks are descriptions — they never call CUDA APIs directly.
+The CudaEngine reads these descriptions to compile and launch the graph.
 ```
 
 ---
@@ -26,7 +29,7 @@ SimpleBlock              CompositeBlock
 Every block implements this interface:
 
 ```csharp
-public interface ICudaBlock
+public interface ICudaBlock : IDisposable
 {
     // Identity
     Guid Id { get; }
@@ -37,19 +40,38 @@ public interface ICudaBlock
     IReadOnlyList<IBlockPort> Outputs { get; }
     IReadOnlyList<IBlockParameter> Parameters { get; }
     
-    // Debug
-    IBlockDebugInfo DebugInfo { get; }
-    
-    // Setup (called once during construction)
-    void Setup(BlockBuilder builder);
+    // Debug (written by CudaEngine after each frame)
+    IBlockDebugInfo DebugInfo { get; set; }
 }
+```
+
+Note: There is no `Setup()` method in the interface. Setup happens in the **constructor**, which receives the `CudaContext` as a parameter (factory pattern, consistent with VL's ModelRecord pattern).
+
+---
+
+## Block Lifecycle
+
+```
+Constructor(CudaContext ctx):
+    1. Create BlockBuilder
+    2. Define kernels, pins, connections (declarative)
+    3. builder.Commit()
+    4. ctx.RegisterBlock(this)
+
+VL Update() (every frame, optional):
+    → Read DebugInfo for tooltip display
+    → Push parameter value changes to CudaContext
+    → NO GPU work
+
+Dispose():
+    → ctx.UnregisterBlock(this)
 ```
 
 ---
 
 ## BlockBuilder
 
-The `BlockBuilder` is the DSL for constructing blocks. It's passed to `Setup()` and provides methods for:
+The `BlockBuilder` is the DSL for describing blocks. It's used in the constructor and provides methods for:
 - Adding kernels
 - Defining inputs/outputs
 - Connecting internal nodes
@@ -59,21 +81,28 @@ The `BlockBuilder` is the DSL for constructing blocks. It's passed to `Setup()` 
 ### Simple Block Example
 
 ```csharp
-public class VectorAddBlock : ICudaBlock
+public class VectorAddBlock : ICudaBlock, IDisposable
 {
+    private readonly CudaContext _ctx;
+    
     public Guid Id { get; } = Guid.NewGuid();
     public string TypeName => "VectorAdd";
     
     public IReadOnlyList<IBlockPort> Inputs => _inputs;
     public IReadOnlyList<IBlockPort> Outputs => _outputs;
     public IReadOnlyList<IBlockParameter> Parameters => _parameters;
+    public IBlockDebugInfo DebugInfo { get; set; }
     
     private List<IBlockPort> _inputs = new();
     private List<IBlockPort> _outputs = new();
     private List<IBlockParameter> _parameters = new();
     
-    public void Setup(BlockBuilder builder)
+    public VectorAddBlock(CudaContext ctx)
     {
+        _ctx = ctx;
+        
+        var builder = new BlockBuilder(ctx, this);
+        
         // Add the kernel
         var kernel = builder.AddKernel("kernels/vector_add.ptx", "vector_add_f32");
         
@@ -92,22 +121,32 @@ public class VectorAddBlock : ICudaBlock
         _outputs.Add(outSum);
         
         builder.Commit();
+        ctx.RegisterBlock(this);
     }
+    
+    public void Dispose() => _ctx.UnregisterBlock(this);
 }
 ```
 
 ### Composite Block Example
 
 ```csharp
-public class ParticleSystemBlock : ICudaBlock
+public class ParticleSystemBlock : ICudaBlock, IDisposable
 {
+    private readonly CudaContext _ctx;
+    
     public Guid Id { get; } = Guid.NewGuid();
     public string TypeName => "ParticleSystem";
+    public IBlockDebugInfo DebugInfo { get; set; }
     
     // ... interface implementation ...
     
-    public void Setup(BlockBuilder builder)
+    public ParticleSystemBlock(CudaContext ctx)
     {
+        _ctx = ctx;
+        
+        var builder = new BlockBuilder(ctx, this);
+        
         // Add child blocks
         var emitter = builder.AddChild<SphereEmitterBlock>();
         var gravity = builder.AddChild<GravityForceBlock>();
@@ -134,7 +173,10 @@ public class ParticleSystemBlock : ICudaBlock
         _outputs.Add(particlesOut);
         
         builder.Commit();
+        ctx.RegisterBlock(this);
     }
+    
+    public void Dispose() => _ctx.UnregisterBlock(this);
 }
 ```
 
@@ -185,8 +227,8 @@ void Connect<T>(OutputHandle<T> source, InputHandle<T> target);
 ### Child Block Operations
 
 ```csharp
-// Add child block
-T AddChild<T>() where T : ICudaBlock, new();
+// Add child block (child receives same CudaContext)
+T AddChild<T>() where T : ICudaBlock;
 ICudaBlock AddChild(Type blockType);
 
 // Connect between children
@@ -294,7 +336,7 @@ public class BlockPort<T> : IBlockPort
 
 ## Block Parameters
 
-For scalar values that can be changed at runtime:
+For scalar values that can be changed at runtime without graph rebuild (Hot Update):
 
 ```csharp
 public interface IBlockParameter
@@ -315,13 +357,15 @@ public class BlockParameter<T> : IBlockParameter
 }
 ```
 
+When a parameter value changes, the block notifies the CudaContext (parametersDirty = true). The CudaEngine picks this up in its next Update() and applies a Hot Update — no graph rebuild needed.
+
 Usage in VL:
 ```
 ┌─────────────────────┐
 │  GravityForce       │
 │                     │
-│  Strength: [9.81]   │  ← BlockParameter<float>
-│  Direction: [▼ Y]   │  ← BlockParameter<Vector3>
+│  Strength: [9.81]   │  ← BlockParameter<float>, Hot Update
+│  Direction: [▼ Y]   │  ← BlockParameter<Vector3>, Hot Update
 │                     │
 └─────────────────────┘
 ```
@@ -329,6 +373,8 @@ Usage in VL:
 ---
 
 ## Block Debug Info
+
+Written by CudaEngine after each frame launch:
 
 ```csharp
 public interface IBlockDebugInfo
@@ -354,7 +400,7 @@ public enum BlockState
     OK,          // Running normally
     Warning,     // Something noteworthy
     Error,       // Compilation/runtime error
-    NotCompiled  // Never compiled
+    NotCompiled  // Graph not yet compiled
 }
 ```
 
@@ -365,8 +411,10 @@ public enum BlockState
 ### Sequential Pipeline
 
 ```csharp
-public void Setup(BlockBuilder builder)
+public ParticleChainBlock(CudaContext ctx)
 {
+    var builder = new BlockBuilder(ctx, this);
+    
     var step1 = builder.AddChild<Step1Block>();
     var step2 = builder.AddChild<Step2Block>();
     var step3 = builder.AddChild<Step3Block>();
@@ -376,14 +424,19 @@ public void Setup(BlockBuilder builder)
     
     builder.ExposeInput("In", step1, "In");
     builder.ExposeOutput("Out", step3, "Out");
+    
+    builder.Commit();
+    ctx.RegisterBlock(this);
 }
 ```
 
 ### Fan-Out / Fan-In
 
 ```csharp
-public void Setup(BlockBuilder builder)
+public FanOutInBlock(CudaContext ctx)
 {
+    var builder = new BlockBuilder(ctx, this);
+    
     var split = builder.AddChild<SplitBlock>();
     var processA = builder.AddChild<ProcessABlock>();
     var processB = builder.AddChild<ProcessBBlock>();
@@ -399,6 +452,9 @@ public void Setup(BlockBuilder builder)
     
     builder.ExposeInput("In", split, "In");
     builder.ExposeOutput("Out", merge, "Out");
+    
+    builder.Commit();
+    ctx.RegisterBlock(this);
 }
 ```
 
@@ -409,10 +465,13 @@ Blocks can contain blocks that contain blocks:
 ```csharp
 public class Level1Block : ICudaBlock
 {
-    public void Setup(BlockBuilder builder)
+    public Level1Block(CudaContext ctx)
     {
+        var builder = new BlockBuilder(ctx, this);
         var level2 = builder.AddChild<Level2Block>();  // Level2 contains Level3
         // ...
+        builder.Commit();
+        ctx.RegisterBlock(this);
     }
 }
 ```
@@ -427,3 +486,5 @@ public class Level1Block : ICudaBlock
 4. **Document parameters**: Use description strings
 5. **Consider reusability**: Design for multiple use cases
 6. **Match VL patterns**: Fit with visual programming style
+7. **Constructor = Setup**: All description happens in the constructor
+8. **Always Dispose**: Unregister from CudaContext to trigger rebuild

@@ -9,7 +9,7 @@ Phase 0: Foundation
     ↓
 Phase 1: Graph Basics
     ↓
-Phase 2: VL Integration
+Phase 2: Execution Model & VL Integration
     ↓
 Phase 3: Advanced Features
     ↓
@@ -70,7 +70,7 @@ buffer.Upload(data);
 | 1.4 | Implement topological sort | 1.2 |
 | 1.5 | Implement CUDA Graph building | 1.4 |
 | 1.6 | Implement CompiledGraph | 1.5 |
-| 1.7 | Implement parameter update | 1.6 |
+| 1.7 | Implement parameter update (Hot/Warm) | 1.6 |
 | 1.8 | Graph execution tests | 1.7 |
 
 ### Deliverables
@@ -84,6 +84,14 @@ desc.AddEdge(kernel1.Out(0), kernel2.In(0));
 
 var compiled = GraphCompiler.Compile(desc, ctx);
 compiled.Launch();
+
+// Hot Update (no rebuild):
+compiled.SetScalar(nodeId, paramIndex, newValue);
+compiled.Launch();
+
+// Warm Update (no rebuild):
+compiled.UpdatePointer(nodeId, paramIndex, newPointer);
+compiled.Launch();
 ```
 
 ### Test Cases
@@ -91,54 +99,85 @@ compiled.Launch();
 1. Single kernel graph
 2. Sequential kernel chain
 3. Parallel kernels (diamond pattern)
-4. Parameter update without rebuild
-5. Cycle detection (should fail)
-6. Type mismatch detection (should fail)
+4. Hot Update: scalar value change without rebuild
+5. Warm Update: buffer pointer change without rebuild
+6. Cycle detection (should fail)
+7. Type mismatch detection (should fail)
 
 ---
 
-## Phase 2: VL Integration
+## Phase 2: Execution Model & VL Integration
 
-**Goal**: Blocks and handles work with VL patterns
+**Goal**: CudaEngine, passive blocks, dirty-tracking, VL integration
+
+> Read `EXECUTION-MODEL.md` before implementing this phase.
 
 ### Tasks
 
 | Task | Description | Depends On |
 |------|-------------|------------|
-| 2.1 | Define ICudaBlock interface | - |
-| 2.2 | Implement BlockBuilder | 2.1 |
+| 2.1 | Define ICudaBlock interface (with IDisposable) | - |
+| 2.2 | Implement BlockBuilder (used in constructor) | 2.1 |
 | 2.3 | Implement InputHandle/OutputHandle | 2.1 |
 | 2.4 | Implement BlockPort, BlockParameter | 2.1 |
-| 2.5 | Implement simple block (kernels only) | 2.2 |
-| 2.6 | Integrate with CudaContext | 2.5 |
-| 2.7 | Implement PinGroups support | 2.5 |
-| 2.8 | VL integration tests | 2.7 |
+| 2.5 | Implement CudaContext block registry | 2.1 |
+| 2.6 | Implement CudaContext connection tracking | 2.5 |
+| 2.7 | Implement dirty-tracking (structure + parameters) | 2.6 |
+| 2.8 | Implement CudaEngine (active ProcessNode) | 2.7 |
+| 2.9 | Implement debug info distribution (Engine → Blocks) | 2.8 |
+| 2.10 | Implement simple block (kernels only) | 2.2 |
+| 2.11 | Implement PinGroups support | 2.10 |
+| 2.12 | Implement error handling (no crash on GPU error) | 2.8 |
+| 2.13 | VL integration tests | 2.12 |
 
 ### Deliverables
 
 ```csharp
 // Should work:
-public class MyBlock : ICudaBlock
-{
-    public void Setup(BlockBuilder builder)
-    {
-        var k = builder.AddKernel("kernel.ptx", "entry");
-        builder.Input<float>("In", k.In(0));
-        builder.Output<float>("Out", k.Out(1));
-        builder.Commit();
-    }
-}
 
-var block = ctx.CreateBlock<MyBlock>();
+// Engine creates context, exposes it as output pin
+var engine = new CudaEngine();
+var ctx = engine.Context;
+
+// Blocks register in constructor (passive)
+var emitter = new EmitterBlock(ctx);
+var forces = new ForcesBlock(ctx);
+
+// VL draws links → Connect calls
+ctx.Connect(emitter.Id, "Particles", forces.Id, "Particles");
+
+// Engine update (called every frame by VL)
+engine.Update();
+// → Detects structureDirty (new blocks + connections)
+// → Cold Rebuild
+// → Launch
+// → Distributes debug info
+
+// Next frame: parameter change (no rebuild)
+forces.Parameters["Gravity"].Value = 5.0f;
+engine.Update();
+// → Detects parametersDirty
+// → Hot Update only
+// → Launch
+
+// Block shows debug tooltip in VL
+var info = emitter.DebugInfo;
+// info.LastExecutionTime = 0.42ms
+// info.State = BlockState.OK
 ```
 
 ### Test Cases
 
-1. Simple block with one kernel
-2. Block with multiple kernels
-3. Scalar parameters
-4. PinGroups generation
-5. Handle flow through mock VL links
+1. Block registers on construction, unregisters on Dispose
+2. Structure dirty flag set on RegisterBlock/UnregisterBlock/Connect/Disconnect
+3. Parameter dirty flag set on parameter value change
+4. CudaEngine Cold Rebuild on structure change
+5. CudaEngine Hot Update on scalar change
+6. CudaEngine Warm Update on buffer pointer change
+7. Debug info distributed to blocks after launch
+8. GPU error doesn't crash — sets BlockState.Error
+9. PinGroups display correctly
+10. Handle flow through mock VL links
 
 ---
 
@@ -166,17 +205,9 @@ var block = ctx.CreateBlock<MyBlock>();
 // Should work:
 var append = ctx.Pool.AcquireAppend<Particle>(100000, BufferLifetime.Graph);
 
-// Composite block
-public class ParticleSystem : ICudaBlock
-{
-    public void Setup(BlockBuilder builder)
-    {
-        var emitter = builder.AddChild<EmitterBlock>();
-        var forces = builder.AddChild<ForcesBlock>();
-        builder.ConnectChildren(emitter, "Out", forces, "In");
-        builder.ExposeOutput("Particles", forces, "Out");
-    }
-}
+// Composite block (children managed via BlockBuilder)
+var particleSystem = new ParticleSystemBlock(ctx);
+// ParticleSystemBlock internally creates Emitter, Forces, Integrate as children
 
 // Serialization
 var model = ctx.GetModel();
@@ -216,8 +247,8 @@ model.SaveToFile("system.json");
 ```csharp
 // Should work:
 // cuFFT
-var fft = ctx.CreateBlock<FFTBlock>();
-fft.Parameters["Size"] = 1024;
+var fft = new FFTBlock(ctx);
+fft.Parameters["Size"].Value = 1024;
 
 // DX11 interop
 var shared = CudaDX11Interop.RegisterBuffer<Particle>(
@@ -262,10 +293,11 @@ VL.Cuda.Stride
 | Risk | Mitigation |
 |------|------------|
 | ManagedCuda CUDA Graph support | Verify API coverage early, may need to extend |
-| Conditional nodes (CUDA 12.4+) | Require minimum CUDA version |
+| Conditional nodes (CUDA 12.4+) | Require minimum CUDA version, verify ManagedCuda support |
 | DX11 interop complexity | Prototype early with simple buffer |
 | VL PinGroups integration | Test with VL team early |
-| Performance (graph rebuild) | Profile rebuild vs update paths |
+| Performance (graph rebuild) | Profile Cold Rebuild cost at realistic graph sizes |
+| Hot-Swap correctness | Test Dispose → new Constructor → reconnect cycle |
 
 ---
 
@@ -277,7 +309,8 @@ VL.Cuda.Stride
 VL.Cuda.Core.Tests/
     ├── Context/
     │   ├── CudaContextTests.cs
-    │   └── CudaStreamTests.cs
+    │   ├── CudaStreamTests.cs
+    │   └── DirtyTrackingTests.cs
     ├── Buffers/
     │   ├── GpuBufferTests.cs
     │   ├── AppendBufferTests.cs
@@ -286,9 +319,16 @@ VL.Cuda.Core.Tests/
     │   ├── GraphCompilerTests.cs
     │   ├── ValidationTests.cs
     │   └── TopologicalSortTests.cs
+    ├── Engine/
+    │   ├── CudaEngineTests.cs
+    │   ├── ColdRebuildTests.cs
+    │   ├── HotUpdateTests.cs
+    │   └── WarmUpdateTests.cs
     ├── Blocks/
     │   ├── BlockBuilderTests.cs
-    │   └── CompositeBlockTests.cs
+    │   ├── BlockLifecycleTests.cs
+    │   ├── CompositeBlockTests.cs
+    │   └── DebugInfoTests.cs
     └── PTX/
         ├── PTXParserTests.cs
         └── ModuleCacheTests.cs
@@ -301,7 +341,8 @@ VL.Cuda.Integration.Tests/
     ├── EndToEnd/
     │   ├── SimpleKernelChainTests.cs
     │   ├── ConditionalGraphTests.cs
-    │   └── ParticleSystemTests.cs
+    │   ├── ParticleSystemTests.cs
+    │   └── HotSwapSimulationTests.cs
     └── VL/
         ├── PinGroupsTests.cs
         └── HandleFlowTests.cs
@@ -311,7 +352,8 @@ VL.Cuda.Integration.Tests/
 
 ```
 VL.Cuda.Benchmarks/
-    ├── GraphRebuildBenchmark.cs
+    ├── ColdRebuildBenchmark.cs     ← Critical: measure rebuild at various graph sizes
+    ├── HotUpdateBenchmark.cs
     ├── BufferPoolBenchmark.cs
     └── KernelLaunchBenchmark.cs
 ```
@@ -324,11 +366,11 @@ VL.Cuda.Benchmarks/
 |-------|----------|--------------|
 | Phase 0 | 2 weeks | - |
 | Phase 1 | 3 weeks | Phase 0 |
-| Phase 2 | 3 weeks | Phase 1 |
+| Phase 2 | 4 weeks | Phase 1 |
 | Phase 3 | 4 weeks | Phase 2 |
 | Phase 4 | 4 weeks | Phase 3 |
 
-**Total**: ~16 weeks (4 months) for full implementation
+**Total**: ~17 weeks for full implementation
 
 Parallel work possible:
 - PTX tooling (Python/Triton) can be developed alongside
@@ -348,14 +390,17 @@ Parallel work possible:
 ### Phase 1 Complete
 - [ ] Can build CUDA Graph from description
 - [ ] Graph executes correctly
-- [ ] Parameter updates work
+- [ ] Hot/Warm parameter updates work without rebuild
 - [ ] Validation catches errors
 
 ### Phase 2 Complete
-- [ ] ICudaBlock implementation works
-- [ ] BlockBuilder generates correct graph
-- [ ] Handle flow through VL links works
+- [ ] CudaEngine compiles and launches graph each frame
+- [ ] Blocks register/unregister via constructor/Dispose
+- [ ] Dirty-tracking correctly triggers Cold/Warm/Hot updates
+- [ ] Debug info flows from Engine to Blocks (tooltips)
+- [ ] GPU errors don't crash — graceful degradation
 - [ ] PinGroups display correctly
+- [ ] Hot-Swap simulation works (Dispose old → create new → reconnect)
 
 ### Phase 3 Complete
 - [ ] AppendBuffer works with GPU counter
