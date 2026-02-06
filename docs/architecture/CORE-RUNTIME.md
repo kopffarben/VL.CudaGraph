@@ -2,51 +2,158 @@
 
 ## CudaContext
 
-The `CudaContext` is the shared state object for all GPU operations. It is created by `CudaEngine` and passed to blocks via VL pin connections. It manages:
-- Block registry and connection tracking
-- Dirty-tracking (structure + parameters)
-- Buffer pool access
-- Debug information
+The `CudaContext` is the central domain container for all GPU operations within a single CUDA device. It is created by `CudaEngine` and flows to blocks via VL pin connections.
 
 > **Note:** CudaContext is created internally by CudaEngine. Users don't create it directly. See `EXECUTION-MODEL.md` for the full lifecycle.
 
-### Creation (by CudaEngine)
+### Internal Architecture
+
+CudaContext is a facade that composes several internal services. These services communicate via events — no service holds a direct reference to another.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ CudaContext (Facade)                                          │
+│                                                               │
+│  ┌──────────────┐   StructureChanged    ┌──────────────────┐ │
+│  │ BlockRegistry │──── event ──────────▶│  DirtyTracker    │ │
+│  └──────────────┘                       │                  │ │
+│  ┌──────────────┐   StructureChanged    │  structureDirty  │ │
+│  │ConnectionGraph│──── event ──────────▶│  parameterDirty  │ │
+│  └──────────────┘                       └──────────────────┘ │
+│  ┌──────────────┐                                            │
+│  │ BufferPool    │  (CUDA-specific pooling, own impl)        │
+│  └──────────────┘                                            │
+│  ┌──────────────┐                                            │
+│  │ ModuleCache   │  (PTX compilation cache)                  │
+│  └──────────────┘                                            │
+│  ┌──────────────┐                                            │
+│  │ DeviceContext │  (CUcontext, stream, device handles)      │
+│  └──────────────┘                                            │
+│                                                               │
+│  Public API:  DeviceId, Pool, ProfilingLevel                  │
+│  Internal:    Registry, Topology, Dirty, Modules, Device      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+### Event-Based Coupling
+
+Internal services communicate through events, wired up in the CudaContext constructor:
 
 ```csharp
-// CudaEngine creates the context:
-var engine = new CudaEngine(new CudaContextOptions
+public class CudaContext : IDisposable
 {
-    DeviceId = 0,
-    Profiling = ProfilingLevel.PerBlock,
-    BufferPoolInitialSizeMB = 512,
-    EnableDebug = true
-});
+    // Public API (visible to VL users)
+    public int DeviceId { get; }
+    public BufferPool Pool { get; }
+    public ProfilingLevel ProfilingLevel { get; set; }
 
-// Blocks receive context via VL pin:
-var ctx = engine.Context;
+    // Internal services (visible to CudaEngine, GraphCompiler)
+    internal BlockRegistry Registry { get; }
+    internal ConnectionGraph Topology { get; }
+    internal DirtyTracker Dirty { get; }
+    internal ModuleCache Modules { get; }
+    internal DeviceContext Device { get; }
+
+    internal CudaContext(CudaEngineOptions options)
+    {
+        Device = new DeviceContext(options.DeviceId);
+        Pool = new BufferPool(Device);
+        Modules = new ModuleCache(Device);
+        Registry = new BlockRegistry();
+        Topology = new ConnectionGraph();
+        Dirty = new DirtyTracker();
+
+        // Event wiring — the ONLY place services are connected
+        Registry.StructureChanged += () => Dirty.MarkStructureDirty();
+        Topology.StructureChanged += () => Dirty.MarkStructureDirty();
+    }
+
+    public void Dispose()
+    {
+        Pool.Dispose();
+        Modules.Dispose();
+        Device.Dispose();
+    }
+}
 ```
+
+### Why Events, Not Direct References
+
+BlockRegistry and ConnectionGraph both trigger structure-dirty independently. With events:
+- Neither service knows DirtyTracker exists
+- New consumers (e.g. future validation cache) subscribe without changing existing code
+- The wiring is explicit and centralized in one constructor
+- Testing is simpler — services can be tested in isolation
+
+### Service Responsibilities
+
+| Service | Responsibility |
+|---------|---------------|
+| **BlockRegistry** | Block registration/unregistration, NodeContext storage for error routing |
+| **ConnectionGraph** | Topology tracking (edges between blocks), connection validation |
+| **DirtyTracker** | Three-tier dirty flags (structure, parameters, hot) |
+| **BufferPool** | GPU memory allocation with power-of-2 bucketing |
+| **ModuleCache** | PTX loading, CUmodule caching, kernel descriptor storage |
+| **DeviceContext** | CUcontext, default stream, device properties |
+
+### CUDA Context Constraint
+
+A CUDA Graph's nodes must all reside on a single device. Therefore one CudaContext always maps to exactly one CUDA device context (`CUcontext`). Multiple CudaEngines in the same patch are separate worlds — cross-engine buffer access is not possible and is validated during graph compilation.
 
 ### Block Registration
 
+Blocks use the public facade methods on CudaContext. These delegate to internal services and fire the appropriate events:
+
 ```csharp
-// Block constructor registers:
-ctx.RegisterBlock(this);    // → structureDirty = true
+// Block constructor registers (internally: Registry fires StructureChanged → DirtyTracker):
+ctx.RegisterBlock(this);  // reads this.NodeContext for identity/diagnostics
 
-// Block Dispose unregisters:
-ctx.UnregisterBlock(id);    // → structureDirty = true
+// Block Dispose unregisters (internally: Registry fires StructureChanged → DirtyTracker):
+ctx.UnregisterBlock(this.Id);
 
-// VL link drawing triggers:
-ctx.Connect(srcId, "Out", tgtId, "In");     // → structureDirty = true
-ctx.Disconnect(srcId, "Out", tgtId, "In");  // → structureDirty = true
+// VL link drawing (internally: Topology fires StructureChanged → DirtyTracker):
+ctx.Connect(srcId, "Out", tgtId, "In");
+ctx.Disconnect(srcId, "Out", tgtId, "In");
 ```
 
 ### Dirty Tracking
 
 ```csharp
-// CudaEngine checks each frame:
-if (ctx.IsStructureDirty)    // → Cold Rebuild
-if (ctx.AreParametersDirty)  // → Hot/Warm Update
+internal class DirtyTracker
+{
+    public bool IsStructureDirty { get; private set; } = true;
+    public bool AreParametersDirty { get; private set; }
+
+    // Called via events from BlockRegistry / ConnectionGraph
+    public void MarkStructureDirty() => IsStructureDirty = true;
+
+    // Called when scalar/pointer values change
+    public void MarkParametersDirty() => AreParametersDirty = true;
+
+    public void ClearAll()
+    {
+        IsStructureDirty = false;
+        AreParametersDirty = false;
+    }
+
+    public void ClearParameters() => AreParametersDirty = false;
+}
 ```
+
+### Global Services via AppHost.ServiceRegistry
+
+Some information is truly app-global and belongs in VL's ServiceRegistry rather than per-CudaContext:
+
+```csharp
+// Registered once at startup (e.g. in a VL static initializer)
+appHost.Services.RegisterService<CudaDeviceInfo>(new CudaDeviceInfo());
+appHost.Services.RegisterService<CudaDriverVersion>(new CudaDriverVersion());
+
+// Accessible anywhere via AppHost
+var deviceInfo = AppHost.Current.Services.GetService<CudaDeviceInfo>();
+```
+
+Per-instance state (pool, registry, dirty, device) stays in CudaContext — because multiple CudaContexts per app must be possible (multi-GPU).
 
 ---
 
@@ -72,7 +179,7 @@ await stream.SynchronizeAsync();
 
 ---
 
-## GpuBuffer<T>
+## GpuBuffer\<T\>
 
 Type-safe wrapper for GPU memory. The generic parameter ensures type safety at compile time.
 
@@ -151,7 +258,7 @@ public enum BufferState
 
 ---
 
-## AppendBuffer<T>
+## AppendBuffer\<T\>
 
 A specialized buffer for GPU-side append operations (streaming output).
 
@@ -206,7 +313,16 @@ var strided = shape.WithStride(new[] { 1, 2048 });
 
 ## BufferPool
 
-Manages GPU memory allocation with power-of-2 bucketing for fast reuse.
+Manages GPU memory allocation with power-of-2 bucketing for fast reuse. This is a custom implementation — VL's `ResourceProvider` pooling is not used internally because GPU memory management requires CUDA-specific knowledge (allocation costs, stream synchronization, power-of-2 bucketing).
+
+### Interop Boundary
+
+When buffers leave the CUDA system (e.g. to VL.Stride), they are wrapped in `IResourceProvider<GpuBuffer<T>>` for VL-compatible lifetime management. See `GRAPHICS-INTEROP.md` for details.
+
+```
+Internal:  BufferPool.Acquire() → GpuBuffer<T>              (own pooling)
+External:  ResourceProvider.Return(buffer, dispose) → IRP   (VL-compatible lifetime)
+```
 
 ### Bucket Strategy
 

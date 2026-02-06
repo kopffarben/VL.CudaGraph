@@ -51,8 +51,8 @@ VL creates Block:
         │
         ├── nodeContext stored (for identity, logging)
         ├── Setup() called (defines kernels, pins, connections)
-        ├── cudaContext.RegisterBlock(this, nodeContext)
-        └── _structureDirty = true on CudaContext
+        ├── cudaContext.RegisterBlock(this)   // facade: delegates to Registry
+        └── Registry fires StructureChanged → DirtyTracker marks structure dirty
 
 VL calls every frame:
     block.Update()
@@ -63,11 +63,11 @@ VL calls every frame:
 VL Hot-Swap (code change):
     block.Dispose()
         │
-        ├── cudaContext.UnregisterBlock(this)
-        └── _structureDirty = true on CudaContext
-    
+        ├── cudaContext.UnregisterBlock(this.Id)   // facade: delegates to Registry
+        └── Registry fires StructureChanged → DirtyTracker marks structure dirty
+
     new EmitterBlock(nodeContext, cudaContext)   ← new instance, new code
-    VL restores connections via Connect() calls
+    VL restores connections via ctx.Connect() calls
 ```
 
 ### CudaEngine Lifecycle
@@ -103,6 +103,9 @@ public class CudaEngine
         _runtime = IVLRuntime.Current;
         _logger = nodeContext.GetLogger();
         _cudaContext = new CudaContext(options ?? new CudaEngineOptions());
+
+        // Ensure cleanup on app shutdown, even if user forgets to Dispose
+        nodeContext.AppHost.TakeOwnership(this);
     }
 }
 
@@ -112,17 +115,19 @@ public class EmitterBlock : ICudaBlock
     {
         _nodeContext = nodeContext;
         _logger = nodeContext.GetLogger();
-        
+
         Setup(new BlockBuilder(cudaContext, this));
-        cudaContext.RegisterBlock(this, nodeContext);
+        cudaContext.RegisterBlock(this);
     }
-    
+
     public void Dispose()
     {
-        _cudaContext.UnregisterBlock(this);
+        _cudaContext.UnregisterBlock(this.Id);
     }
 }
 ```
+
+> **Note on NodeContext**: VL injects `nodeContext` automatically as the first constructor parameter — VL users never see it in the patch. Only C# users who code against the API directly see this parameter. See `VL-INTEGRATION.md` for details.
 
 ---
 
@@ -147,21 +152,25 @@ Structural changes (Cold Rebuild) happen during development only. During runtime
 ```csharp
 class CudaContext
 {
-    private bool _structureDirty = true;    // Cold Rebuild needed
-    private bool _parametersDirty = false;  // Warm/Hot Update needed
-    
-    // --- These set _structureDirty = true ---
-    
-    public void RegisterBlock(ICudaBlock block, NodeContext nodeContext);
-    public void UnregisterBlock(ICudaBlock block);
-    public void Connect(Guid sourceBlockId, string sourcePort,
-                        Guid targetBlockId, string targetPort);
-    public void Disconnect(Guid sourceBlockId, string sourcePort,
-                           Guid targetBlockId, string targetPort);
-    internal void OnBlockStructureChanged(Guid blockId);
-    
-    // --- These set _parametersDirty = true ---
-    
+    // --- Dirty state (managed by DirtyTracker internally) ---
+    // See CORE-RUNTIME.md for the event-based coupling design
+
+    public bool IsStructureDirty { get; }    // Cold Rebuild needed
+    public bool AreParametersDirty { get; }  // Warm/Hot Update needed
+
+    // --- Public facade methods that trigger structure dirty ---
+    // These delegate to internal BlockRegistry/ConnectionGraph,
+    // which fire StructureChanged events → DirtyTracker subscribes
+
+    public void RegisterBlock(ICudaBlock block);              // block.NodeContext used for identity
+    public void UnregisterBlock(Guid blockId);
+    public void Connect(Guid srcId, string srcPort, Guid tgtId, string tgtPort);
+    public void Disconnect(Guid srcId, string srcPort, Guid tgtId, string tgtPort);
+
+    // BlockBuilder.Commit() also fires StructureChanged if description changed
+
+    // --- These set parametersDirty = true ---
+
     public void SetParameter<T>(Guid blockId, string name, T value);
     public void RebindBuffer(Guid blockId, string pinName, CUdeviceptr newPointer);
 }
@@ -205,17 +214,17 @@ class CudaEngine
         CollectParameters();
         
         // 2. Rebuild or update
-        if (_cudaContext.StructureDirty)
+        if (_cudaContext.IsStructureDirty)
         {
             ColdRebuild();
             // Rebuild includes all current parameters,
             // so parameter dirty flag is also cleared
-            _cudaContext.ClearAllDirty();
+            _cudaContext.ClearStructureDirty();
         }
-        else if (_cudaContext.ParametersDirty)
+        else if (_cudaContext.AreParametersDirty)
         {
             WarmUpdate();
-            _cudaContext.ClearParameterDirty();
+            _cudaContext.ClearParametersDirty();
         }
         
         // 3. Launch
@@ -453,43 +462,38 @@ class CudaEngine
 
 ## VL Diagnostics Integration
 
-### Warnings and Errors on Nodes
+Two separate mechanisms for two separate purposes:
 
-VL displays warnings (node turns orange) and errors (node turns red) directly on nodes. The CudaEngine uses `IVLRuntime` to report diagnostics after each frame:
+### Errors/Warnings → IVLRuntime
+
+VL displays warnings (node turns orange) and errors (node turns red) directly on nodes. CudaEngine uses `IVLRuntime` to report diagnostics after each frame. This is VL's native mechanism — no custom error display system needed.
 
 ```csharp
 class CudaEngine
 {
     private IVLRuntime _runtime;
     private Dictionary<Guid, IDisposable?> _persistentMessages = new();
-    
+
     private void ReportDiagnostics()
     {
-        foreach (var reg in _blockRegistry.Values)
+        foreach (var reg in _cudaContext.Registry.All)
         {
             var diag = GetDiagnostics(reg.Block.Id);
             var elementId = reg.NodeContext.Path.Stack.Peek();
-            
+
             if (diag.HasError)
             {
                 // Persistent: stays until error is resolved
-                if (!_persistentMessages.ContainsKey(reg.Block.Id) 
-                    || _persistentMessages[reg.Block.Id] == null)
-                {
-                    _persistentMessages[reg.Block.Id] = 
-                        _runtime.AddPersistentMessage(
-                            new Message(elementId, MessageSeverity.Error, diag.ErrorText));
-                }
+                _persistentMessages[reg.Block.Id] ??=
+                    _runtime.AddPersistentMessage(
+                        new Message(elementId, MessageSeverity.Error, diag.ErrorText));
             }
             else
             {
                 // Clear persistent error if resolved
-                if (_persistentMessages.TryGetValue(reg.Block.Id, out var msg) && msg != null)
-                {
-                    msg.Dispose();
-                    _persistentMessages[reg.Block.Id] = null;
-                }
-                
+                _persistentMessages[reg.Block.Id]?.Dispose();
+                _persistentMessages[reg.Block.Id] = null;
+
                 if (diag.HasWarning)
                 {
                     // Per-frame: disappears when warning condition clears
@@ -501,6 +505,10 @@ class CudaEngine
 }
 ```
 
+### Timing/Stats → ToString / DebugInfo
+
+Profiling data (execution times, buffer statistics) is displayed via VL's standard tooltip mechanism. `ToString()` is called only when the user hovers a node — zero overhead when not observed. Data comes from the async profiling pipeline, not from live GPU queries.
+
 ### Diagnostic Sources
 
 | Source | Severity | Example |
@@ -508,6 +516,7 @@ class CudaEngine
 | PTX load failure | Error | "Failed to load kernel.ptx: file not found" |
 | CUDA launch error | Error | "CUDA_ERROR_LAUNCH_FAILED in particle_emit" |
 | Graph validation | Error | "Type mismatch: GpuBuffer\<float4\> → GpuBuffer\<float3\>" |
+| Cross-engine connection | Error | "Block uses different CudaContext than engine" |
 | Missing connection | Warning | "Required input 'Particles' not connected" |
 | Buffer near capacity | Warning | "AppendBuffer at 95% capacity (95000/100000)" |
 | Low occupancy | Warning | "Kernel 'emit' occupancy: 25% (consider reducing registers)" |

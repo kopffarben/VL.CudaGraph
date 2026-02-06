@@ -82,34 +82,48 @@ docs/
 | Composition (not inheritance) | VL doesn't support inheritance well |
 | Buffer pool with power-of-2 | Fast allocation, predictable memory |
 | JSON alongside PTX | Human-readable metadata, editable without recompile |
+| Event-based service coupling | BlockRegistry/ConnectionGraph fire events, DirtyTracker subscribes |
+| NodeContext as first constructor param | VL convention: auto-injected identity + logging |
+| IVLRuntime for diagnostics | Native VL error/warning display on nodes, no custom system |
+| AppHost.TakeOwnership | Ensures CudaEngine cleanup on app shutdown |
+| ResourceProvider at Stride boundary only | Internal: raw handles. External: VL-compatible lifetime |
+| DeltaTime as normal VL pin | No special CUDA handling, user connects FrameClock |
 
 ## Execution Model Summary
 
 ```
 Blocks = passive ProcessNodes
-    → Constructor: define kernels, pins (Setup)
+    → Constructor(NodeContext, CudaContext): define kernels, pins, register
     → Update: read DebugInfo for VL tooltips, push parameter changes
     → Dispose: unregister from CudaContext
 
 CudaEngine = active ProcessNode (one per CUDA pipeline)
-    → Update: collect params → dirty-check → rebuild/update → launch → distribute debug info
+    → Constructor: creates CudaContext, AppHost.TakeOwnership(this)
+    → Update: collect params → dirty-check → rebuild/update → launch → report diagnostics
     → The ONLY component that talks to the GPU
+    → Routes errors/warnings to VL nodes via IVLRuntime
 
-CudaContext = internal state
-    → Dirty-tracking, block registry, buffer pool, connections
+CudaContext = facade over event-coupled services
+    → BlockRegistry (fires StructureChanged) → DirtyTracker subscribes
+    → ConnectionGraph (fires StructureChanged) → DirtyTracker subscribes
+    → DirtyTracker, BufferPool, ModuleCache, DeviceContext
 
 Update Levels:
     Hot    (scalar changed)         → cuGraphExecKernelNodeSetParams, ~0 cost
     Warm   (pointer/grid changed)   → cuGraphExecKernelNodeSetParams, cheap
     Cold   (structure changed)      → Full graph rebuild, expensive but OK during development
+
+Diagnostics:
+    Errors/Warnings  → IVLRuntime.AddMessage() → VL node colors (red/orange)
+    Timing/Stats     → ToString() / DebugInfo  → VL tooltips (on hover)
 ```
 
 ## Dependencies
 
 ```
 ManagedCuda          — CUDA driver API bindings
-VL.Core              — PinGroups, TypeRegistry
-VL.Stride (optional) — Graphics interop
+VL.Core              — NodeContext, IVLRuntime, AppHost, ResourceProvider, PinGroups
+VL.Stride (optional) — Graphics interop (ResourceProvider boundary)
 ```
 
 ## CUDA Version Requirements

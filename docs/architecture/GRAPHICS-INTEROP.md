@@ -25,6 +25,61 @@ VL.Cuda needs to share GPU resources with VL.Stride for visualization. This enab
 
 ---
 
+## ResourceProvider Boundary
+
+This is the **only** place in the system where VL's `IResourceProvider<T>` is used. Internal CUDA buffer handling uses the custom BufferPool. At the Stride boundary, buffers are wrapped for VL-compatible lifetime management.
+
+### Boundary Map
+
+| Boundary | Direction | Mechanism |
+|----------|-----------|-----------|
+| Block ↔ Block | internal | Raw `OutputHandle<GpuBuffer<T>>`, no ResourceProvider |
+| **CUDA → Stride** | **out** | **Wrap in `IResourceProvider<GpuBuffer<T>>`** |
+| **Stride → CUDA** | **in** | **Consume `IResourceHandle`, release at frame end** |
+| CUDA → CPU (Download) | out | Synchronous copy, no ResourceProvider |
+| External → CUDA | in | `BufferLifetime.External`, no ResourceProvider |
+
+### CUDA → Stride (wrapping outgoing buffers)
+
+```csharp
+// ToDX11Buffer node wraps internal buffer for Stride consumption
+public IResourceProvider<GpuBuffer<T>> WrapForStride(GpuBuffer<T> buffer)
+{
+    return ResourceProvider.Return(buffer, disposeAction: b => Pool.Release(b));
+}
+```
+
+Stride nodes receive an `IResourceProvider<GpuBuffer<T>>` and obtain handles via `.GetHandle()`. When the handle is disposed, the buffer returns to the pool.
+
+### Stride → CUDA (consuming incoming resources)
+
+```csharp
+// FromDX11Texture node consumes a Stride resource
+public void UseStrideTexture(IResourceProvider<SharedTexture2D<T>> provider)
+{
+    using var handle = provider.GetHandle();
+    var texture = handle.Resource;
+    texture.MapForCuda();
+    // ... use in kernel ...
+    texture.UnmapFromCuda();
+}
+```
+
+### IRefCounter Registration
+
+For external consumers that need ref-counting on CUDA buffers:
+
+```csharp
+// Registered once at CudaEngine startup
+appHost.Factory.RegisterService<GpuBuffer, IRefCounter<GpuBuffer>>(
+    _ => new GpuBufferRefCounter(pool)
+);
+```
+
+This allows VL nodes outside the CUDA system to safely hold references to GPU buffers.
+
+---
+
 ## Requirements
 
 ### Target Renderer
@@ -120,16 +175,16 @@ public interface IDX11SharedResource : IDisposable
 {
     // The underlying DX11 resource
     IntPtr DX11Resource { get; }
-    
+
     // CUDA device pointer (valid only when mapped)
     CUdeviceptr CudaPointer { get; }
-    
+
     // Map for CUDA access
     void MapForCuda(CudaStream? stream = null);
-    
+
     // Unmap (return to DX11)
     void UnmapFromCuda(CudaStream? stream = null);
-    
+
     // State
     bool IsMappedForCuda { get; }
 }
@@ -148,7 +203,7 @@ public static class CudaDX11Interop
         CudaContext ctx,
         CUgraphicsRegisterFlags flags = CUgraphicsRegisterFlags.None)
         where T : unmanaged;
-    
+
     /// <summary>
     /// Register a DX11 Texture2D for CUDA access
     /// </summary>
@@ -157,7 +212,7 @@ public static class CudaDX11Interop
         CudaContext ctx,
         CUgraphicsRegisterFlags flags = CUgraphicsRegisterFlags.None)
         where T : unmanaged;
-    
+
     /// <summary>
     /// Register a DX11 Texture3D for CUDA access
     /// </summary>
@@ -166,7 +221,7 @@ public static class CudaDX11Interop
         CudaContext ctx,
         CUgraphicsRegisterFlags flags = CUgraphicsRegisterFlags.None)
         where T : unmanaged;
-    
+
     /// <summary>
     /// Create a new buffer that can be shared between CUDA and DX11
     /// </summary>
@@ -178,46 +233,46 @@ public static class CudaDX11Interop
 }
 ```
 
-### SharedBuffer<T>
+### SharedBuffer\<T\>
 
 ```csharp
 public class SharedBuffer<T> : IDX11SharedResource, IDisposable where T : unmanaged
 {
     public IntPtr DX11Resource { get; }
     public CUdeviceptr CudaPointer { get; private set; }
-    
+
     public int ElementCount { get; }
     public long SizeInBytes { get; }
-    
+
     private CUgraphicsResource _cudaResource;
     private bool _isMapped;
-    
+
     public bool IsMappedForCuda => _isMapped;
-    
+
     public void MapForCuda(CudaStream? stream = null)
     {
         if (_isMapped) return;
-        
+
         cuGraphicsMapResources(1, ref _cudaResource, stream?.Handle ?? IntPtr.Zero);
-        
+
         CUdeviceptr ptr;
         size_t size;
         cuGraphicsResourceGetMappedPointer(out ptr, out size, _cudaResource);
-        
+
         CudaPointer = ptr;
         _isMapped = true;
     }
-    
+
     public void UnmapFromCuda(CudaStream? stream = null)
     {
         if (!_isMapped) return;
-        
+
         cuGraphicsUnmapResources(1, ref _cudaResource, stream?.Handle ?? IntPtr.Zero);
-        
+
         CudaPointer = default;
         _isMapped = false;
     }
-    
+
     public void Dispose()
     {
         if (_isMapped) UnmapFromCuda();
@@ -285,7 +340,7 @@ For frequently shared resources, keep them registered:
 public class ParticleSystem : IDisposable
 {
     private SharedBuffer<Particle> _particles;
-    
+
     public void Initialize(StrideDevice stride, CudaContext cuda)
     {
         // Create buffer once
@@ -294,27 +349,27 @@ public class ParticleSystem : IDisposable
             cuda,
             stride.Device);
     }
-    
+
     public void Update()
     {
         // Map
         _particles.MapForCuda();
-        
+
         // CUDA compute
         _emitter.Run(_particles.CudaPointer);
         _forces.Run(_particles.CudaPointer);
         _integrate.Run(_particles.CudaPointer);
-        
+
         // Unmap
         _particles.UnmapFromCuda();
     }
-    
+
     public void Render(StrideRenderer renderer)
     {
         // DX11 render (buffer is already accessible)
         renderer.DrawInstancedParticles(_particles.DX11Resource, _particleCount);
     }
-    
+
     public void Dispose()
     {
         _particles.Dispose();
@@ -369,6 +424,53 @@ dx11Context.Wait(dx11Fence, value);
 
 ---
 
+## VL Patch Integration
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ CUDA Particle System                                            │
+│                                                                  │
+│  ┌────────────┐      ┌────────────┐      ┌──────────────────┐  │
+│  │  Emitter   │─────▶│   Forces   │─────▶│ ToDX11Buffer     │  │
+│  └────────────┘      └────────────┘      └────────┬─────────┘  │
+│                                                    │            │
+└────────────────────────────────────────────────────┼────────────┘
+                                                     │
+                                                     ▼
+                                   IResourceProvider<GpuBuffer<T>>
+                                      (VL-compatible lifetime)
+                                                     │
+                                                     ▼
+                                            ┌────────────────┐
+                                            │  Stride Render │
+                                            └────────────────┘
+```
+
+The `ToDX11Buffer` node wraps the internal `GpuBuffer<T>` in an `IResourceProvider` before handing it to Stride. This is the ResourceProvider boundary — see `VL-INTEGRATION.md` for the full boundary design.
+
+### Block: ToDX11Buffer
+
+```csharp
+public class ToDX11BufferBlock : ICudaBlock
+{
+    private SharedBuffer<T> _shared;
+
+    public void Setup(BlockBuilder builder)
+    {
+        // Input from CUDA graph
+        var cudaIn = builder.Input<T>("Particles", ...);
+
+        // This block bridges to DX11
+        // Output is wrapped as IResourceProvider for Stride
+    }
+
+    // Special handling in graph compiler:
+    // After CUDA execution, the buffer is available for DX11
+}
+```
+
+---
+
 ## Later Considerations
 
 ### DX12 Migration
@@ -405,66 +507,20 @@ cuExternalMemoryGetMappedBuffer(
 public class SharedResourceManager : IDisposable
 {
     private List<IDX11SharedResource> _resources = new();
-    
+
     public T Register<T>(IntPtr dx11Resource, ...) where T : IDX11SharedResource
     {
         var shared = CreateShared<T>(dx11Resource, ...);
         _resources.Add(shared);
         return shared;
     }
-    
+
     public void Dispose()
     {
         foreach (var res in _resources)
             res.Dispose();
         _resources.Clear();
     }
-}
-```
-
----
-
-## Integration with VL.Stride
-
-### VL Node Example
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│ CUDA Particle System                                            │
-│                                                                  │
-│  ┌────────────┐      ┌────────────┐      ┌──────────────────┐  │
-│  │  Emitter   │─────▶│   Forces   │─────▶│ ToDX11Buffer     │  │
-│  └────────────┘      └────────────┘      └────────┬─────────┘  │
-│                                                    │            │
-└────────────────────────────────────────────────────┼────────────┘
-                                                     │
-                                                     ▼
-                                            DX11 Buffer
-                                                     │
-                                                     ▼
-                                            ┌────────────────┐
-                                            │  Stride Render │
-                                            └────────────────┘
-```
-
-### Block: ToDX11Buffer
-
-```csharp
-public class ToDX11BufferBlock : ICudaBlock
-{
-    private SharedBuffer<T> _shared;
-    
-    public void Setup(BlockBuilder builder)
-    {
-        // Input from CUDA graph
-        var cudaIn = builder.Input<T>("Particles", ...);
-        
-        // This block bridges to DX11
-        // Output is a DX11 buffer handle
-    }
-    
-    // Special handling in graph compiler:
-    // After CUDA execution, the buffer is available for DX11
 }
 ```
 

@@ -8,18 +8,19 @@
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │                    VL.Cuda.Core                                │   │
 │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐│   │
-│  │  │ Block System │  │Graph Compiler│  │   Debug System       ││   │
-│  │  │              │  │              │  │                      ││   │
-│  │  │ ICudaBlock   │  │ Validation   │  │ Timing, Readback,    ││   │
-│  │  │ BlockBuilder │  │ TopoSort     │  │ Structure Inspect    ││   │
-│  │  │ Composition  │  │ CUDA Build   │  │                      ││   │
+│  │  │ Block System │  │Graph Compiler│  │ Profiling &          ││   │
+│  │  │              │  │              │  │ Diagnostics          ││   │
+│  │  │ ICudaBlock   │  │ Validation   │  │ Timing (async GPU)   ││   │
+│  │  │ BlockBuilder │  │ TopoSort     │  │ IVLRuntime (errors)  ││   │
+│  │  │ Composition  │  │ CUDA Build   │  │ ToString (tooltips)  ││   │
 │  │  └──────────────┘  └──────────────┘  └──────────────────────┘│   │
 │  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────────────┐│   │
 │  │  │ Buffer Pool  │  │ PTX Loader   │  │   Handle System      ││   │
 │  │  │              │  │              │  │                      ││   │
 │  │  │ GpuBuffer<T> │  │ Parser       │  │ InputHandle<T>       ││   │
 │  │  │ AppendBuffer │  │ ModuleCache  │  │ OutputHandle<T>      ││   │
-│  │  │ RefCounting  │  │ Descriptors  │  │ PinGroups            ││   │
+│  │  │ Interop only:│  │ Descriptors  │  │ PinGroups            ││   │
+│  │  │ RefCounting  │  │              │  │                      ││   │
 │  │  └──────────────┘  └──────────────┘  └──────────────────────┘│   │
 │  │  ┌──────────────────────────────────────────────────────────┐│   │
 │  │  │ Execution Model                                          ││   │
@@ -80,9 +81,13 @@ VL.Cuda uses a centralized execution model with three actors:
 - `Update()` every frame: collect params → dirty-check → rebuild or update → launch → distribute debug
 - The ONLY component that does GPU work
 
-**CudaContext** is internal shared state:
-- Block registry, connection tracking, buffer pool
-- Three-level dirty tracking: Hot (scalars), Warm (pointers), Cold (structure)
+**CudaContext** is a facade over event-coupled internal services:
+- Public API: `RegisterBlock()`, `UnregisterBlock()`, `Connect()`, `Disconnect()`
+- Internal: BlockRegistry (fires StructureChanged events)
+- Internal: ConnectionGraph (fires StructureChanged events)
+- Internal: DirtyTracker (subscribes to structure events)
+- Internal: BufferPool, ModuleCache, DeviceContext
+- See `CORE-RUNTIME.md` for the event-based coupling design
 
 ### Update Levels
 
@@ -253,7 +258,7 @@ public class ParticleSystemBlock : ICudaBlock
         builder.ExposeOutput("Particles", integrate.Particles);
         
         builder.Commit();
-        ctx.RegisterBlock(this);
+        ctx.RegisterBlock(this);   // public facade method
     }
 }
 ```
@@ -275,6 +280,11 @@ VL.Cuda.Core
     │   └── CUDA Driver API
     │
     └── VL.Core
+        ├── NodeContext (identity, first ctor parameter by VL convention)
+        ├── IVLRuntime.AddMessage() (compilation errors → node tooltips)
+        ├── AppHost.TakeOwnership() (lifetime guarantee at shutdown)
+        ├── ServiceRegistry (app-global: DeviceInfo, DriverVersion)
+        ├── IResourceProvider<T> (Stride interop boundary only)
         └── PinGroups, TypeRegistry
 
 VL.Cuda.Libraries (optional)
@@ -302,7 +312,7 @@ VL.Cuda.Stride (optional)
 | `*.ptx` | Compiled CUDA kernel code |
 | `*.json` | Kernel metadata (parameters, types, hints) |
 | `CudaEngine.cs` | Active ProcessNode — compiles and launches graph |
-| `CudaContext.cs` | Shared state, dirty-tracking, block registry |
+| `CudaContext.cs` | Facade: public API over event-coupled internal services |
 | `GpuBuffer.cs` | Type-safe GPU memory wrapper |
 | `BufferPool.cs` | Memory pooling with power-of-2 buckets |
 | `GraphCompiler.cs` | Converts description to CUDA Graph |

@@ -45,18 +45,21 @@ public interface ICudaBlock : IDisposable
 }
 ```
 
-Note: There is no `Setup()` method in the interface. Setup happens in the **constructor**, which receives the `CudaContext` as a parameter (factory pattern, consistent with VL's ModelRecord pattern).
+Note: There is no `Setup()` method in the interface. Setup happens in the **constructor**, which receives `NodeContext` (injected by VL) and `CudaContext` as parameters.
+
+> **NodeContext Convention**: VL injects `NodeContext` as the first constructor parameter automatically — VL users never see it. C# users see it in the signature. See `VL-INTEGRATION.md`.
 
 ---
 
 ## Block Lifecycle
 
 ```
-Constructor(CudaContext ctx):
-    1. Create BlockBuilder
-    2. Define kernels, pins, connections (declarative)
-    3. builder.Commit()
-    4. ctx.RegisterBlock(this)
+Constructor(NodeContext nodeContext, CudaContext ctx):
+    1. Store nodeContext (for identity, logging)
+    2. Create BlockBuilder
+    3. Define kernels, pins, connections (declarative)
+    4. builder.Commit()
+    5. ctx.Registry.Register(this, nodeContext)
 
 VL Update() (every frame, optional):
     → Read DebugInfo for tooltip display
@@ -64,7 +67,7 @@ VL Update() (every frame, optional):
     → NO GPU work
 
 Dispose():
-    → ctx.UnregisterBlock(this)
+    → ctx.Registry.Unregister(this)
 ```
 
 ---
@@ -84,47 +87,47 @@ The `BlockBuilder` is the DSL for describing blocks. It's used in the constructo
 public class VectorAddBlock : ICudaBlock, IDisposable
 {
     private readonly CudaContext _ctx;
-    
+
     public Guid Id { get; } = Guid.NewGuid();
     public string TypeName => "VectorAdd";
-    
+
     public IReadOnlyList<IBlockPort> Inputs => _inputs;
     public IReadOnlyList<IBlockPort> Outputs => _outputs;
     public IReadOnlyList<IBlockParameter> Parameters => _parameters;
     public IBlockDebugInfo DebugInfo { get; set; }
-    
+
     private List<IBlockPort> _inputs = new();
     private List<IBlockPort> _outputs = new();
     private List<IBlockParameter> _parameters = new();
-    
-    public VectorAddBlock(CudaContext ctx)
+
+    public VectorAddBlock(NodeContext nodeContext, CudaContext ctx)
     {
         _ctx = ctx;
-        
+
         var builder = new BlockBuilder(ctx, this);
-        
+
         // Add the kernel
         var kernel = builder.AddKernel("kernels/vector_add.ptx", "vector_add_f32");
-        
+
         // Define inputs (buffer pins)
         var inA = builder.Input<float>("A", kernel.In(0), "First vector");
         var inB = builder.Input<float>("B", kernel.In(1), "Second vector");
-        
+
         // Define output
         var outSum = builder.Output<float>("Sum", kernel.Out(2), "Result vector");
-        
+
         // Scalar parameter (becomes a config pin)
         builder.InputScalar<int>("Count", kernel.In(3), defaultValue: 0);
-        
+
         // Store for interface
         _inputs.AddRange(new[] { inA, inB });
         _outputs.Add(outSum);
-        
+
         builder.Commit();
         ctx.RegisterBlock(this);
     }
-    
-    public void Dispose() => _ctx.UnregisterBlock(this);
+
+    public void Dispose() => _ctx.UnregisterBlock(this.Id);
 }
 ```
 
@@ -141,42 +144,42 @@ public class ParticleSystemBlock : ICudaBlock, IDisposable
     
     // ... interface implementation ...
     
-    public ParticleSystemBlock(CudaContext ctx)
+    public ParticleSystemBlock(NodeContext nodeContext, CudaContext ctx)
     {
         _ctx = ctx;
-        
+
         var builder = new BlockBuilder(ctx, this);
-        
+
         // Add child blocks
         var emitter = builder.AddChild<SphereEmitterBlock>();
         var gravity = builder.AddChild<GravityForceBlock>();
         var drag = builder.AddChild<DragForceBlock>();
         var integrate = builder.AddChild<IntegrateBlock>();
-        
+
         // Connect children internally
         builder.ConnectChildren(emitter, "Particles", gravity, "Particles");
         builder.ConnectChildren(gravity, "Particles", drag, "Particles");
         builder.ConnectChildren(drag, "Particles", integrate, "Particles");
-        
+
         // Expose input from emitter
         var configIn = builder.ExposeInput("EmitterConfig", emitter, "Config");
-        
+
         // Expose parameters from children
         builder.ExposeParameter<float>("Gravity", gravity, "Strength");
         builder.ExposeParameter<float>("DragCoeff", drag, "Coefficient");
         builder.ExposeParameter<float>("DeltaTime", integrate, "DeltaTime");
-        
+
         // Expose output from integrate
         var particlesOut = builder.ExposeOutput("Particles", integrate, "Particles");
-        
+
         _inputs.Add(configIn);
         _outputs.Add(particlesOut);
-        
+
         builder.Commit();
         ctx.RegisterBlock(this);
     }
-    
-    public void Dispose() => _ctx.UnregisterBlock(this);
+
+    public void Dispose() => _ctx.UnregisterBlock(this.Id);
 }
 ```
 
@@ -411,20 +414,20 @@ public enum BlockState
 ### Sequential Pipeline
 
 ```csharp
-public ParticleChainBlock(CudaContext ctx)
+public ParticleChainBlock(NodeContext nodeContext, CudaContext ctx)
 {
     var builder = new BlockBuilder(ctx, this);
-    
+
     var step1 = builder.AddChild<Step1Block>();
     var step2 = builder.AddChild<Step2Block>();
     var step3 = builder.AddChild<Step3Block>();
-    
+
     builder.ConnectChildren(step1, "Out", step2, "In");
     builder.ConnectChildren(step2, "Out", step3, "In");
-    
+
     builder.ExposeInput("In", step1, "In");
     builder.ExposeOutput("Out", step3, "Out");
-    
+
     builder.Commit();
     ctx.RegisterBlock(this);
 }
@@ -433,26 +436,26 @@ public ParticleChainBlock(CudaContext ctx)
 ### Fan-Out / Fan-In
 
 ```csharp
-public FanOutInBlock(CudaContext ctx)
+public FanOutInBlock(NodeContext nodeContext, CudaContext ctx)
 {
     var builder = new BlockBuilder(ctx, this);
-    
+
     var split = builder.AddChild<SplitBlock>();
     var processA = builder.AddChild<ProcessABlock>();
     var processB = builder.AddChild<ProcessBBlock>();
     var merge = builder.AddChild<MergeBlock>();
-    
+
     // Fan-out
     builder.ConnectChildren(split, "OutA", processA, "In");
     builder.ConnectChildren(split, "OutB", processB, "In");
-    
+
     // Fan-in
     builder.ConnectChildren(processA, "Out", merge, "InA");
     builder.ConnectChildren(processB, "Out", merge, "InB");
-    
+
     builder.ExposeInput("In", split, "In");
     builder.ExposeOutput("Out", merge, "Out");
-    
+
     builder.Commit();
     ctx.RegisterBlock(this);
 }
@@ -465,7 +468,7 @@ Blocks can contain blocks that contain blocks:
 ```csharp
 public class Level1Block : ICudaBlock
 {
-    public Level1Block(CudaContext ctx)
+    public Level1Block(NodeContext nodeContext, CudaContext ctx)
     {
         var builder = new BlockBuilder(ctx, this);
         var level2 = builder.AddChild<Level2Block>();  // Level2 contains Level3

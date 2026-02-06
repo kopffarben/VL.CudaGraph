@@ -128,7 +128,12 @@ compiled.Launch();
 | 2.10 | Implement simple block (kernels only) | 2.2 |
 | 2.11 | Implement PinGroups support | 2.10 |
 | 2.12 | Implement error handling (no crash on GPU error) | 2.8 |
-| 2.13 | VL integration tests | 2.12 |
+| 2.13 | VL.Core: NodeContext in all constructors | 2.1 |
+| 2.14 | VL.Core: IVLRuntime diagnostics (AddMessage, AddPersistentMessage) | 2.8 |
+| 2.15 | VL.Core: AppHost.TakeOwnership for CudaEngine | 2.8 |
+| 2.16 | VL.Core: ServiceRegistry for global singletons (DeviceInfo, DriverVersion) | 0.3 |
+| 2.17 | VL.Core: Event-based coupling (Registry/Topology → DirtyTracker) | 2.7 |
+| 2.18 | VL integration tests | 2.17 |
 
 ### Deliverables
 
@@ -274,7 +279,7 @@ shared.UnmapFromCuda();
 ```
 VL.Cuda.Core
     └── ManagedCuda (NuGet)
-    └── VL.Core (later, for PinGroups)
+    └── VL.Core (NodeContext, IVLRuntime, AppHost, ResourceProvider, PinGroups)
 
 VL.Cuda.Libraries
     └── VL.Cuda.Core
@@ -401,6 +406,10 @@ Parallel work possible:
 - [ ] GPU errors don't crash — graceful degradation
 - [ ] PinGroups display correctly
 - [ ] Hot-Swap simulation works (Dispose old → create new → reconnect)
+- [ ] NodeContext flows through all constructors
+- [ ] IVLRuntime routes errors/warnings to correct VL nodes
+- [ ] AppHost.TakeOwnership ensures cleanup on app shutdown
+- [ ] Event-based coupling between Registry/Topology and DirtyTracker
 
 ### Phase 3 Complete
 - [ ] AppendBuffer works with GPU counter
