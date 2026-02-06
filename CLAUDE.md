@@ -148,11 +148,12 @@ ResourceProvider, IVLRuntime, etc.) and ManagedCuda APIs actually work.
 - ✅ **Our code** (`src/VL.Cuda.Core/`, etc.) consumes these as **NuGet packages**
 - The submodules are not project references — they are not compiled as part of our solution
 
-## CUDA Version Requirements
+## CUDA Requirements
 
-- **Minimum:** CUDA 12.4 (for Conditional Nodes in Graphs)
-- **Recommended:** CUDA 12.8+ (improved conditional node features)
-- **Compute Capability:** 7.0+ (Volta or newer)
+- **Minimum:** CUDA 12.8 / Driver ≥ 570.x (hard requirement, no fallback paths)
+- **Compute Capability:** 7.5+ (Turing / RTX 20xx or newer)
+- Full CUDA Graph feature set including improved conditional nodes
+- No version-gating in code — all features assumed available
 
 ## File Conventions
 

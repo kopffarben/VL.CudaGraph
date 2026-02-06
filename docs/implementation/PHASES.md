@@ -298,7 +298,7 @@ VL.Cuda.Stride
 | Risk | Mitigation |
 |------|------------|
 | ManagedCuda CUDA Graph support | Verify API coverage early, may need to extend |
-| Conditional nodes (CUDA 12.4+) | Require minimum CUDA version, verify ManagedCuda support |
+| Conditional nodes (CUDA 12.8) | Hard minimum — no fallback paths, verify ManagedCuda support |
 | DX11 interop complexity | Prototype early with simple buffer |
 | VL PinGroups integration | Test with VL team early |
 | Performance (graph rebuild) | Profile Cold Rebuild cost at realistic graph sizes |

@@ -319,12 +319,28 @@ VL.Cuda.Stride (optional)
 | `PTXLoader.cs` | Parses PTX, extracts kernel info |
 | `BlockBuilder.cs` | DSL for block construction |
 
-## CUDA Version Features
+## CUDA Requirements
 
-| Feature | Minimum CUDA |
-|---------|--------------|
-| Basic Graph API | 10.0 |
-| Graph Update (parameters) | 10.2 |
-| Memory allocation in graph | 11.4 |
-| Conditional nodes (If/While) | 12.4 |
-| Improved conditionals | 12.8 |
+**Minimum: CUDA 12.8 / Driver ≥ 570.x / Compute Capability 7.5 (RTX 20xx+)**
+
+We target CUDA 12.8 as hard minimum to use the full CUDA Graph feature set
+without version-gating or fallback paths:
+
+| Feature | Available Since | Status |
+|---------|----------------|--------|
+| Basic Graph API | 10.0 | ✅ included |
+| Graph Update (parameters) | 10.2 | ✅ included |
+| Memory allocation in graph | 11.4 | ✅ included |
+| Conditional nodes (If/While) | 12.4 | ✅ included |
+| Improved conditionals | 12.8 | ✅ included |
+
+### Supported GPUs
+
+| Generation | Architecture | Compute Capability | Supported |
+|-----------|-------------|-------------------|:---------:|
+| RTX 20xx | Turing | 7.5 | ✅ |
+| RTX 30xx | Ampere | 8.6 | ✅ |
+| RTX 40xx | Ada Lovelace | 8.9 | ✅ |
+| RTX 50xx | Blackwell | 10.0 | ✅ |
+| GTX 10xx | Pascal | 6.1 | ❌ |
+| Older | — | < 6.1 | ❌ |

@@ -18,8 +18,8 @@ VL.CudaGraph lets you build GPU compute graphs in vvvv's visual patching environ
 ## Requirements
 
 - **vvvv gamma** 6.x+
-- **NVIDIA GPU** with Compute Capability 7.0+ (Volta or newer)
-- **CUDA** 12.4+ (12.8+ recommended for improved conditional nodes)
+- **NVIDIA GPU** with Compute Capability 7.5+ (RTX 20xx / Turing or newer)
+- **CUDA 12.8** with Driver ≥ 570.x
 - **Windows** (Linux support depends on VL.Stride availability)
 
 ## Getting Started
