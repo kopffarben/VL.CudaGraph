@@ -1,0 +1,31 @@
+{
+  "entryPoint": "scalar_mul",
+  "blockSize": 256,
+  "sharedMemoryBytes": 0,
+  "parameters": [
+    {
+      "name": "A",
+      "type": "float*",
+      "direction": "in",
+      "isPointer": true
+    },
+    {
+      "name": "C",
+      "type": "float*",
+      "direction": "out",
+      "isPointer": true
+    },
+    {
+      "name": "scale",
+      "type": "float",
+      "direction": "in",
+      "isPointer": false
+    },
+    {
+      "name": "N",
+      "type": "uint",
+      "direction": "in",
+      "isPointer": false
+    }
+  ]
+}
