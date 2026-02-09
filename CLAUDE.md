@@ -95,18 +95,32 @@ CLAUDE.md                              ← You are here
 docs/
   architecture/
     OVERVIEW.md                        ← High-level architecture
-    EXECUTION-MODEL.md                 ← Block/Engine lifecycle, dirty-tracking ★ NEW
+    EXECUTION-MODEL.md                 ← Block/Engine lifecycle, dirty-tracking
     CORE-RUNTIME.md                    ← Buffer, Context, Stream
     GRAPH-COMPILER.md                  ← Graph building & execution
     VL-INTEGRATION.md                  ← VL-specific patterns
     BLOCK-SYSTEM.md                    ← ICudaBlock, composition
-    KERNEL-SOURCES.md                  ← Three sources, two node types, static + patchable ★
+    KERNEL-SOURCES.md                  ← Three sources, two node types, static + patchable
     PTX-LOADER.md                      ← PTX file parsing, kernel loading
     GRAPHICS-INTEROP.md                ← DX11/Stride integration
   api/
     CSHARP-API.md                      ← Complete C# API reference
   implementation/
     PHASES.md                          ← Implementation roadmap
+  vl.reference/                        ← VL platform reference (for agents)
+    VL.Overview.md                     ← Library dependency graph, key concepts
+    VL.Compiler.md                     ← vvvvc.exe CLI compiler, .vl validation
+    VL.Fileformat/
+      VL.Fileformat.Description.md     ← .vl XML format spec (IDs, elements, patterns)
+      VL.Fileformat.BestPractices.md   ← Layout conventions, spacing, sizing
+    VL.StandardLibs/
+      VL.CoreLib.md                    ← Foundation: types, Spread, math, animation, reactive
+      VL.Stride.md                     ← 3D rendering, ECS, shaders, post-FX
+      VL.Skia.md                       ← 2D rendering, layers, paint, input
+      VL.ImGui.md                      ← Immediate-mode GUI, widgets, channels
+      VL.Serialization.md              ← XML, FSPickler, MessagePack, Raw
+      VL.Video.md                      ← Video playback, camera capture
+      VL.IO.md                         ← File, HTTP, Redis, OSCQuery, Pipes, Dataflow
 src/
   References/                          ← READ-ONLY git submodules
     VL.StandardLibs/                   ← VL.Core source (API reference)
@@ -222,6 +236,23 @@ contains official VL design guidelines, naming conventions, and best practices.
 *.json      — Kernel metadata (beside PTX, same name)
 *.vl        — VL patches using VL.Cuda
 ```
+
+### Editing `.vl` Files
+
+When generating or editing `.vl` files, **strictly follow** the specification in
+[`docs/vl.reference/VL.Fileformat/VL.Fileformat.Description.md`](docs/vl.reference/VL.Fileformat/VL.Fileformat.Description.md).
+This includes: ID encoding (Base64url, 16 bytes), element structure (Document, Patch, Canvas,
+Node, Pin, Pad, Link, Fragment, Slot), property serialization, NodeReference/CategoryReference
+patterns, and all element kinds. Non-conforming `.vl` files will fail to load in vvvv gamma.
+
+After editing a `.vl` file, **always validate** it by compiling with `vvvvc.exe`:
+```bash
+tools\vvvv_gamma_7.1-0161-g176d67638c-win-x64\vvvvc.exe VL.CudaGraph.vl ^
+  --package-repositories "D:\_MBOX\_CODE\_packages" --verbosity Information
+```
+For library packages (no entry point), the export step will crash with "Entry point not found" —
+this is expected. The validation signal is the compilation line: `VL.CudaGraph.vl -> ...dll`.
+See [`docs/vl.reference/VL.Compiler.md`](docs/vl.reference/VL.Compiler.md) for details.
 
 ## Testing
 

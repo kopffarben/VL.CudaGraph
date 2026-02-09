@@ -10,3 +10,5 @@ bin/
 .vl/
 /lib/
 src/References/
+/tools/vvvv_gamma*/
+/tools/*.zip
