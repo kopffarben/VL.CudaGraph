@@ -140,6 +140,88 @@ A CUDA Graph's nodes must all reside on a single device. Therefore:
 
 ---
 
+## Source-Package Setup (Validated)
+
+VL.CudaGraph is distributed as a **source-package** — a folder with a `.vl` file, `lib/` DLLs, and a `deployment/` nuspec. VL discovers it via `--package-repositories` pointing to the parent folder.
+
+### File Structure
+
+```
+VL.CudaGraph/
+  VL.CudaGraph.vl              ← VL document (dependencies, category)
+  lib/net8.0/
+    VL.Cuda.Core.dll            ← Built DLL (OutputPath in .csproj)
+    VL.Cuda.Core.xml            ← XML docs (GenerateDocumentationFile)
+    VL.Cuda.Core.deps.json      ← Dependency resolution
+  deployment/
+    VL.CudaGraph.nuspec         ← Package metadata (for nuget pack)
+  help/
+    help.xml                    ← Help patches (empty for now)
+  src/
+    VL.Cuda.Core/               ← C# source
+```
+
+### .vl File — Dependencies
+
+The `.vl` file declares dependencies that VL resolves at load time:
+
+```xml
+<NugetDependency Location="VL.CoreLib" Version="2025.7.0" />
+<PlatformDependency Location="./lib/net8.0/VL.Cuda.Core.dll" IsForward="true" />
+<NugetDependency Location="ManagedCuda-13" Version="13.0.64" />
+```
+
+Key rules:
+- **`PlatformDependency`** for our own DLL — NOT `AssemblyReference`
+- **`IsForward="true"`** is required to make types visible in VL's node browser
+- **Explicit `NugetDependency` for transitive deps** (ManagedCuda-13) — VL doesn't resolve from `deps.json` alone
+- **Don't hand-edit `.vl` files** — VL regenerates all IDs and LanguageVersion on open
+
+### .csproj Output Configuration
+
+```xml
+<OutputPath>..\..\lib\net8.0</OutputPath>
+<AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+<AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+<GenerateDocumentationFile>true</GenerateDocumentationFile>
+```
+
+- `OutputPath` places DLL directly in `lib/net8.0/` (VL source-package convention)
+- `GenerateDocumentationFile` produces XML docs that VL reads for tooltips
+
+### Assembly Attributes
+
+```csharp
+// Properties/AssemblyInfo.cs
+using VL.Core.Import;
+
+[assembly: ImportAsIs(Namespace = "VL.Cuda.Core")]
+```
+
+- `ImportAsIs` makes all public types available in VL
+- `Namespace` stripping: `VL.Cuda.Core.Engine.CudaEngine` → `CudaEngine [Engine]` in VL
+
+### ProcessNode Attribute
+
+```csharp
+[ProcessNode(HasStateOutput = true)]
+public sealed class CudaEngine : IDisposable
+```
+
+- `[ProcessNode]` marks a class as a VL process node (Create → Update → Dispose lifecycle)
+- `HasStateOutput = true` exposes the instance as an output pin (for flowing CudaContext to blocks)
+- Requires `[assembly:ImportAsIs]` to work
+
+### Launch via --package-repositories
+
+```
+vvvv.exe --package-repositories "D:\_MBOX\_CODE\_packages"
+```
+
+VL scans the path for folders containing `.vl` files and treats them as source packages.
+
+---
+
 ## Core Pattern: Handle-Flow
 
 VL (vvvv gamma) is a visual, node-based programming environment. The key principle for VL.Cuda integration is that **data flows visibly through links**.

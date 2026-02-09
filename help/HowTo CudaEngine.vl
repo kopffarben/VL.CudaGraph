@@ -1,0 +1,44 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Document xmlns:p="property" xmlns:r="reflection" Id="BY2w9XCNboSLbNPzGJVgMT" LanguageVersion="2025.7.1-0161-g176d67638c" Version="0.128">
+  <NugetDependency Id="JDGDo6n6XhMLg0ept9Uybr" Location="VL.CoreLib" Version="2025.7.1-0161-g176d67638c" />
+  <Patch Id="KlBnk7N2S84LF1WPifigWh">
+    <Canvas Id="QozgPxSQODbQTEZz1IQOCc" DefaultCategory="Main" BordersChecked="false" CanvasType="FullCategory" />
+    <!--
+
+    ************************ Application ************************
+
+-->
+    <Node Name="Application" Bounds="100,100" Id="TjmTrOAFUKyOEze8x8Q96G">
+      <p:NodeReference>
+        <Choice Kind="ContainerDefinition" Name="Process" />
+        <CategoryReference Kind="Category" Name="Primitive" />
+      </p:NodeReference>
+      <Patch Id="GoQxMznUvTAM5rrpLmvwxD">
+        <Canvas Id="BnZ3YoTYmXvOWcgLl4Az6D" CanvasType="Group">
+          <Node Bounds="287,141,105,19" Id="JJ7vqJqjLDBOEDQzg79qRo">
+            <p:NodeReference LastCategoryFullName="Engine" LastDependency="VL.CudaGraph.vl">
+              <Choice Kind="NodeFlag" Name="Node" Fixed="true" />
+              <Choice Kind="ProcessAppFlag" Name="CudaEngine" />
+            </p:NodeReference>
+            <Pin Id="RQSmHawdl6JOHveOeMvtD3" Name="Node Context" Kind="InputPin" IsHidden="true" />
+            <Pin Id="VC4UmdP4QUbQZ3vg9UWUBH" Name="Options" Kind="InputPin" />
+            <Pin Id="EQF6FwxvLZ4L3t5ZaeVpid" Name="Update" Kind="ApplyPin" />
+            <Pin Id="QUb8JBz8LTZOCBNrxFiF6O" Name="Output" Kind="StateOutputPin" />
+            <Pin Id="PcqUnUqKsMcP2p4Dib4oif" Name="Result" Kind="OutputPin" />
+            <Pin Id="SRneXMIQyVpOwbfBOB2Gv5" Name="Context" Kind="OutputPin" />
+            <Pin Id="HcFOxS2WNN2LnkJvYePIaW" Name="Node Context" Kind="OutputPin" />
+            <Pin Id="VwXMs30WYZjN4kavqyp07Q" Name="Is Compiled" Kind="OutputPin" />
+            <Pin Id="LMuA8pbNebdQFmtOKqZNnc" Name="Last Rebuild Time" Kind="OutputPin" />
+          </Node>
+        </Canvas>
+        <Patch Id="JIN46sWIMtVMgcWZktrbnz" Name="Create" />
+        <Patch Id="M9Pvpl5nqE1MQ70qmdQvLZ" Name="Update" />
+        <ProcessDefinition Id="HjCnvXzXzbXOJ8MAym0PBB">
+          <Fragment Id="GelVfGr8bW4PBa2f3Ylw3m" Patch="JIN46sWIMtVMgcWZktrbnz" Enabled="true" />
+          <Fragment Id="LTDncvlYbXcMMPv1EMEXeJ" Patch="M9Pvpl5nqE1MQ70qmdQvLZ" Enabled="true" />
+        </ProcessDefinition>
+      </Patch>
+    </Node>
+  </Patch>
+  <NugetDependency Id="JEylHtTRN9MQRFcx4OWzTd" Location="VL.CudaGraph" Version="0.1.0-alpha" />
+</Document>

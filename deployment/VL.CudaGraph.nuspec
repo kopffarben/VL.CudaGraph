@@ -1,0 +1,20 @@
+<?xml version="1.0"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2011/10/nuspec.xsd">
+  <metadata>
+    <id>VL.CudaGraph</id>
+    <version>0.1.0-alpha</version>
+    <title>VL.CudaGraph</title>
+    <authors>schmi</authors>
+    <description>CUDA Graph integration for vvvv gamma</description>
+    <tags>VL CUDA GPU</tags>
+    <dependencies>
+      <dependency id="VL.CoreLib" version="2025.7" />
+      <dependency id="ManagedCuda-13" version="13.0.0" />
+    </dependencies>
+  </metadata>
+  <files>
+    <file src="lib\**" target="lib\" />
+    <file src="*.vl" target="" />
+    <file src="help\**" target="help\" />
+  </files>
+</package>

@@ -97,12 +97,14 @@ The single active ProcessNode. The ONLY component that does GPU work.
 > See `EXECUTION-MODEL.md` for the full execution model.
 
 ```csharp
+[ProcessNode(HasStateOutput = true)]
 public sealed class CudaEngine : IDisposable
 {
     // === Creation ===
 
     /// <summary>
     /// Production constructor. NodeContext is injected by VL as first parameter.
+    /// CudaEngineOptions becomes a visible VL input pin.
     /// </summary>
     public CudaEngine(NodeContext nodeContext, CudaEngineOptions? options = null);
 
@@ -115,7 +117,7 @@ public sealed class CudaEngine : IDisposable
 
     /// <summary>
     /// The CudaContext managed by this engine.
-    /// Exposed as output — flows to all blocks.
+    /// Exposed as state output — flows to all blocks via VL links.
     /// </summary>
     public CudaContext Context { get; }
 
@@ -145,6 +147,15 @@ public sealed class CudaEngine : IDisposable
     /// 3. If compiled graph exists → Launch + Synchronize + Distribute DebugInfo
     /// </summary>
     public void Update();
+
+    // === Debug ===
+
+    /// <summary>
+    /// VL tooltip display. Shows block count and compilation status.
+    /// </summary>
+    public override string ToString();
+    // → "CudaEngine: 3 blocks, compiled"
+    // → "CudaEngine: 0 blocks, not compiled"
 
     // === Dispose ===
 

@@ -212,28 +212,44 @@ var info = emitter.DebugInfo;
 
 ---
 
-## VL Integration Gate — REQUIRED BEFORE PHASE 3
+## VL Integration Gate — PASSED
 
-**Before continuing with Phase 3+, the existing Phase 0–2 code must be tested in a real VL (vvvv gamma) environment.** Unit tests verify internal correctness, but they cannot validate:
+**Status**: All 6 manual tests passed in vvvv gamma 7.1.
 
-1. **NuGet packaging** — Does VL.Cuda.Core resolve correctly as a VL NuGet?
-2. **NodeContext injection** — Does VL actually inject NodeContext into our constructors?
-3. **ProcessNode lifecycle** — Do CudaEngine.Update() and block constructors/Dispose get called at the right times?
-4. **Handle-flow on links** — Does CudaContext flow through VL links from Engine output to Block inputs?
-5. **GPU on VL's thread** — Do CUDA calls work on VL's main thread? Any context issues?
-6. **Hot-Swap** — Does Dispose → new constructor → reconnect work when editing a block's .vl patch?
-7. **Tooltip display** — Does DebugInfo/ToString show up in VL node tooltips?
+### Validated
 
-### Minimum viable test
+| Test | Result |
+|------|--------|
+| Package Discovery | CudaEngine found in node browser |
+| Node Creation | Node placed without error, CUDA context created on VL's thread |
+| Update Loop | Update() called every frame, no crashes |
+| Tooltip/DebugInfo | ToString() shows "CudaEngine: 0 blocks, not compiled" |
+| Dispose | Node deletion cleans up without crash or GPU leaks |
+| State Output | State output pin visible (HasStateOutput = true) |
 
-Create a simple VL patch with:
-- One `CudaEngine` node
-- One block (e.g. `VectorAdd`) connected to the engine's `CudaContext` output
-- Verify: graph compiles, launches, DebugInfo shows `OK`
-- Verify: changing a scalar parameter triggers Hot Update (no rebuild)
-- Verify: deleting and re-adding a block triggers Cold Rebuild
+### Source-Package Setup (validated)
 
-**If any of these fail, fix before Phase 3.** Assumptions made in Phase 0–2 (thread model, NodeContext shape, handle-flow) could be wrong — better to discover now than after building 3 more phases on top.
+| File | Purpose |
+|------|---------|
+| `deployment/VL.CudaGraph.nuspec` | Package metadata (for `nuget pack`) |
+| `VL.CudaGraph.vl` | VL document with dependencies |
+| `lib/net8.0/VL.Cuda.Core.dll` | Built DLL (OutputPath convention) |
+| `lib/net8.0/VL.Cuda.Core.xml` | XML docs for VL tooltips |
+
+Key learnings:
+- `.nuspec` goes in `deployment/` folder (VL template convention)
+- `.vl` uses `PlatformDependency` with `IsForward="true"` (NOT `AssemblyReference`)
+- `.vl` needs explicit `NugetDependency` for ManagedCuda-13 (not just in nuspec)
+- Don't hand-edit `.vl` files — VL regenerates them with new IDs on open
+- `deps.json` alone is NOT enough for dependency resolution — VL resolves from `.vl` file
+
+### Not Yet Tested (deferred to first block implementation)
+
+- Hot-Swap (needs block code change)
+- Handle-flow on links (needs block consuming CudaContext)
+- IVLRuntime diagnostics (needs error scenario)
+- PinGroups (needs block with dynamic pins)
+- AppHost.TakeOwnership (needs app shutdown test)
 
 ---
 
@@ -582,7 +598,15 @@ Parallel work possible:
 - [x] 90 tests passing (148 total)
 - [x] NodeContext in constructors (VL.Core NuGet added)
 
-Phase 2 VL Runtime Integration (deferred — done when first VL patch is built):
+VL Integration Gate (validated in vvvv gamma 7.1):
+- [x] Package discovery (source-package via `--package-repositories`)
+- [x] NodeContext injection (auto-injected by VL)
+- [x] ProcessNode lifecycle (Create → Update → Dispose)
+- [x] GPU on VL's thread (CUDA calls work)
+- [x] Tooltip display (ToString() shows in VL)
+- [x] State output pin (HasStateOutput = true)
+
+Phase 2 VL Runtime Integration (deferred — done when first block is built):
 - [ ] PinGroups display (needs VL.Core PinGroupKind)
 - [ ] Hot-Swap simulation (needs VL runtime)
 - [ ] IVLRuntime diagnostics (needs VL runtime)

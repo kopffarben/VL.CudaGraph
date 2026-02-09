@@ -9,6 +9,7 @@ using VL.Cuda.Core.Blocks.Builder;
 using VL.Cuda.Core.Buffers;
 using VL.Cuda.Core.Context;
 using VL.Cuda.Core.Context.Services;
+using VL.Core.Import;
 using VL.Cuda.Core.Graph;
 
 namespace VL.Cuda.Core.Engine;
@@ -18,6 +19,7 @@ namespace VL.Cuda.Core.Engine;
 /// compiles and launches the CUDA graph, and distributes debug info.
 /// One CudaEngine per pipeline.
 /// </summary>
+[ProcessNode(HasStateOutput = true)]
 public sealed class CudaEngine : IDisposable
 {
     private readonly ManagedCuda.CudaStream _stream;
@@ -379,6 +381,13 @@ public sealed class CudaEngine : IDisposable
                 LastExecutionTime = _stopwatch.Elapsed,
             };
         }
+    }
+
+    public override string ToString()
+    {
+        var blockCount = Context.Registry.Count;
+        var status = _compiledGraph != null ? "compiled" : "not compiled";
+        return $"CudaEngine: {blockCount} blocks, {status}";
     }
 
     public void Dispose()
