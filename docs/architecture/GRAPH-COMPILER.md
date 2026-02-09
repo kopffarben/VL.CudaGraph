@@ -13,14 +13,16 @@ CudaEngine.Update() detects structureDirty
     ┌─────────────────────────────────────┐
     │         Graph Compiler               │
     │                                      │
-    │  1. Validation                       │
-    │  2. Buffer Allocation                │
-    │  3. Topological Sort                 │
-    │  4. Shape Propagation                │
-    │  5. Liveness Analysis                │
-    │  5.5 Stream Capture (CapturedNodes)  │
-    │  6. CUDA Graph Build                 │
-    │  7. Instantiate                      │
+    │  1. Validation                       │  ← Phase 1 (implemented)
+    │  2. Topological Sort                 │  ← Phase 1 (implemented)
+    │  3. Buffer Allocation                │  ← Phase 1 (implemented)
+    │  4. Wire Parameters                  │  ← Phase 1 (implemented)
+    │  5. CUDA Graph Build                 │  ← Phase 1 (implemented)
+    │  6. Instantiate                      │  ← Phase 1 (implemented)
+    │  ─── Planned ───────────────────── │
+    │  Shape Propagation                   │  ← Phase 3 (planned)
+    │  Liveness Analysis                   │  ← Phase 3 (planned)
+    │  Stream Capture (CapturedNodes)      │  ← Phase 4a (planned)
     │                                      │
     └─────────────────────────────────────┘
          │
@@ -32,6 +34,8 @@ CudaEngine.Update() detects structureDirty
 ```
 
 ## Compilation Phases
+
+> **Current implementation (Phase 1-2):** The compiler performs Validation → Topological Sort → Buffer Allocation → Wire Parameters → CUDA Graph Build → Instantiate. Shape Propagation and Liveness Analysis are Phase 3 features. Stream Capture is Phase 4a.
 
 ### Phase 1: Validation
 
@@ -86,7 +90,7 @@ Topological levels:
 CUDA Graph automatically parallelizes nodes at same level.
 ```
 
-### Phase 4: Shape Propagation
+### Phase 4: Shape Propagation *(Phase 3 — not yet implemented)*
 
 ```
 Shape Rules:
@@ -96,7 +100,7 @@ Shape Rules:
   "[N, 16]"        → output.shape = [inputs[0].dim0, 16]
 ```
 
-### Phase 5: Liveness Analysis
+### Phase 5: Liveness Analysis *(Phase 3 — not yet implemented)*
 
 Determines when buffers can be reused:
 
@@ -110,7 +114,7 @@ Timeline:
 Buffer_A live range: [t0, t2] → can be released after t2
 ```
 
-### Phase 5.5: Stream Capture (CapturedNodes only)
+### Stream Capture *(Phase 4a — not yet implemented)*
 
 For CapturedNode descriptors (Library Calls like cuBLAS, cuFFT), the compiler executes Stream Capture to produce child graphs:
 
@@ -195,7 +199,7 @@ Regions enable control flow within the graph.
 | Buffer rebind (same size) | **Warm Update** — `cuGraphExecKernelNodeSetParams` |
 | Buffer resize | **Warm Update** + Pool realloc |
 | Grid size changed | **Warm Update** — `cuGraphExecKernelNodeSetParams` |
-| Patchable kernel logic changed | **Code Rebuild** — NVRTC recompile → new CUmodule → Cold Rebuild of affected block |
+| Patchable kernel logic changed | **Code Rebuild** — Recompile (ILGPU IR or NVRTC) → new CUmodule → Cold Rebuild of affected block |
 | Node added/removed | **Cold Rebuild** — Full Rebuild |
 | Edge added/removed | **Cold Rebuild** — Full Rebuild |
 | Region added/removed | **Cold Rebuild** — Full Rebuild |

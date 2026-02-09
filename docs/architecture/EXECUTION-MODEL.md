@@ -289,11 +289,14 @@ class CudaEngine
 
 ---
 
-## Profiling
+## Profiling *(Phase 3+ — not yet implemented)*
+
+> **Note:** This entire section describes **planned** profiling infrastructure. The current Phase 2 implementation distributes only `BlockDebugInfo` (State, StateMessage, LastExecutionTime) via `CudaEngine.DistributeDebugInfo()`. The types below (`ProfilingPipeline`, `ProfilingLevel`, `FrameDebugData`) do not exist yet.
 
 ### Profiling Levels
 
 ```csharp
+// Planned (Phase 3+)
 public enum ProfilingLevel
 {
     None,        // Zero overhead. Only state (OK/Warning/Error).
@@ -335,23 +338,24 @@ Request Readbacks(F0) Request Readbacks(F1) Request Readbacks(F2)
 ```
 
 ```csharp
+// Planned (Phase 3+) — types do not exist yet
 class ProfilingPipeline
 {
     private const int InFlightFrames = 3;
     private FrameDebugData[] _inFlight = new FrameDebugData[InFlightFrames];
     private int _writeIndex;
     private FrameDebugData? _current;  // Latest completed data
-    
+
     public void OnPreLaunch(CompiledGraph graph, ProfilingLevel level)
     {
         // Check if oldest in-flight frame is ready
         var oldest = _inFlight[_writeIndex % InFlightFrames];
         if (oldest != null && oldest.IsReady())
             _current = oldest;
-        
+
         // Prepare new frame
         var frame = new FrameDebugData();
-        
+
         if (level >= ProfilingLevel.Summary)
             frame.RecordGraphEvents(graph);
         if (level >= ProfilingLevel.PerBlock)
@@ -362,14 +366,15 @@ class ProfilingPipeline
             frame.RequestAsyncReadbacks(graph);
         if (level == ProfilingLevel.DeepSync)
             frame.RequestSyncReadbacks(graph);  // GPU stall here
-        
+
         _inFlight[_writeIndex++ % InFlightFrames] = frame;
     }
-    
+
     /// <summary>
     /// Called by blocks via ToString(). Returns null if no data available yet.
+    /// Returns IBlockDebugInfo (or a richer subtype when profiling is active).
     /// </summary>
-    public BlockDebugSnapshot? GetCached(Guid blockId)
+    public IBlockDebugInfo? GetCached(Guid blockId)
     {
         return _current?.GetBlock(blockId);
     }
@@ -378,7 +383,9 @@ class ProfilingPipeline
 
 ---
 
-## Debug Display
+## Debug Display *(Phase 3+ — design preview)*
+
+> **Note:** The examples below show the **planned** tooltip design. In the current Phase 2 implementation, blocks only have `BlockDebugInfo` (State, StateMessage, LastExecutionTime) written by `CudaEngine.DistributeDebugInfo()`. The `ProfilingPipeline` and `OutputHandle` types referenced below do not exist yet.
 
 ### Principle: Zero Overhead When Not Observed
 
