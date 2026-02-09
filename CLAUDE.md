@@ -193,17 +193,20 @@ src/References/
   VL.StandardLibs/     — VL.Core, VL.Stride, etc. (git submodule)
   managedCuda/         — ManagedCuda CUDA bindings (git submodule)
   ILGPU/               — ILGPU .NET GPU compiler (git submodule)
+  The-Gray-Book/       — Official VL documentation, design guidelines, best practices (git submodule)
 ```
 
 **Purpose:** These submodules exist solely as API reference for development.
 Search the source code to understand how VL.Core APIs (NodeContext, AppHost,
-ResourceProvider, IVLRuntime, etc.) and ManagedCuda APIs actually work.
+ResourceProvider, IVLRuntime, etc.) and ManagedCuda APIs actually work. The-Gray-Book
+contains official VL design guidelines, naming conventions, and best practices.
 
 **Rules:**
 - ⛔ **NEVER modify any file** in `src/References/` — these are upstream repos
 - ✅ **Search and read** to understand API signatures, patterns, conventions
 - ✅ **Our code** (`src/VL.Cuda.Core/`, etc.) consumes these as **NuGet packages**
 - The submodules are not project references — they are not compiled as part of our solution
+- ✅ **The-Gray-Book** is VL's official documentation — follow its design guidelines for node/pin naming, categories, documentation, etc.
 
 ## CUDA Requirements
 

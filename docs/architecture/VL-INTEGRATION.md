@@ -516,6 +516,234 @@ Engine Tooltip (CudaEngine.ToString):
 
 ---
 
+## VL Naming Conventions & Design Guidelines
+
+> **Based on The-Gray-Book design guidelines.** See `src/References/The-Gray-Book/reference/extending/design-guidelines.md` for full reference.
+
+### Node Names
+
+A node name consists of three components: **Name (Version) [Category]**
+
+#### Name Component
+- Use **CamelCasing**, no spaces
+- **Process nodes** (stateful): use nouns → `Sequencer`, `Emitter`, `Integrator`
+- **Operation nodes** (stateless): prefer verbs → `Add`, `Scale`, `Transform`
+- Avoid `As..` prefixes like `AsString`. Use `To..` or `From..` instead
+
+#### Version Component (optional)
+- Most nodes should have **no version**
+- Use versions only when specializing an existing node
+- Simpler variant = no version, specialized variant = descriptive version
+- Examples: `Emitter` vs `Emitter (Sphere)`, `Add` vs `Add (Saturated)`
+
+#### Category Component (required)
+- Use existing categories when possible: `[Math]`, `[Collections]`, `[Animation]`, `[Reactive]`
+- For VL.Cuda nodes, use `[CUDA]` as root category
+- Subcategories with dot notation: `[CUDA.Kernels]`, `[CUDA.Buffers]`, `[CUDA.Libraries]`
+- Avoid excessive subcategory nesting (max 2-3 levels)
+
+### Pin Names
+
+- Use **spaces** to separate words, all starting with **upper case**
+- Good: `Particle Count`, `Delta Time`, `Grid Size`
+- Bad: `particleCount`, `delta_time`, `gridSize`
+- Avoid generic names like `Do`, `Update` unless following established patterns
+- For vector components: `X`, `Y`, `Z`, `W` (not `x`, `y`, `z`, `w`)
+
+#### Pin Order
+- **Main input** on the left
+- **Configuration/parameters** in the middle
+- **Reset/Control** typically on the right
+- **Outputs** ordered by importance (main result first)
+
+### Constructor Node Naming
+
+Three naming patterns for constructor operations:
+
+| Pattern | Use Case | Example |
+|---------|----------|---------|
+| **Create** | Complex datatypes with functionality | `Create [Particle]` |
+| **Join/Split** | Container datatypes (property bags) | `Vector2 (Join)`, `Vector2 (Split)` |
+| **FromX/ToX** | Type conversions | `FromHSL [Color.RGBA]`, `ToRadians [Math]` |
+
+For VL.Cuda:
+```
+Create [GpuBuffer<T>]           // Main buffer constructor
+Upload [CUDA.Buffers]           // CPU → GPU conversion
+Download [CUDA.Buffers]         // GPU → CPU conversion
+FromCpuArray [CUDA.Buffers]     // Alternative to Upload
+ToCpuArray [CUDA.Buffers]       // Alternative to Download
+```
+
+### XML Documentation
+
+Use standard XML doc comments — VL reads them automatically:
+
+```csharp
+/// <summary>Emits particles from a sphere surface</summary>
+/// <remarks>
+/// Particles are distributed uniformly across the sphere surface.
+/// Use Emission Rate to control density.
+/// </remarks>
+/// <param name="radius">Sphere radius in world units</param>
+/// <param name="emissionRate">Particles per second</param>
+/// <returns>Buffer containing newly emitted particles</returns>
+public class SphereEmitter : ICudaBlock
+{
+    // ...
+}
+```
+
+VL displays:
+- **Summary** in NodeBrowser and as first line of tooltip
+- **Remarks** in extended tooltip (multi-line, shows on hover)
+- **Param** descriptions for each pin's tooltip
+- **Returns** for output pin tooltips
+
+> **IMPORTANT:** XML docs are only generated if the C# project has `<GenerateDocumentationFile>true</GenerateDocumentationFile>` in the .csproj.
+
+### Tags for Node Search
+
+- Tags are **lowercase, space-separated** search terms
+- Apply via `[Tags("term1 term2 term3")]` attribute
+- **Don't duplicate** terms already in name/version/category
+- Example: `[Tags("gpu compute parallel kernel")]`
+
+### Standard Datatypes
+
+Prefer established VL types on node boundaries:
+
+| Use Case | VL Type | Avoid |
+|----------|---------|-------|
+| Booleans | `bool` | Custom enum |
+| Integers | `int` | `int32`, `Int32` |
+| Floats | `float` | `float32`, `Float32` |
+| Vectors | `Vector2`, `Vector3`, `Vector4` | Custom structs |
+| Matrices | `Matrix4x4` | Custom matrix types |
+| Strings | `string` | Custom text types |
+| Collections | `Spread<T>`, `IEnumerable<T>` | Arrays, Lists |
+| File paths | `Path` (VL.IO) | `string` |
+| Colors | `RGBA` (VL.CoreLib) | Custom color types |
+| Angles | **Cycles** (0-1 = full rotation) | Radians, degrees |
+
+For VL.Cuda:
+- Internal GPU buffers: `GpuBuffer<T>` (our type)
+- CPU↔GPU boundary: `Spread<T>` (VL) ↔ `GpuBuffer<T>` (CUDA)
+- Scalar parameters: use standard VL types (`float`, `int`, `Vector3`, etc.)
+
+### Process Nodes
+
+Mark classes intended as VL process nodes with `[ProcessNode]` attribute:
+
+```csharp
+[ProcessNode]
+public class ParticleEmitter : ICudaBlock
+{
+    private int _particleCount;
+
+    public ParticleEmitter(NodeContext nodeContext, CudaContext ctx)
+    {
+        // Constructor runs once on node creation
+    }
+
+    public void Update(float deltaTime, int emissionRate)
+    {
+        // Update runs every frame
+        _particleCount += (int)(emissionRate * deltaTime);
+    }
+
+    public void Dispose()
+    {
+        // Cleanup when node is deleted
+    }
+}
+```
+
+Key points:
+- `[ProcessNode]` only works if assembly has `[assembly:ImportAsIs]` attribute
+- Constructor runs **once** when node is created
+- `Update` (or any public method) runs **every frame** via VL pins
+- Use fields for state that persists between frames
+- VL automatically creates an input pin for any `Update` method parameter
+- Methods with no outputs get a `bool` enable pin (default: false)
+- Methods with Input/Output of same type get an `Apply` pin (default: true)
+
+### Async Operations Pattern
+
+For operations that may take time, follow this output pattern:
+
+```csharp
+public class AsyncLoader
+{
+    public void Load(out bool inProgress, out bool onCompleted,
+                     out bool success, out string error)
+    {
+        // inProgress: true while operation is running
+        // onCompleted: bang when operation finishes
+        // success: true if completed successfully
+        // error: error message if failed
+    }
+}
+```
+
+VL users recognize this pattern and know how to handle it.
+
+### Exception Handling
+
+For VL.Cuda blocks:
+- **Validation errors** (missing inputs, type mismatches) → report via `IVLRuntime.AddMessage()` with `MessageSeverity.Error`
+- **CUDA errors** (launch failures, out of memory) → report via `IVLRuntime.AddMessage()` with `MessageSeverity.Error`
+- **Warnings** (deprecated features, suboptimal config) → report via `IVLRuntime.AddMessage()` with `MessageSeverity.Warning`
+- **Info/stats** (timing, buffer usage) → return via `ToString()` for tooltips
+
+Don't throw exceptions from `Update()` methods — VL can't recover. Always report via IVLRuntime.
+
+### Pin Visibility
+
+Operations with a single `Input` → `Output` flow automatically get an **Apply** pin:
+
+```csharp
+// Automatically gets Apply pin (default: true)
+public GpuBuffer<float> Scale(GpuBuffer<float> input, float factor)
+{
+    // When Apply = false, input is passed through unchanged
+    // When Apply = true, operation executes
+}
+```
+
+Operations with no output get an **enable pin** named after the method:
+
+```csharp
+// Gets a "Clear" pin (default: false)
+public void Clear()
+{
+    // Only runs when pin is true
+}
+```
+
+### Observable Pattern
+
+For events/notifications, always return `IObservable<T>`:
+
+```csharp
+public class BufferMonitor
+{
+    private Subject<int> _capacityExceeded = new();
+
+    public IObservable<int> OnCapacityExceeded => _capacityExceeded;
+
+    public void CheckCapacity(int current, int max)
+    {
+        if (current > max * 0.9f)
+            _capacityExceeded.OnNext(current);
+    }
+}
+```
+
+VL has native Reactive nodes (`HoldLatest`, `KeepLatest`, etc.) that work seamlessly with `IObservable<T>`.
+
+---
+
 ## Typical VL Patch Structure
 
 ```
