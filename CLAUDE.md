@@ -254,6 +254,44 @@ For library packages (no entry point), the export step will crash with "Entry po
 this is expected. The validation signal is the compilation line: `VL.CudaGraph.vl -> ...dll`.
 See [`docs/vl.reference/VL.Compiler.md`](docs/vl.reference/VL.Compiler.md) for details.
 
+## Pre-Commit Documentation Checklist
+
+**Before every commit, documentation MUST be updated and verified.** Code and docs are always committed together — never commit code changes without updating affected docs.
+
+### Mandatory Steps
+
+1. **Check affected docs** — For every code change, identify which docs are impacted:
+   - `docs/api/CSHARP-API.md` — Any new/changed/removed types, methods, properties, namespaces
+   - `docs/architecture/EXECUTION-MODEL.md` — Changes to block/engine lifecycle, dirty-tracking, update levels
+   - `docs/architecture/BLOCK-SYSTEM.md` — Changes to ICudaBlock, BlockBuilder, composition patterns
+   - `docs/architecture/CORE-RUNTIME.md` — Changes to CudaContext, BufferPool, GpuBuffer, DeviceContext
+   - `docs/architecture/GRAPH-COMPILER.md` — Changes to graph building, KernelNode, CompiledGraph
+   - `docs/architecture/KERNEL-SOURCES.md` — Changes to kernel sources, node types, ILGPU/NVRTC
+   - `docs/architecture/VL-INTEGRATION.md` — Changes to VL patterns, handle-flow, ProcessNode
+   - `docs/architecture/PTX-LOADER.md` — Changes to PTX/JSON loading
+   - `docs/architecture/GRAPHICS-INTEROP.md` — Changes to DX11/Stride interop
+   - `docs/implementation/PHASES.md` — Phase status changes, new test counts, completed tasks
+   - `CLAUDE.md` — New architecture decisions, design patterns, technology changes
+
+2. **Update docs to match code** — Ensure signatures, class names, namespaces, behavior descriptions, and examples in docs reflect the actual implementation. Mark planned features clearly as *(Phase N+)*.
+
+3. **Verify consistency** — Cross-check:
+   - API doc type names match actual C# class/interface names
+   - Phase status and test counts in PHASES.md are current
+   - Code examples in docs compile against the actual API
+   - No references to renamed/removed types or methods
+
+4. **Do NOT update** `docs/vl.reference/` — These are external platform reference docs, not project docs.
+
+### What Counts as "Affected"
+
+- Added a new class → update CSHARP-API.md + relevant architecture doc
+- Changed a method signature → update CSHARP-API.md
+- Changed behavior/lifecycle → update the architecture doc that describes it
+- Completed a phase task → update PHASES.md status
+- New architecture decision → update CLAUDE.md "Key Design Decisions" table
+- Changed test count → update PHASES.md and CSHARP-API.md header
+
 ## Testing
 
 Run tests with:
