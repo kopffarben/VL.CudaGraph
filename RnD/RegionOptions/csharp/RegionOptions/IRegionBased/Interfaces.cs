@@ -11,7 +11,12 @@ public interface LFOInterface
     void Update(float Period, bool Pause, bool Reset, out float Result);
 }
 
-public interface ForRegionInterface
+public interface PureFunctionInterface
+{
+    void Update(bool Enable);
+}
+
+public interface ForeachRegionInterface
 {
     void Update(int Index, out bool Break);
 }
