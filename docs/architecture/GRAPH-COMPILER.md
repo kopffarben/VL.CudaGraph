@@ -17,6 +17,7 @@ CudaEngine.Update() detects structureDirty
     │  2. Topological Sort                 │  ← Phase 1 (implemented)
     │  3. Buffer Allocation                │  ← Phase 1 (implemented)
     │  4. Wire Parameters                  │  ← Phase 1 (implemented)
+    │  4.5 Memset Nodes (AppendBuffers)    │  ← Phase 3.1 (implemented)
     │  5. CUDA Graph Build                 │  ← Phase 1 (implemented)
     │  6. Instantiate                      │  ← Phase 1 (implemented)
     │  ─── Planned ───────────────────── │
@@ -35,7 +36,7 @@ CudaEngine.Update() detects structureDirty
 
 ## Compilation Phases
 
-> **Current implementation (Phase 1-2):** The compiler performs Validation → Topological Sort → Buffer Allocation → Wire Parameters → CUDA Graph Build → Instantiate. Shape Propagation and Liveness Analysis are Phase 3 features. Stream Capture is Phase 4a.
+> **Current implementation (Phase 1-3.1):** The compiler performs Validation → Topological Sort → Buffer Allocation → Wire Parameters → Memset Nodes (AppendBuffer counters) → CUDA Graph Build → Instantiate. Shape Propagation and Liveness Analysis are Phase 3 features. Stream Capture is Phase 4a.
 
 ### Phase 1: Validation
 
@@ -89,6 +90,52 @@ Topological levels:
 
 CUDA Graph automatically parallelizes nodes at same level.
 ```
+
+### Phase 4.5: Memset Nodes (AppendBuffer Counter Reset)
+
+After Wire Parameters and before kernel node insertion, the compiler generates memset nodes to zero-initialize AppendBuffer counters. This ensures counters are reset at the start of every graph launch without any manual intervention.
+
+#### MemsetDescriptor
+
+Each `AppendBufferInfo` in the `BlockDescription` produces a `MemsetDescriptor`:
+
+```csharp
+public sealed class MemsetDescriptor
+{
+    public CUdeviceptr Pointer { get; }   // Counter buffer pointer
+    public uint Value { get; }            // Always 0 (reset)
+    public int SizeInBytes { get; }       // sizeof(uint) = 4
+}
+```
+
+#### Graph Construction
+
+```csharp
+// For each AppendBuffer, insert a memset node:
+foreach (var memsetDesc in memsetDescriptors)
+{
+    var memsetParams = new CudaMemsetNodeParams
+    {
+        dst = memsetDesc.Pointer,
+        value = memsetDesc.Value,       // 0
+        elementSize = sizeof(uint),
+        width = 1,
+        height = 1
+    };
+    var memsetNode = graph.AddMemsetNode(memsetParams, dependencies: Array.Empty<CUgraphNode>());
+    memsetNodes.Add(memsetNode);
+}
+```
+
+#### Dependency Wiring
+
+Memset nodes execute **before** any kernel nodes that use the corresponding append buffer. The compiler adds each memset node as an additional dependency for kernel nodes that write to that append output:
+
+```
+Memset(Counter=0)  ──dependency──▶  KernelNode (appends to buffer)
+```
+
+This guarantees the counter is zeroed before the kernel's `atomicAdd` operations begin. Multiple kernel nodes writing to the same append buffer all depend on the same memset node.
 
 ### Phase 4: Shape Propagation *(Phase 3 — not yet implemented)*
 

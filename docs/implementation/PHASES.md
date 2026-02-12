@@ -257,11 +257,28 @@ Key learnings:
 
 **Goal**: AppendBuffer, regions, liveness analysis
 
-### Tasks
+### Phase 3.1: AppendBuffer — COMPLETE
+
+**Status**: Complete. 19 tests passing (167 total with Phase 0+1+2).
+
+#### Implemented
+
+| Task | Description | Status |
+|------|-------------|--------|
+| 3.1a | AppendBuffer\<T\> (wraps GpuBuffer\<T\> Data + GpuBuffer\<uint\> Counter) | Done |
+| 3.1b | IAppendBuffer interface (type-erased tracking for GraphCompiler/CudaEngine) | Done |
+| 3.1c | BufferPool.AcquireAppend\<T\>(maxCapacity, lifetime) | Done |
+| 3.1d | MemsetDescriptor + GraphCompiler memset node phase (counter reset before kernel execution) | Done |
+| 3.1e | BlockBuilder.AppendOutput\<T\>() with auto-generated "{name} Count" port | Done |
+| 3.1f | AppendBufferInfo in BlockDescription | Done |
+| 3.1g | CudaEngine integration: memset dependency wiring in graph build | Done |
+| 3.1h | CudaEngine auto-readback of append counts after launch | Done |
+| 3.1i | BlockDebugInfo.AppendCounts (Dictionary\<string, uint\>) | Done |
+
+### Remaining Tasks (Phase 3.2+)
 
 | Task | Description | Depends On |
 |------|-------------|------------|
-| 3.1 | Implement AppendBuffer<T> | - |
 | 3.2 | Implement If region | 3.1 |
 | 3.3 | Implement While region | 3.2 |
 | 3.4 | Implement For region | 3.2 |
@@ -274,12 +291,14 @@ Key learnings:
 ### Deliverables
 
 ```csharp
-// Should work:
+// Should work (Phase 3.1 — implemented):
 var append = ctx.Pool.AcquireAppend<Particle>(100000, BufferLifetime.Graph);
+// Counter auto-reset via memset node before each graph launch
+// Count auto-readback into BlockDebugInfo.AppendCounts after launch
 
+// Phase 3.2+ (not yet implemented):
 // Composite block (children managed via BlockBuilder)
 var particleSystem = new ParticleSystemBlock(ctx);
-// ParticleSystemBlock internally creates Emitter, Forces, Integrate as children
 
 // Serialization
 var model = ctx.GetModel();
@@ -288,7 +307,7 @@ model.SaveToFile("system.json");
 
 ### Test Cases
 
-1. AppendBuffer with GPU counter
+1. ~~AppendBuffer with GPU counter~~ (Phase 3.1 — done)
 2. If region with condition kernel
 3. While loop termination
 4. Buffer reuse across regions
@@ -612,8 +631,20 @@ Phase 2 VL Runtime Integration (deferred — done when first block is built):
 - [ ] IVLRuntime diagnostics (needs VL runtime)
 - [ ] AppHost.TakeOwnership (needs VL runtime)
 
-### Phase 3 Complete
-- [ ] AppendBuffer works with GPU counter
+### Phase 3.1 Complete (AppendBuffer)
+- [x] AppendBuffer\<T\> wraps GpuBuffer\<T\> Data + GpuBuffer\<uint\> Counter (composition)
+- [x] IAppendBuffer interface for type-erased tracking
+- [x] BufferPool.AcquireAppend\<T\>() allocates both buffers
+- [x] MemsetDescriptor → cuGraphAddMemsetNode for counter reset
+- [x] GraphCompiler memset node phase (between WireParameters and kernel insertion)
+- [x] Memset nodes wired as dependencies for kernel nodes using append outputs
+- [x] BlockBuilder.AppendOutput\<T\>() with auto-generated "{name} Count" port
+- [x] AppendBufferInfo in BlockDescription
+- [x] CudaEngine auto-readback of append counts after launch
+- [x] BlockDebugInfo.AppendCounts populated per frame
+- [x] 19 tests passing (167 total)
+
+### Phase 3 Remaining
 - [ ] Conditional regions execute correctly
 - [ ] Composite blocks compose properly
 - [ ] Serialization round-trips

@@ -17,6 +17,7 @@ public sealed class GraphBuilder
     private readonly List<KernelNode> _nodes = new();
     private readonly List<Edge> _edges = new();
     private readonly Dictionary<(Guid NodeId, int ParamIndex), CUdeviceptr> _externalBuffers = new();
+    private readonly List<MemsetDescriptor> _memsetDescriptors = new();
 
     public GraphBuilder(DeviceContext device, ModuleCache moduleCache)
     {
@@ -170,11 +171,31 @@ public sealed class GraphBuilder
         return new GraphDescription(
             _nodes.ToList().AsReadOnly(),
             _edges.ToList().AsReadOnly(),
-            new Dictionary<(Guid, int), CUdeviceptr>(_externalBuffers));
+            new Dictionary<(Guid, int), CUdeviceptr>(_externalBuffers),
+            _memsetDescriptors.ToList().AsReadOnly());
+    }
+
+    /// <summary>
+    /// Add a memset operation to the graph (e.g., for resetting AppendBuffer counters).
+    /// </summary>
+    internal MemsetDescriptor AddMemset(CUdeviceptr dst, uint value, uint elemSize, ulong width, string debugName)
+    {
+        var desc = new MemsetDescriptor(dst, value, elemSize, width, debugName);
+        _memsetDescriptors.Add(desc);
+        return desc;
+    }
+
+    /// <summary>
+    /// Declare that a kernel node depends on a memset completing first.
+    /// </summary>
+    internal void AddMemsetDependency(MemsetDescriptor memset, KernelNode kernelNode)
+    {
+        memset.DependentKernelNodeIds.Add(kernelNode.Id);
     }
 
     public IReadOnlyList<KernelNode> Nodes => _nodes;
     public IReadOnlyList<Edge> Edges => _edges;
+    internal IReadOnlyList<MemsetDescriptor> MemsetDescriptors => _memsetDescriptors;
 
     /// <summary>
     /// Kahn's algorithm for cycle detection. Returns true if the graph is acyclic.

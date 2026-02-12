@@ -30,6 +30,26 @@ public sealed class BufferPool : IDisposable
     }
 
     /// <summary>
+    /// Acquire an append buffer (data + counter) from the pool.
+    /// The counter is a single uint element, reset to 0 by a memset graph node before each launch.
+    /// </summary>
+    public AppendBuffer<T> AcquireAppend<T>(int maxCapacity, BufferLifetime lifetime = BufferLifetime.Graph)
+        where T : unmanaged
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        var data = Acquire<T>(maxCapacity, lifetime);
+        var counter = Acquire<uint>(1, lifetime);
+
+        return new AppendBuffer<T>(data, counter, maxCapacity, lifetime,
+            onDispose: ab =>
+            {
+                ab.Data.Dispose();    // returns to pool via GpuBuffer's onDispose
+                ab.Counter.Dispose(); // returns to pool via GpuBuffer's onDispose
+            });
+    }
+
+    /// <summary>
     /// Acquire a buffer from the pool. May reuse a previously released buffer.
     /// </summary>
     public GpuBuffer<T> Acquire<T>(int elementCount, BufferLifetime lifetime = BufferLifetime.Graph)

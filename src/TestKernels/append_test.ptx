@@ -1,0 +1,65 @@
+//
+// append_test: Filter kernel with atomic append.
+// Reads input[tid], if > threshold, atomically claims a slot and writes to output.
+// Hand-written PTX for Phase 3 testing. SM 7.5+, 64-bit addressing.
+//
+// Params: input (float*), output (float*), counter (uint*), threshold (float), N (uint)
+//
+.version 7.5
+.target sm_75
+.address_size 64
+
+.visible .entry append_test(
+    .param .u64 param_input,
+    .param .u64 param_output,
+    .param .u64 param_counter,
+    .param .f32 param_threshold,
+    .param .u32 param_N
+)
+{
+    .reg .pred  %p<3>;
+    .reg .f32   %f<3>;
+    .reg .b32   %r<6>;
+    .reg .b64   %rd<8>;
+
+    // tid = blockIdx.x * blockDim.x + threadIdx.x
+    mov.u32         %r0, %tid.x;
+    mov.u32         %r1, %ctaid.x;
+    mov.u32         %r2, %ntid.x;
+    mad.lo.s32      %r0, %r1, %r2, %r0;
+
+    // bounds check: if (tid >= N) return
+    ld.param.u32    %r3, [param_N];
+    setp.ge.u32     %p1, %r0, %r3;
+    @%p1 bra        EXIT;
+
+    // offset = tid * 4 (sizeof float)
+    cvt.u64.u32     %rd0, %r0;
+    shl.b64         %rd0, %rd0, 2;
+
+    // load input[tid]
+    ld.param.u64    %rd1, [param_input];
+    add.u64         %rd1, %rd1, %rd0;
+    ld.global.f32   %f1, [%rd1];
+
+    // load threshold
+    ld.param.f32    %f2, [param_threshold];
+
+    // if input[tid] <= threshold: skip
+    setp.le.f32     %p2, %f1, %f2;
+    @%p2 bra        EXIT;
+
+    // idx = atomicAdd(counter, 1)
+    ld.param.u64    %rd2, [param_counter];
+    atom.global.add.u32 %r4, [%rd2], 1;
+
+    // output[idx] = input[tid]
+    cvt.u64.u32     %rd3, %r4;
+    shl.b64         %rd3, %rd3, 2;
+    ld.param.u64    %rd4, [param_output];
+    add.u64         %rd4, %rd4, %rd3;
+    st.global.f32   [%rd4], %f1;
+
+EXIT:
+    ret;
+}

@@ -1,0 +1,37 @@
+{
+  "entryPoint": "append_test",
+  "blockSize": 256,
+  "sharedMemoryBytes": 0,
+  "parameters": [
+    {
+      "name": "input",
+      "type": "float*",
+      "direction": "in",
+      "isPointer": true
+    },
+    {
+      "name": "output",
+      "type": "float*",
+      "direction": "out",
+      "isPointer": true
+    },
+    {
+      "name": "counter",
+      "type": "uint*",
+      "direction": "inout",
+      "isPointer": true
+    },
+    {
+      "name": "threshold",
+      "type": "float",
+      "direction": "in",
+      "isPointer": false
+    },
+    {
+      "name": "N",
+      "type": "uint",
+      "direction": "in",
+      "isPointer": false
+    }
+  ]
+}

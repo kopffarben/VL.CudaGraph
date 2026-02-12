@@ -49,24 +49,64 @@ public sealed class GraphCompiler
         // 5. Build CUgraph
         var graph = new ManagedCuda.CudaGraph();
         var graphNodeHandles = new Dictionary<Guid, CUgraphNode>();
+        var memsetNodeHandles = new Dictionary<Guid, CUgraphNode>();
 
-        // Build dependency map: for each node, collect the CUDA graph nodes it depends on
+        // 5a. Insert memset nodes (e.g., AppendBuffer counter resets)
+        foreach (var memset in desc.MemsetDescriptors)
+        {
+            var memsetParams = new CudaMemsetNodeParams
+            {
+                dst = memset.Destination,
+                pitch = 0,
+                value = memset.Value,
+                elementSize = memset.ElementSize,
+                width = (ManagedCuda.BasicTypes.SizeT)memset.Width,
+                height = 1,
+            };
+
+            var memsetNode = graph.AddMemsetNode(null, memsetParams, _device.Context);
+            memsetNodeHandles[memset.Id] = memsetNode;
+        }
+
+        // Build a lookup: kernelNodeId → list of memset CUgraphNodes it depends on
+        var memsetDepsForKernel = new Dictionary<Guid, List<CUgraphNode>>();
+        foreach (var memset in desc.MemsetDescriptors)
+        {
+            if (!memsetNodeHandles.TryGetValue(memset.Id, out var memsetHandle)) continue;
+            foreach (var kernelId in memset.DependentKernelNodeIds)
+            {
+                if (!memsetDepsForKernel.TryGetValue(kernelId, out var list))
+                {
+                    list = new List<CUgraphNode>();
+                    memsetDepsForKernel[kernelId] = list;
+                }
+                list.Add(memsetHandle);
+            }
+        }
+
+        // 5b. Build dependency map: for each node, collect the CUDA graph nodes it depends on
         var nodeDependencies = BuildDependencyMap(desc.Edges, sortedNodes);
 
         foreach (var node in sortedNodes)
         {
             var nodeParams = node.BuildNodeParams();
 
-            // Get the CUDA graph node handles this node depends on
-            CUgraphNode[]? deps = null;
+            // Collect all dependencies: edge-based + memset-based
+            var allDeps = new List<CUgraphNode>();
+
             if (nodeDependencies.TryGetValue(node.Id, out var depIds) && depIds.Count > 0)
             {
-                deps = depIds
+                allDeps.AddRange(depIds
                     .Where(id => graphNodeHandles.ContainsKey(id))
-                    .Select(id => graphNodeHandles[id])
-                    .ToArray();
-                if (deps.Length == 0) deps = null;
+                    .Select(id => graphNodeHandles[id]));
             }
+
+            if (memsetDepsForKernel.TryGetValue(node.Id, out var memsetDeps))
+            {
+                allDeps.AddRange(memsetDeps);
+            }
+
+            CUgraphNode[]? deps = allDeps.Count > 0 ? allDeps.ToArray() : null;
 
             var graphNode = graph.AddKernelNode(deps, nodeParams);
             graphNodeHandles[node.Id] = graphNode;
@@ -75,7 +115,7 @@ public sealed class GraphCompiler
         // 6. Instantiate
         var exec = graph.Instantiate(CUgraphInstantiate_flags.None);
 
-        return new CompiledGraph(exec, graph, graphNodeHandles, nodeMap, intermediateBuffers);
+        return new CompiledGraph(exec, graph, graphNodeHandles, nodeMap, intermediateBuffers, memsetNodeHandles);
     }
 
     /// <summary>

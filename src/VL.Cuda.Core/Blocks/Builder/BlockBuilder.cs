@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Runtime.InteropServices;
 using VL.Cuda.Core.Buffers;
 using VL.Cuda.Core.Context;
 using VL.Cuda.Core.PTX;
@@ -20,6 +21,7 @@ public sealed class BlockBuilder
     private readonly List<BlockPort> _outputs = new();
     private readonly List<IBlockParameter> _parameters = new();
     private readonly List<(Guid SrcKernel, int SrcParam, Guid TgtKernel, int TgtParam)> _internalConnections = new();
+    private readonly List<AppendBufferInfo> _appendBuffers = new();
     private bool _committed;
 
     public BlockBuilder(CudaContext context, ICudaBlock block)
@@ -68,6 +70,36 @@ public sealed class BlockBuilder
         };
         _outputs.Add(port);
         return port;
+    }
+
+    /// <summary>
+    /// Define an append buffer output. Creates a data output port and records
+    /// the data+counter kernel parameter bindings. The engine will allocate the
+    /// AppendBuffer, wire both pointers, insert a memset node to reset the counter,
+    /// and auto-read the count after each launch. A "{name} Count" entry will appear
+    /// in BlockDebugInfo.AppendCounts for the block to expose as a VL output pin.
+    /// </summary>
+    public AppendOutputPort AppendOutput<T>(string name, KernelPin dataPin, KernelPin counterPin, int maxCapacity)
+        where T : unmanaged
+    {
+        EnsureNotCommitted();
+
+        // Create the data output port (downstream sees a normal buffer)
+        var dataPort = new BlockPort(_block.Id, name, PortDirection.Output, PinType.Buffer<T>())
+        {
+            KernelNodeId = dataPin.KernelHandleId,
+            KernelParamIndex = dataPin.ParamIndex,
+        };
+        _outputs.Add(dataPort);
+
+        var info = new AppendBufferInfo(
+            _block.Id, name,
+            dataPin.KernelHandleId, dataPin.ParamIndex,
+            counterPin.KernelHandleId, counterPin.ParamIndex,
+            maxCapacity, Marshal.SizeOf<T>());
+        _appendBuffers.Add(info);
+
+        return new AppendOutputPort(dataPort, info);
     }
 
     /// <summary>
@@ -175,7 +207,8 @@ public sealed class BlockBuilder
             .Concat(_outputs.Select(p => (p.Name, p.Direction, p.Type)))
             .ToList();
 
-        return new BlockDescription(kernelEntries, ports, indexedConnections);
+        return new BlockDescription(kernelEntries, ports, indexedConnections,
+            _appendBuffers.Count > 0 ? _appendBuffers.ToList() : null);
     }
 
     private void EnsureNotCommitted()

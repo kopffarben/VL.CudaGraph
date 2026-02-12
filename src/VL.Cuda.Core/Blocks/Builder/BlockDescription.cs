@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 namespace VL.Cuda.Core.Blocks.Builder;
 
@@ -44,6 +45,65 @@ public sealed class KernelEntry
 }
 
 /// <summary>
+/// Describes an AppendBuffer output within a block: which kernel params hold
+/// the data pointer and counter pointer, and the maximum capacity.
+/// </summary>
+public sealed class AppendBufferInfo
+{
+    public Guid BlockId { get; }
+    public string PortName { get; }
+    public string CountPortName => $"{PortName} Count";
+    public Guid DataKernelHandleId { get; }
+    public int DataParamIndex { get; }
+    public Guid CounterKernelHandleId { get; }
+    public int CounterParamIndex { get; }
+    public int MaxCapacity { get; }
+    public int ElementSize { get; }
+
+    public AppendBufferInfo(Guid blockId, string portName,
+        Guid dataKernelHandleId, int dataParamIndex,
+        Guid counterKernelHandleId, int counterParamIndex,
+        int maxCapacity, int elementSize)
+    {
+        BlockId = blockId;
+        PortName = portName;
+        DataKernelHandleId = dataKernelHandleId;
+        DataParamIndex = dataParamIndex;
+        CounterKernelHandleId = counterKernelHandleId;
+        CounterParamIndex = counterParamIndex;
+        MaxCapacity = maxCapacity;
+        ElementSize = elementSize;
+    }
+
+    public bool StructuralEquals(AppendBufferInfo? other)
+    {
+        if (other is null) return false;
+        return PortName == other.PortName &&
+               DataParamIndex == other.DataParamIndex &&
+               CounterParamIndex == other.CounterParamIndex &&
+               MaxCapacity == other.MaxCapacity &&
+               ElementSize == other.ElementSize;
+    }
+}
+
+/// <summary>
+/// Returned by BlockBuilder.AppendOutput to give block authors access to the data port
+/// and the auto-generated count port name.
+/// </summary>
+public sealed class AppendOutputPort
+{
+    public BlockPort DataPort { get; }
+    public AppendBufferInfo Info { get; }
+    public string CountPortName => Info.CountPortName;
+
+    internal AppendOutputPort(BlockPort dataPort, AppendBufferInfo info)
+    {
+        DataPort = dataPort;
+        Info = info;
+    }
+}
+
+/// <summary>
 /// Immutable snapshot of a block's structural description.
 /// Used for change detection and graph rebuilding.
 /// </summary>
@@ -65,14 +125,21 @@ public sealed class BlockDescription
     /// </summary>
     public IReadOnlyList<(int SrcKernelIndex, int SrcParam, int TgtKernelIndex, int TgtParam)> InternalConnections { get; }
 
+    /// <summary>
+    /// AppendBuffer descriptions for variable-length outputs.
+    /// </summary>
+    public IReadOnlyList<AppendBufferInfo> AppendBuffers { get; }
+
     public BlockDescription(
         IReadOnlyList<KernelEntry> kernelEntries,
         IReadOnlyList<(string Name, PortDirection Direction, PinType Type)> ports,
-        IReadOnlyList<(int SrcKernelIndex, int SrcParam, int TgtKernelIndex, int TgtParam)> internalConnections)
+        IReadOnlyList<(int SrcKernelIndex, int SrcParam, int TgtKernelIndex, int TgtParam)> internalConnections,
+        IReadOnlyList<AppendBufferInfo>? appendBuffers = null)
     {
         KernelEntries = kernelEntries;
         Ports = ports;
         InternalConnections = internalConnections;
+        AppendBuffers = appendBuffers ?? Array.Empty<AppendBufferInfo>();
     }
 
     /// <summary>
@@ -87,6 +154,7 @@ public sealed class BlockDescription
         if (KernelEntries.Count != other.KernelEntries.Count) return false;
         if (Ports.Count != other.Ports.Count) return false;
         if (InternalConnections.Count != other.InternalConnections.Count) return false;
+        if (AppendBuffers.Count != other.AppendBuffers.Count) return false;
 
         for (int i = 0; i < KernelEntries.Count; i++)
         {
@@ -108,6 +176,12 @@ public sealed class BlockDescription
             var b = other.InternalConnections[i];
             if (a.SrcKernelIndex != b.SrcKernelIndex || a.SrcParam != b.SrcParam ||
                 a.TgtKernelIndex != b.TgtKernelIndex || a.TgtParam != b.TgtParam)
+                return false;
+        }
+
+        for (int i = 0; i < AppendBuffers.Count; i++)
+        {
+            if (!AppendBuffers[i].StructuralEquals(other.AppendBuffers[i]))
                 return false;
         }
 

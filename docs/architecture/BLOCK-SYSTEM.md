@@ -212,6 +212,12 @@ BlockParameter<T> InputScalar<T>(string name, KernelPin pin, T defaultValue = de
 ```csharp
 // Buffer output port bound to a kernel parameter. Returns BlockPort.
 BlockPort Output<T>(string name, KernelPin pin) where T : unmanaged;
+
+// Append output port — wraps an AppendBuffer<T> (data + atomic counter).
+// Automatically creates a companion "{name} Count" output port for the current count.
+// The counter is reset to 0 by a memset node before each graph launch (see GRAPH-COMPILER.md).
+AppendOutputPort AppendOutput<T>(string name, KernelPin dataPin, KernelPin counterPin, int maxCapacity)
+    where T : unmanaged;
 ```
 
 ### Internal Connections (Implemented)
@@ -309,6 +315,55 @@ public sealed class BlockPort : IBlockPort
 }
 ```
 
+### AppendOutputPort
+
+Returned by `BlockBuilder.AppendOutput<T>()`. Represents a streaming append output with an auto-generated count companion port:
+
+```csharp
+public sealed class AppendOutputPort : IBlockPort
+{
+    public Guid BlockId { get; }
+    public string Name { get; }                    // e.g. "Particles"
+    public PortDirection Direction => PortDirection.Output;
+    public PinType Type { get; }                   // Buffer<T>
+
+    public string CountPortName { get; }           // Auto-generated: "Particles Count"
+    public int MaxCapacity { get; }
+
+    // Internal: kernel parameter mappings
+    internal Guid KernelNodeId { get; set; }
+    internal int DataParamIndex { get; set; }      // Kernel param for data buffer
+    internal int CounterParamIndex { get; set; }   // Kernel param for counter buffer
+}
+```
+
+In VL, an append output appears as two pins:
+```
+┌───────────────────────┐
+│  ParticleEmitter      │
+│                       │
+│       Particles ○──── │  ← AppendBuffer<Particle>.Data pointer
+│  Particles Count ○─── │  ← uint, auto-readback after launch
+│                       │
+└───────────────────────┘
+```
+
+### AppendBufferInfo
+
+Stored in `BlockDescription` to track which outputs are append buffers. Used by `GraphCompiler` to generate memset nodes and by `CudaEngine` for auto-readback:
+
+```csharp
+public sealed class AppendBufferInfo
+{
+    public string PortName { get; }             // "Particles"
+    public IAppendBuffer Buffer { get; }        // Type-erased append buffer
+    public Guid KernelNodeId { get; }           // Which kernel writes to this
+    public int DataParamIndex { get; }
+    public int CounterParamIndex { get; }
+    public int MaxCapacity { get; }
+}
+```
+
 ---
 
 ## Block Parameters
@@ -358,7 +413,7 @@ Usage in VL:
 
 Written by CudaEngine after each frame launch:
 
-**Current implementation (Phase 2):**
+**Current implementation (Phase 2 + Phase 3.1):**
 
 ```csharp
 public interface IBlockDebugInfo
@@ -366,6 +421,7 @@ public interface IBlockDebugInfo
     BlockState State { get; }
     string? StateMessage { get; }
     TimeSpan LastExecutionTime { get; }
+    IReadOnlyDictionary<string, uint> AppendCounts { get; }  // Phase 3.1
 }
 
 public sealed class BlockDebugInfo : IBlockDebugInfo
@@ -373,6 +429,7 @@ public sealed class BlockDebugInfo : IBlockDebugInfo
     public BlockState State { get; set; } = BlockState.NotCompiled;
     public string? StateMessage { get; set; }
     public TimeSpan LastExecutionTime { get; set; }
+    public Dictionary<string, uint> AppendCounts { get; set; } = new();  // Phase 3.1
 }
 
 public enum BlockState
@@ -383,6 +440,8 @@ public enum BlockState
     NotCompiled  // Graph not yet compiled
 }
 ```
+
+`AppendCounts` is populated by `CudaEngine` after each graph launch. Each entry maps an append output port name to the counter value read back from GPU. For example, `AppendCounts["Particles"]` = 4200 means 4200 particles were emitted this frame. Blocks read this in their VL `Update()` for tooltip display.
 
 **Planned additions (Phase 3+):** `AverageExecutionTime`, `Buffers`, `Kernels`, `Children` lists for hierarchical profiling.
 

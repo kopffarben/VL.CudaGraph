@@ -1,6 +1,6 @@
 # C# API Reference
 
-> **Status**: Phase 0 + Phase 1 + Phase 2 implemented and tested (148 tests).
+> **Status**: Phase 0 + Phase 1 + Phase 2 + Phase 3.1 implemented and tested (167 tests).
 > Types marked *(Phase 3+)* are planned but not yet implemented.
 
 ## Module Structure
@@ -24,6 +24,9 @@ VL.Cuda.Core
   ├── Buffers
   │     GpuBuffer<T>
   │     BufferPool
+  │     IAppendBuffer
+  │     AppendBuffer<T>
+  │     BufferLifetime
   │     DType
   │
   ├── Blocks
@@ -45,6 +48,8 @@ VL.Cuda.Core
   │     KernelPin
   │     KernelEntry
   │     BlockDescription
+  │     AppendBufferInfo
+  │     AppendOutputPort
   │
   ├── Graph
   │     KernelNode
@@ -53,6 +58,7 @@ VL.Cuda.Core
   │     GraphCompiler
   │     CompiledGraph
   │     GraphDescription
+  │     MemsetDescriptor (internal)
   │     ValidationResult
   │
   ├── PTX
@@ -167,14 +173,20 @@ public sealed class CudaEngine : IDisposable
 ```
 
 **ColdRebuild pipeline** (internal):
-1. Dispose old CompiledGraph + KernelNodes
+1. Dispose old CompiledGraph + KernelNodes + owned AppendBuffers
 2. For each registered block: iterate `BlockDescription.KernelEntries` → create KernelNodes (via GraphBuilder) with grid dims
 3. Add intra-block connections (from `BlockDescription.InternalConnections` using kernel indices)
 4. Add inter-block connections (from `ConnectionGraph` using BlockPort → KernelNode mapping)
-5. Apply external buffer bindings
-6. Apply current parameter values to KernelNodes
-7. Compile via GraphCompiler → new CompiledGraph
-8. Distribute debug info (BlockState.OK or BlockState.Error) to all blocks
+5. Allocate and wire AppendBuffers (`AllocateAndWireAppendBuffer()` for each `AppendBufferInfo`)
+6. Add memset nodes for AppendBuffer counters (via `GraphBuilder.AddMemset()` + `AddMemsetDependency()`)
+7. Apply external buffer bindings
+8. Apply current parameter values to KernelNodes
+9. Compile via GraphCompiler → new CompiledGraph
+10. Distribute debug info (BlockState.OK or BlockState.Error) to all blocks
+
+**Post-Launch** (internal):
+- `ReadbackAppendCounters()` — synchronously reads append counter values from GPU
+- `BuildStateMessage()` — constructs state message including append counts for debug info
 
 **Hot/Warm Update** (internal):
 - Iterates `DirtyTracker.GetDirtyParameters()`
@@ -382,10 +394,121 @@ public sealed class BufferPool : IDisposable
     public GpuBuffer<T> Acquire<T>(int elementCount) where T : unmanaged;
     public void Release<T>(GpuBuffer<T> buffer) where T : unmanaged;
 
+    /// <summary>
+    /// Acquire an AppendBuffer with the given max capacity and lifetime.
+    /// Allocates both the data buffer (maxCapacity elements) and a 1-element uint counter buffer.
+    /// </summary>
+    public AppendBuffer<T> AcquireAppend<T>(int maxCapacity, BufferLifetime lifetime) where T : unmanaged;
+
     public long TotalAllocatedBytes { get; }
     public int RentedCount { get; }
 
     public void Dispose();
+}
+```
+
+### IAppendBuffer
+
+```csharp
+/// <summary>
+/// Non-generic interface for AppendBuffer. Used for type-erased engine operations.
+/// </summary>
+public interface IAppendBuffer
+{
+    /// <summary>Device pointer to the data buffer.</summary>
+    CUdeviceptr DataPointer { get; }
+
+    /// <summary>Device pointer to the GPU atomic counter (single uint).</summary>
+    CUdeviceptr CounterPointer { get; }
+
+    /// <summary>Maximum number of elements the buffer can hold.</summary>
+    int MaxCapacity { get; }
+
+    /// <summary>
+    /// Read the counter value from GPU (synchronous download).
+    /// Clamps to MaxCapacity and stores result in LastReadCount.
+    /// Returns the clamped count.
+    /// </summary>
+    int ReadCount();
+
+    /// <summary>Last value returned by ReadCount() (clamped to MaxCapacity).</summary>
+    int LastReadCount { get; }
+
+    /// <summary>Raw counter value from GPU before clamping. Useful for overflow detection.</summary>
+    int LastRawCount { get; }
+
+    /// <summary>True if LastRawCount exceeded MaxCapacity on the last ReadCount().</summary>
+    bool DidOverflow { get; }
+}
+```
+
+### AppendBuffer\<T\>
+
+```csharp
+/// <summary>
+/// GPU buffer with an atomic append counter. Wraps a data GpuBuffer and a counter GpuBuffer.
+/// Kernels atomicAdd to the counter and write data at the returned index.
+/// The counter is reset to zero via a CUDA memset node before each graph launch.
+/// </summary>
+public sealed class AppendBuffer<T> : IAppendBuffer, IDisposable where T : unmanaged
+{
+    /// <summary>The underlying data buffer.</summary>
+    public GpuBuffer<T> Data { get; }
+
+    /// <summary>The 1-element uint buffer used as an atomic counter on GPU.</summary>
+    public GpuBuffer<uint> Counter { get; }
+
+    /// <summary>Maximum number of elements the data buffer can hold.</summary>
+    public int MaxCapacity { get; }
+
+    /// <summary>The CLR element type (typeof(T)).</summary>
+    public Type ElementType { get; }
+
+    /// <summary>Lifetime policy for this buffer.</summary>
+    public BufferLifetime Lifetime { get; }
+
+    // --- IAppendBuffer ---
+    public CUdeviceptr DataPointer { get; }
+    public CUdeviceptr CounterPointer { get; }
+
+    /// <summary>
+    /// Read counter from GPU, clamp to MaxCapacity.
+    /// Sets LastReadCount, LastRawCount, and DidOverflow.
+    /// </summary>
+    public int ReadCount();
+
+    public int LastReadCount { get; }
+    public int LastRawCount { get; }
+    public bool DidOverflow { get; }
+
+    /// <summary>
+    /// Download only the valid elements (0..LastReadCount) from the data buffer.
+    /// Must call ReadCount() first.
+    /// </summary>
+    public T[] DownloadValid();
+
+    /// <summary>
+    /// Set the read count manually (internal, used for testing).
+    /// </summary>
+    internal void SetReadCount(int count);
+
+    public void Dispose();
+}
+```
+
+### BufferLifetime
+
+```csharp
+/// <summary>
+/// Controls how long an AppendBuffer lives relative to graph rebuilds.
+/// </summary>
+public enum BufferLifetime
+{
+    /// <summary>Buffer is re-allocated on every cold rebuild.</summary>
+    PerBuild,
+
+    /// <summary>Buffer persists across cold rebuilds (re-used if compatible).</summary>
+    Persistent
 }
 ```
 
@@ -523,6 +646,12 @@ public interface IBlockDebugInfo
     BlockState State { get; }
     string? StateMessage { get; }
     TimeSpan LastExecutionTime { get; }
+
+    /// <summary>
+    /// Per-port append counts after the last launch. Null if the block has no append outputs.
+    /// Key = port name, Value = last read count (clamped to MaxCapacity).
+    /// </summary>
+    IReadOnlyDictionary<string, int>? AppendCounts { get; }
 }
 ```
 
@@ -534,6 +663,11 @@ public sealed class BlockDebugInfo : IBlockDebugInfo
     public BlockState State { get; set; } = BlockState.NotCompiled;
     public string? StateMessage { get; set; }
     public TimeSpan LastExecutionTime { get; set; }
+
+    /// <summary>
+    /// Per-port append counts. Null if the block has no append outputs.
+    /// </summary>
+    public IReadOnlyDictionary<string, int>? AppendCounts { get; set; }
 }
 ```
 
@@ -613,6 +747,16 @@ public sealed class BlockBuilder
     /// </summary>
     public BlockParameter<T> InputScalar<T>(string name, KernelPin pin, T defaultValue = default)
         where T : unmanaged;
+
+    // === Append Buffer Outputs ===
+
+    /// <summary>
+    /// Define an append buffer output. Binds both a data pointer pin and a counter pointer pin
+    /// to kernel parameters. The engine will allocate an AppendBuffer, wire both pointers,
+    /// and add a memset node to reset the counter before each launch.
+    /// </summary>
+    public AppendOutputPort AppendOutput<T>(string name, KernelPin dataPin, KernelPin counterPin,
+        int maxCapacity) where T : unmanaged;
 
     // === Internal Connections ===
 
@@ -733,16 +877,88 @@ public sealed class BlockDescription
     /// </summary>
     public IReadOnlyList<(int SrcKernelIndex, int SrcParam, int TgtKernelIndex, int TgtParam)> InternalConnections { get; }
 
+    /// <summary>
+    /// Append buffer descriptors. One per AppendOutput port.
+    /// Used by CudaEngine to allocate AppendBuffers and wire memset nodes.
+    /// </summary>
+    public IReadOnlyList<AppendBufferInfo> AppendBuffers { get; }
+
     public BlockDescription(
         IReadOnlyList<KernelEntry> kernelEntries,
         IReadOnlyList<(string Name, PortDirection Direction, PinType Type)> ports,
-        IReadOnlyList<(int SrcKernelIndex, int SrcParam, int TgtKernelIndex, int TgtParam)> internalConnections);
+        IReadOnlyList<(int SrcKernelIndex, int SrcParam, int TgtKernelIndex, int TgtParam)> internalConnections,
+        IReadOnlyList<AppendBufferInfo>? appendBuffers = null);
 
     /// <summary>
-    /// Structural equality: same kernels (path + grid), ports, and connections.
+    /// Structural equality: same kernels (path + grid), ports, connections, and append buffers.
     /// HandleIds are ignored — they change every construction.
     /// </summary>
     public bool StructuralEquals(BlockDescription? other);
+}
+```
+
+### AppendBufferInfo
+
+```csharp
+/// <summary>
+/// Describes an append buffer binding within a block. Stored in BlockDescription
+/// for structural comparison and used by CudaEngine during ColdRebuild to allocate
+/// and wire AppendBuffers.
+/// </summary>
+public sealed class AppendBufferInfo
+{
+    /// <summary>Block that owns this append buffer.</summary>
+    public Guid BlockId { get; }
+
+    /// <summary>Name of the append output port (data port).</summary>
+    public string PortName { get; }
+
+    /// <summary>Name of the counter port (derived from data port name).</summary>
+    public string CountPortName { get; }
+
+    /// <summary>KernelHandle ID for the data pointer parameter.</summary>
+    public Guid DataKernelHandleId { get; }
+
+    /// <summary>Parameter index for the data pointer on the kernel.</summary>
+    public int DataParamIndex { get; }
+
+    /// <summary>KernelHandle ID for the counter pointer parameter.</summary>
+    public Guid CounterKernelHandleId { get; }
+
+    /// <summary>Parameter index for the counter pointer on the kernel.</summary>
+    public int CounterParamIndex { get; }
+
+    /// <summary>Maximum number of elements the append buffer can hold.</summary>
+    public int MaxCapacity { get; }
+
+    /// <summary>Size in bytes of each element.</summary>
+    public int ElementSize { get; }
+
+    /// <summary>
+    /// Structural equality: compares port names, param indices, max capacity, and element size.
+    /// Ignores BlockId and KernelHandleIds (change every construction).
+    /// </summary>
+    public bool StructuralEquals(AppendBufferInfo? other);
+}
+```
+
+### AppendOutputPort
+
+```csharp
+/// <summary>
+/// Returned by BlockBuilder.AppendOutput(). Provides access to the data port
+/// and append buffer metadata.
+/// </summary>
+public sealed class AppendOutputPort
+{
+    /// <summary>The data output port (can be connected to downstream block inputs).</summary>
+    public BlockPort DataPort { get; }
+
+    /// <summary>The append buffer descriptor for this port.</summary>
+    public AppendBufferInfo Info { get; }
+
+    /// <summary>Name of the counter port.</summary>
+    public string CountPortName { get; }
 }
 ```
 
@@ -796,10 +1012,86 @@ public sealed class GraphBuilder
     public void AddEdge(KernelNode source, int sourceParam, KernelNode target, int targetParam);
     public void SetExternalBuffer(KernelNode node, int paramIndex, CUdeviceptr pointer);
 
+    /// <summary>
+    /// Add a memset node to the graph. Used to zero-initialize append buffer counters
+    /// before kernel execution. Returns a descriptor for dependency wiring.
+    /// </summary>
+    internal MemsetDescriptor AddMemset(CUdeviceptr dst, uint value, uint elemSize,
+        ulong width, string? debugName = null);
+
+    /// <summary>
+    /// Add a dependency edge: the memset must complete before the kernel node executes.
+    /// </summary>
+    internal void AddMemsetDependency(MemsetDescriptor memset, KernelNode kernel);
+
     public IReadOnlyList<KernelNode> Nodes { get; }
     public IReadOnlyList<Edge> Edges { get; }
 
+    /// <summary>
+    /// All memset descriptors added via AddMemset().
+    /// </summary>
+    internal IReadOnlyList<MemsetDescriptor> MemsetDescriptors { get; }
+
     public ValidationResult Validate();
+}
+```
+
+### MemsetDescriptor
+
+```csharp
+/// <summary>
+/// Describes a memset node in the CUDA graph. Used to zero-initialize
+/// append buffer counters before kernel execution.
+/// </summary>
+internal sealed class MemsetDescriptor
+{
+    public Guid Id { get; }
+
+    /// <summary>Device pointer to the memory to be set.</summary>
+    public CUdeviceptr Destination { get; }
+
+    /// <summary>Value to fill (typically 0 for counter reset).</summary>
+    public uint Value { get; }
+
+    /// <summary>Size of each element in bytes (e.g., 4 for uint).</summary>
+    public uint ElementSize { get; }
+
+    /// <summary>Number of elements to set.</summary>
+    public ulong Width { get; }
+
+    /// <summary>Debug name for diagnostics.</summary>
+    public string? DebugName { get; }
+
+    /// <summary>
+    /// Kernel nodes that depend on this memset (must execute after memset completes).
+    /// </summary>
+    public IReadOnlyList<Guid> DependentKernelNodeIds { get; }
+}
+```
+
+### GraphDescription
+
+```csharp
+/// <summary>
+/// Immutable snapshot of a graph description ready for compilation.
+/// Produced by GraphBuilder.Build().
+/// </summary>
+internal sealed class GraphDescription
+{
+    public IReadOnlyList<KernelNode> Nodes { get; }
+    public IReadOnlyList<Edge> Edges { get; }
+    public IReadOnlyDictionary<(Guid NodeId, int ParamIndex), CUdeviceptr> ExternalBuffers { get; }
+
+    /// <summary>
+    /// Memset descriptors for append buffer counter resets.
+    /// </summary>
+    public IReadOnlyList<MemsetDescriptor> MemsetDescriptors { get; }
+
+    public GraphDescription(
+        IReadOnlyList<KernelNode> nodes,
+        IReadOnlyList<Edge> edges,
+        IReadOnlyDictionary<(Guid NodeId, int ParamIndex), CUdeviceptr> externalBuffers,
+        IReadOnlyList<MemsetDescriptor>? memsetDescriptors = null);
 }
 ```
 
@@ -840,6 +1132,12 @@ public sealed class CompiledGraph : IDisposable
     /// Warm Update: change grid dimensions without rebuild.
     /// </summary>
     public void UpdateGrid(Guid nodeId, uint gridX, uint gridY, uint gridZ);
+
+    /// <summary>
+    /// Native handles for memset nodes in the compiled CUDA graph.
+    /// Used internally to track memset → kernel dependencies.
+    /// </summary>
+    internal IReadOnlyDictionary<Guid, CUgraphNode> MemsetNodeHandles { get; }
 
     /// <summary>
     /// Disposes CUgraph and CUgraphExec. Does NOT dispose KernelNodes.
@@ -981,7 +1279,6 @@ public class VectorAddBlock : ICudaBlock, IDisposable
 
 The following types are designed but not yet implemented:
 
-- **AppendBuffer\<T\>** — GpuBuffer with GPU atomic counter (Phase 3)
 - **InputHandle\<T\> / OutputHandle\<T\>** — VL handle-flow for typed links (Phase 3)
 - **GridConfig / GridSizeMode** — Auto-grid from buffer size (Phase 3)
 - **Regions** — If/While/For conditional graph execution (Phase 3)

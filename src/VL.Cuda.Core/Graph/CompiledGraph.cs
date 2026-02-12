@@ -18,6 +18,7 @@ public sealed class CompiledGraph : IDisposable
     private readonly Dictionary<Guid, CUgraphNode> _nodeHandles;
     private readonly Dictionary<Guid, KernelNode> _kernelNodes;
     private readonly List<GpuBuffer<byte>> _intermediateBuffers;
+    private readonly Dictionary<Guid, CUgraphNode> _memsetNodeHandles;
     private bool _disposed;
 
     internal CompiledGraph(
@@ -25,13 +26,15 @@ public sealed class CompiledGraph : IDisposable
         ManagedCuda.CudaGraph graph,
         Dictionary<Guid, CUgraphNode> nodeHandles,
         Dictionary<Guid, KernelNode> kernelNodes,
-        List<GpuBuffer<byte>> intermediateBuffers)
+        List<GpuBuffer<byte>> intermediateBuffers,
+        Dictionary<Guid, CUgraphNode>? memsetNodeHandles = null)
     {
         _exec = exec;
         _graph = graph;
         _nodeHandles = nodeHandles;
         _kernelNodes = kernelNodes;
         _intermediateBuffers = intermediateBuffers;
+        _memsetNodeHandles = memsetNodeHandles ?? new Dictionary<Guid, CUgraphNode>();
     }
 
     /// <summary>
@@ -111,6 +114,7 @@ public sealed class CompiledGraph : IDisposable
     internal CudaGraphExec Exec => _exec;
     internal IReadOnlyDictionary<Guid, CUgraphNode> NodeHandles => _nodeHandles;
     internal IReadOnlyList<GpuBuffer<byte>> IntermediateBuffers => _intermediateBuffers;
+    internal IReadOnlyDictionary<Guid, CUgraphNode> MemsetNodeHandles => _memsetNodeHandles;
 
     public void Dispose()
     {

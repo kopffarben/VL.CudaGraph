@@ -278,30 +278,87 @@ public enum BufferState
 
 ## AppendBuffer\<T\>
 
-A specialized buffer for GPU-side append operations (streaming output).
+A specialized buffer for GPU-side append operations (streaming output). Uses composition: wraps a `GpuBuffer<T>` for data and a `GpuBuffer<uint>` for the atomic counter. Kernels append elements via `atomicAdd` on the counter, then write to `Data[index]`.
 
 ### Structure
 
 ```
 ┌────────────────────────────────────────────┐
-│              Data Buffer                    │
+│         Data: GpuBuffer<T>                 │
 │  [elem0][elem1][elem2][...][    unused    ]│
 └────────────────────────────────────────────┘
                     ▲
                     │ CurrentCount
 ┌────────────────────┐
-│  Counter (uint32)  │  ← GPU-side atomic counter
+│Counter: GpuBuffer<uint>│  ← GPU-side atomic counter (single uint32)
 └────────────────────┘
 ```
+
+### IAppendBuffer Interface
+
+Type-erased interface for systems that track append buffers without knowing `T`:
+
+```csharp
+public interface IAppendBuffer
+{
+    GpuBuffer CounterBuffer { get; }   // The single-uint counter buffer
+    CUdeviceptr CounterPointer { get; } // Shortcut: CounterBuffer.Pointer
+    int MaxCapacity { get; }
+    uint ReadCount();                   // Blocking readback of counter value
+}
+```
+
+`GraphCompiler` and `CudaEngine` use `IAppendBuffer` to generate memset nodes and read back counts without knowing the element type.
 
 ### C# API
 
 ```csharp
+public sealed class AppendBuffer<T> : IAppendBuffer, IDisposable where T : unmanaged
+{
+    public GpuBuffer<T> Data { get; }           // Element storage
+    public GpuBuffer<uint> Counter { get; }     // Atomic counter (1 element)
+    public int MaxCapacity { get; }
+
+    // IAppendBuffer (type-erased)
+    GpuBuffer IAppendBuffer.CounterBuffer => Counter;
+    CUdeviceptr IAppendBuffer.CounterPointer => Counter.Pointer;
+    uint IAppendBuffer.ReadCount() => ReadCount();
+
+    // Typed API
+    public uint ReadCount();                    // Blocking: downloads counter from GPU
+    public Task<uint> ReadCountAsync();         // Async variant
+}
+```
+
+### Acquisition
+
+```csharp
+// BufferPool allocates both the data buffer and the 1-element counter buffer
 var particles = pool.AcquireAppend<Particle>(maxCapacity: 100000, BufferLifetime.Graph);
 
-int count = particles.ReadCount();
-int count = await particles.ReadCountAsync();
-particles.ResetCount();
+// Access the two underlying buffers
+CUdeviceptr dataPtr = particles.Data.Pointer;
+CUdeviceptr counterPtr = particles.Counter.Pointer;
+```
+
+### Counter Reset
+
+Counter reset is **not** done manually. The `GraphCompiler` automatically inserts a `cuGraphAddMemsetNode` for each append buffer's counter before kernel execution. This ensures the counter is zeroed at the start of every graph launch. See `GRAPH-COMPILER.md` for the memset node phase.
+
+### Readback
+
+After graph launch, `CudaEngine` automatically reads back append counts and stores them in `BlockDebugInfo.AppendCounts`:
+
+```csharp
+// CudaEngine does this after Launch():
+foreach (var appendInfo in description.AppendBuffers)
+{
+    uint count = appendInfo.Buffer.ReadCount();
+    debugInfo.AppendCounts[appendInfo.PortName] = count;
+}
+
+// Block's VL Update() reads it for tooltip display:
+var counts = block.DebugInfo.AppendCounts;  // Dictionary<string, uint>
 ```
 
 ---
@@ -360,7 +417,7 @@ Size        Bucket
 ```csharp
 var buffer = pool.Acquire<float>(elementCount: 1024, BufferLifetime.Graph);
 var buffer2d = pool.Acquire<float>(new BufferShape(64, 64), BufferLifetime.Graph);
-var append = pool.AcquireAppend<Particle>(maxCapacity: 10000, BufferLifetime.Region);
+var append = pool.AcquireAppend<Particle>(maxCapacity: 10000, BufferLifetime.Graph);
 pool.Release(buffer);
 ```
 

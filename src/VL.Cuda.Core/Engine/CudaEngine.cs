@@ -32,6 +32,16 @@ public sealed class CudaEngine : IDisposable
     private readonly List<KernelNode> _ownedKernelNodes = new();
 
     /// <summary>
+    /// AppendBuffers allocated during ColdRebuild. Disposed on rebuild.
+    /// </summary>
+    private readonly List<IAppendBuffer> _ownedAppendBuffers = new();
+
+    /// <summary>
+    /// Maps (blockId, portName) → IAppendBuffer for auto-readback after launch.
+    /// </summary>
+    private readonly Dictionary<(Guid BlockId, string PortName), IAppendBuffer> _appendBufferMapping = new();
+
+    /// <summary>
     /// Maps (blockId, paramName) → (kernelNodeId, paramIndex) for Hot/Warm updates.
     /// Built during ColdRebuild.
     /// </summary>
@@ -104,6 +114,7 @@ public sealed class CudaEngine : IDisposable
         {
             _compiledGraph.Launch(_stream);
             _stream.Synchronize();
+            ReadbackAppendCounters();
             DistributeDebugInfo(BlockState.OK);
         }
     }
@@ -122,6 +133,12 @@ public sealed class CudaEngine : IDisposable
         foreach (var node in _ownedKernelNodes)
             node.Dispose();
         _ownedKernelNodes.Clear();
+
+        foreach (var ab in _ownedAppendBuffers)
+            ab.Dispose();
+        _ownedAppendBuffers.Clear();
+        _appendBufferMapping.Clear();
+
         _paramMapping.Clear();
         _handleToNodeId.Clear();
 
@@ -211,6 +228,18 @@ public sealed class CudaEngine : IDisposable
             foreach (var block in Context.Registry.All)
             {
                 ApplyBlockParameters(block);
+            }
+
+            // 7a. Allocate AppendBuffers and wire counter memset nodes
+            foreach (var block in Context.Registry.All)
+            {
+                var desc = Context.GetBlockDescription(block.Id);
+                if (desc == null) continue;
+
+                foreach (var appendInfo in desc.AppendBuffers)
+                {
+                    AllocateAndWireAppendBuffer(graphBuilder, appendInfo);
+                }
             }
 
             // 8. Compile
@@ -367,6 +396,79 @@ public sealed class CudaEngine : IDisposable
         }
     }
 
+    /// <summary>
+    /// Allocate an AppendBuffer for the given info, wire data+counter pointers
+    /// as external buffers, and register a counter-reset memset node.
+    /// </summary>
+    private void AllocateAndWireAppendBuffer(GraphBuilder graphBuilder, AppendBufferInfo info)
+    {
+        // Allocate type-erased (byte-based) append buffer: capacity * elementSize bytes
+        int totalBytes = info.MaxCapacity * info.ElementSize;
+        var dataBuffer = Context.Pool.Acquire<byte>(totalBytes);
+        var counterBuffer = Context.Pool.Acquire<uint>(1);
+
+        var appendBuffer = new AppendBuffer<byte>(dataBuffer, counterBuffer, info.MaxCapacity,
+            BufferLifetime.Graph, onDispose: ab =>
+            {
+                ab.Data.Dispose();
+                ab.Counter.Dispose();
+            });
+        _ownedAppendBuffers.Add(appendBuffer);
+        _appendBufferMapping[(info.BlockId, info.PortName)] = appendBuffer;
+
+        // Wire data pointer to the kernel parameter
+        if (_handleToNodeId.TryGetValue(info.DataKernelHandleId, out var dataNodeId))
+        {
+            var dataNode = FindNode(dataNodeId);
+            if (dataNode != null)
+                graphBuilder.SetExternalBuffer(dataNode, info.DataParamIndex, appendBuffer.DataPointer);
+        }
+
+        // Wire counter pointer to the kernel parameter
+        if (_handleToNodeId.TryGetValue(info.CounterKernelHandleId, out var counterNodeId))
+        {
+            var counterNode = FindNode(counterNodeId);
+            if (counterNode != null)
+                graphBuilder.SetExternalBuffer(counterNode, info.CounterParamIndex, appendBuffer.CounterPointer);
+        }
+
+        // Register memset node to reset counter to 0 before each launch
+        var memset = graphBuilder.AddMemset(
+            appendBuffer.CounterPointer,
+            value: 0,
+            elemSize: 4,  // uint32
+            width: 1,
+            debugName: $"Reset {info.PortName} Counter");
+
+        // All kernel nodes that use this counter must depend on the memset
+        if (_handleToNodeId.TryGetValue(info.DataKernelHandleId, out var depNodeId))
+        {
+            var depNode = FindNode(depNodeId);
+            if (depNode != null)
+                graphBuilder.AddMemsetDependency(memset, depNode);
+        }
+
+        // If counter is on a different kernel, add dependency for that too
+        if (info.CounterKernelHandleId != info.DataKernelHandleId &&
+            _handleToNodeId.TryGetValue(info.CounterKernelHandleId, out var counterDepNodeId))
+        {
+            var counterDepNode = FindNode(counterDepNodeId);
+            if (counterDepNode != null)
+                graphBuilder.AddMemsetDependency(memset, counterDepNode);
+        }
+    }
+
+    /// <summary>
+    /// Auto-readback: read all append buffer counters after launch+sync.
+    /// </summary>
+    private void ReadbackAppendCounters()
+    {
+        foreach (var ab in _ownedAppendBuffers)
+        {
+            ab.ReadCount();
+        }
+    }
+
     private KernelNode? FindNode(Guid nodeId)
         => _ownedKernelNodes.FirstOrDefault(n => n.Id == nodeId);
 
@@ -374,13 +476,42 @@ public sealed class CudaEngine : IDisposable
     {
         foreach (var block in Context.Registry.All)
         {
+            // Build AppendCounts for this block
+            Dictionary<string, int>? appendCounts = null;
+            foreach (var kvp in _appendBufferMapping)
+            {
+                if (kvp.Key.BlockId != block.Id) continue;
+                appendCounts ??= new Dictionary<string, int>();
+                appendCounts[kvp.Key.PortName] = kvp.Value.LastReadCount;
+            }
+
             block.DebugInfo = new BlockDebugInfo
             {
                 State = state,
-                StateMessage = message,
+                StateMessage = BuildStateMessage(message, block.Id),
                 LastExecutionTime = _stopwatch.Elapsed,
+                AppendCounts = appendCounts,
             };
         }
+    }
+
+    /// <summary>
+    /// Build state message including overflow warnings for append buffers.
+    /// </summary>
+    private string? BuildStateMessage(string? baseMessage, Guid blockId)
+    {
+        var overflows = new List<string>();
+        foreach (var kvp in _appendBufferMapping)
+        {
+            if (kvp.Key.BlockId != blockId) continue;
+            if (kvp.Value.DidOverflow)
+                overflows.Add($"{kvp.Key.PortName}: overflow ({kvp.Value.LastRawCount}/{kvp.Value.MaxCapacity})");
+        }
+
+        if (overflows.Count == 0) return baseMessage;
+
+        var overflowMsg = string.Join("; ", overflows);
+        return baseMessage != null ? $"{baseMessage}; {overflowMsg}" : overflowMsg;
     }
 
     public override string ToString()
@@ -401,6 +532,11 @@ public sealed class CudaEngine : IDisposable
         foreach (var node in _ownedKernelNodes)
             node.Dispose();
         _ownedKernelNodes.Clear();
+
+        foreach (var ab in _ownedAppendBuffers)
+            ab.Dispose();
+        _ownedAppendBuffers.Clear();
+        _appendBufferMapping.Clear();
 
         _stream.Dispose();
         Context.Dispose();
