@@ -2,8 +2,10 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Runtime.InteropServices;
+using ManagedCuda.BasicTypes;
 using VL.Cuda.Core.Buffers;
 using VL.Cuda.Core.Context;
+using VL.Cuda.Core.Graph;
 using VL.Cuda.Core.PTX;
 
 namespace VL.Cuda.Core.Blocks.Builder;
@@ -17,6 +19,7 @@ public sealed class BlockBuilder
     private readonly CudaContext _context;
     private readonly ICudaBlock _block;
     private readonly List<KernelHandle> _kernels = new();
+    private readonly List<CapturedHandle> _capturedHandles = new();
     private readonly List<BlockPort> _inputs = new();
     private readonly List<BlockPort> _outputs = new();
     private readonly List<IBlockParameter> _parameters = new();
@@ -40,6 +43,48 @@ public sealed class BlockBuilder
         var handle = new KernelHandle(ptxPath, loaded.Descriptor);
         _kernels.Add(handle);
         return handle;
+    }
+
+    /// <summary>
+    /// Add a captured library operation. Returns a handle for binding ports.
+    /// The captureAction is called during stream capture to record library calls.
+    /// </summary>
+    public CapturedHandle AddCaptured(Action<CUstream, CUdeviceptr[]> captureAction, CapturedNodeDescriptor descriptor)
+    {
+        EnsureNotCommitted();
+        var handle = new CapturedHandle(descriptor, captureAction);
+        _capturedHandles.Add(handle);
+        return handle;
+    }
+
+    /// <summary>
+    /// Define a buffer input port bound to a captured operation parameter.
+    /// </summary>
+    public BlockPort Input<T>(string name, CapturedPin pin) where T : unmanaged
+    {
+        EnsureNotCommitted();
+        var port = new BlockPort(_block.Id, name, PortDirection.Input, PinType.Buffer<T>())
+        {
+            KernelNodeId = pin.CapturedHandleId,
+            KernelParamIndex = pin.ParamIndex,
+        };
+        _inputs.Add(port);
+        return port;
+    }
+
+    /// <summary>
+    /// Define a buffer output port bound to a captured operation parameter.
+    /// </summary>
+    public BlockPort Output<T>(string name, CapturedPin pin) where T : unmanaged
+    {
+        EnsureNotCommitted();
+        var port = new BlockPort(_block.Id, name, PortDirection.Output, PinType.Buffer<T>())
+        {
+            KernelNodeId = pin.CapturedHandleId,
+            KernelParamIndex = pin.ParamIndex,
+        };
+        _outputs.Add(port);
+        return port;
     }
 
     /// <summary>
@@ -178,6 +223,7 @@ public sealed class BlockBuilder
     }
 
     public IReadOnlyList<KernelHandle> Kernels => _kernels;
+    public IReadOnlyList<CapturedHandle> CapturedHandles => _capturedHandles;
     public IReadOnlyList<BlockPort> Inputs => _inputs;
     public IReadOnlyList<BlockPort> Outputs => _outputs;
     public IReadOnlyList<IBlockParameter> Parameters => _parameters;
@@ -190,6 +236,10 @@ public sealed class BlockBuilder
         var kernelEntries = _kernels.Select(k => new KernelEntry(
             k.Id, k.PtxPath, k.Descriptor.EntryPoint,
             k.GridDimX, k.GridDimY, k.GridDimZ)).ToList();
+
+        // Build captured entries
+        var capturedEntries = _capturedHandles.Select(c => new CapturedEntry(
+            c.Id, c.Descriptor, c.CaptureAction)).ToList();
 
         // Build handle-to-index map for converting internal connections
         var handleToIndex = new Dictionary<Guid, int>();
@@ -208,7 +258,8 @@ public sealed class BlockBuilder
             .ToList();
 
         return new BlockDescription(kernelEntries, ports, indexedConnections,
-            _appendBuffers.Count > 0 ? _appendBuffers.ToList() : null);
+            _appendBuffers.Count > 0 ? _appendBuffers.ToList() : null,
+            capturedEntries.Count > 0 ? capturedEntries : null);
     }
 
     private void EnsureNotCommitted()

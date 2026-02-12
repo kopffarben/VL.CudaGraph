@@ -153,6 +153,9 @@ src/
 | DeltaTime as normal VL pin | No special CUDA handling, user connects FrameClock |
 | ShaderFX model for patchable kernels | Element-wise, implicit parallelism, GPU type enforcement |
 | Three user levels | Consumer (use blocks), Composer (patch GPU nodes), Author (write PTX) |
+| Raw CUgraph handles for CapturedNode | ManagedCuda.CudaGraph(CUgraph) constructor is internal in NuGet — use raw handles via DriverAPINativeMethods |
+| Flat buffer binding indices | CapturedHandle.In/Out/Scalar return flat index into BufferBindings[]: [inputs..., outputs..., scalars...] |
+| LibraryHandleCache per CudaContext | Lazy-init expensive library handles (cuBLAS, cuFFT, etc.) — cached by config key for FFT plans |
 
 ## Execution Model Summary
 

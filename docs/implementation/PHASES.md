@@ -316,52 +316,92 @@ model.SaveToFile("system.json");
 
 ---
 
-## Phase 4a: Library Calls (Stream Capture)
+## Phase 4a: Library Calls (Stream Capture) — COMPLETE
 
-**Goal**: cuBLAS/cuFFT via CapturedNode (static + patchable chained), INodeDescriptor abstraction
+**Goal**: cuBLAS/cuFFT/cuSPARSE/cuRAND/cuSOLVER via CapturedNode (static + patchable chained), IGraphNode abstraction
 
-> Read `KERNEL-SOURCES.md` before implementing this phase.
+**Status**: Complete. 44 tests passing (211 total with Phase 0-3).
 
-### Tasks
+> See `KERNEL-SOURCES.md` for the full CapturedNode design.
 
-| Task | Description | Depends On |
-|------|-------------|------------|
-| 4a.1 | Define INodeDescriptor, KernelNodeDescriptor, CapturedNodeDescriptor | - |
-| 4a.2 | Implement StreamCaptureHelper | - |
-| 4a.3 | Implement LibraryHandleCache | - |
-| 4a.4 | Implement AddCaptured() in BlockBuilder (static + chained) | 4a.1, 4a.2, 4a.3 |
-| 4a.5 | Implement cuBLAS wrapper (Sgemm via Stream Capture) | 4a.4 |
-| 4a.6 | Implement cuFFT wrapper (via Stream Capture) | 4a.4 |
-| 4a.7 | Graph Compiler Phase 5.5 (Stream Capture for CapturedNodes) | 4a.4 |
-| 4a.8 | Dirty-Tracking: Add Recapture level for CapturedNodes | 4a.7 |
-| 4a.9 | CudaEngine.UpdateDirtyNodes() dispatch by node type | 4a.8 |
-| 4a.10 | Patchable CapturedNode: chained library call sequence | 4a.4 |
-| 4a.11 | CapturedNode tests | 4a.10 |
+### Implemented
+
+| Task | Description | Status |
+|------|-------------|--------|
+| 4a.1 | IGraphNode interface (polymorphic: KernelNode + CapturedNode) | Done |
+| 4a.2 | CapturedNode (stream capture → CUgraph, owns child graph lifetime) | Done |
+| 4a.3 | CapturedNodeDescriptor (Inputs/Outputs/Scalars as CapturedParam lists) | Done |
+| 4a.4 | StreamCaptureHelper (CaptureToGraph, DestroyGraph, AddChildGraphNode, UpdateChildGraphNode) | Done |
+| 4a.5 | LibraryHandleCache (cuBLAS, cuFFT, cuSPARSE, cuRAND, cuSOLVER) | Done |
+| 4a.6 | BlockBuilder.AddCaptured(Action\<CUstream, CUdeviceptr[]\>, descriptor) → CapturedHandle | Done |
+| 4a.7 | CapturedHandle.In()/Out()/Scalar() → CapturedPin (flat buffer binding index) | Done |
+| 4a.8 | BlockBuilder Input\<T\>/Output\<T\> overloads for CapturedPin | Done |
+| 4a.9 | CapturedEntry in BlockDescription.CapturedEntries | Done |
+| 4a.10 | GraphCompiler Phase 5b: capture on dedicated stream → AddChildGraphNode | Done |
+| 4a.11 | GraphCompiler Phase 5c: kernel node deps on captured node handles (CapturedDependency) | Done |
+| 4a.12 | CompiledGraph.capturedNodeHandles + RecaptureNode() | Done |
+| 4a.13 | DirtyTracker: AreCapturedNodesDirty, MarkCapturedNodeDirty(), ClearCapturedNodesDirty() | Done |
+| 4a.14 | DirtyCapturedNode record struct (BlockId, CapturedHandleId) | Done |
+| 4a.15 | CudaContext.OnCapturedNodeChanged() → DirtyTracker | Done |
+| 4a.16 | CudaEngine: Structure > Recapture > Parameters priority in Update() | Done |
+| 4a.17 | CudaEngine: RecaptureNodes() — re-stream-capture + UpdateChildGraphNode | Done |
+| 4a.18 | CudaEngine: CapturedNode creation in ColdRebuild via BuildBlockNodes() | Done |
+| 4a.19 | BlasOperations (Sgemm, Dgemm, Sgemv, Sscal) | Done |
+| 4a.20 | FftOperations (Forward1D, Inverse1D, R2C1D, C2R1D) | Done |
+| 4a.21 | SparseOperations (SpMV) | Done |
+| 4a.22 | RandOperations (GenerateUniform, GenerateNormal) | Done |
+| 4a.23 | SolveOperations (Sgetrf, Sgetrs) | Done |
+
+### Implementation Notes
+
+- `IGraphNode` interface (Id, DebugName) provides polymorphic handling — both `KernelNode` and `CapturedNode` implement it
+- `CapturedNode.Capture(stream)` destroys previous captured graph before re-capturing (prevents CUgraph leaks)
+- Buffer bindings layout: `[inputs..., outputs..., scalars...]` — flat array matching descriptor order
+- `CapturedHandle.In(i)` returns flat index `i`, `Out(i)` returns `Inputs.Count + i`, `Scalar(i)` returns `Inputs.Count + Outputs.Count + i`
+- `CapturedDependency(SourceNodeId, TargetNodeId)` allows cross-type dependencies: kernel→captured and captured→kernel
+- GraphCompiler creates a dedicated `CudaStream` for capture (separate from execution stream)
+- `_capturedHandleToNodeId` dict in CudaEngine maps `(BlockId, HandleId)` → `CapturedNode.Id` for Recapture routing
+- Library wrappers are static classes that take `BlockBuilder` + `LibraryHandleCache` and return `CapturedHandle`
+- `BlockDescription.StructuralEquals()` includes `CapturedEntries` comparison (debug name + param counts)
 
 ### Deliverables
 
 ```csharp
-// Should work:
+// Should work (and does):
 
-// Static CapturedNode (single library call)
-var op = builder.AddCaptured("MatMul", stream =>
+// Static CapturedNode via low-level API
+var descriptor = new CapturedNodeDescriptor("cuBLAS.Sgemm",
+    inputs: new[] { CapturedParam.Pointer("A", "float*"), CapturedParam.Pointer("B", "float*") },
+    outputs: new[] { CapturedParam.Pointer("C", "float*") });
+
+var op = builder.AddCaptured((stream, buffers) =>
 {
-    cublasSetStream(handle, stream);
-    cublasSgemm(handle, ..., stream);
+    var blas = libs.GetOrCreateBlas();
+    blas.Stream = stream;
+    CudaBlasNativeMethods.cublasSgemm_v2(blas.CublasHandle, ...,
+        buffers[0], ..., buffers[1], ..., buffers[2], ...);
 }, descriptor);
-// Parameter changes trigger Recapture
+builder.Input<float>("A", op.In(0));
+builder.Output<float>("C", op.Out(0));
+
+// Static CapturedNode via high-level wrapper
+var sgemm = BlasOperations.Sgemm(builder, libs, m: 128, n: 128, k: 128);
+builder.Input<float>("A", sgemm.In(0));
+builder.Input<float>("B", sgemm.In(1));
+builder.Output<float>("C", sgemm.Out(0));
 
 // Patchable CapturedNode (chained library calls)
-var chain = builder.AddCaptured("MatMulFFT", stream =>
+var chain = builder.AddCaptured((stream, buffers) =>
 {
-    cublasSgemm(handle, ..., A, B, temp1);
-    cufftExecC2C(plan, temp1, result, CUFFT_FORWARD);
+    var blas = libs.GetOrCreateBlas(); blas.Stream = stream;
+    CudaBlasNativeMethods.cublasSgemm_v2(blas.CublasHandle, ..., buffers[0], buffers[1], temp);
+    var plan = libs.GetOrCreateFFT1D(nx, cufftType.C2C);
+    CudaFFTNativeMethods.cufftSetStream(plan.Handle, stream);
+    plan.Exec(temp, buffers[2], TransformDirection.Forward);
 }, chainDescriptor);
-// From outside: one block. Recapture on any param change.
 
-// cuFFT
-var fft = new FFTBlock(ctx);
-fft.Parameters["Size"].Value = 1024;
+// CudaEngine dispatches: Structure > Recapture > Parameters
+// RecaptureNodes() re-captures and updates child graph in-place
 ```
 
 ### Test Cases
@@ -650,18 +690,30 @@ Phase 2 VL Runtime Integration (deferred — done when first block is built):
 - [ ] Serialization round-trips
 
 ### Phase 4a Complete
-- [ ] INodeDescriptor abstraction with KernelNodeDescriptor and CapturedNodeDescriptor
-- [ ] StreamCaptureHelper captures library calls into child graphs
-- [ ] LibraryHandleCache caches cuBLAS/cuFFT handles
-- [ ] AddCaptured() works in BlockBuilder (static + chained)
-- [ ] cuBLAS Sgemm works in CUDA Graph via CapturedNode
-- [ ] cuFFT forward/inverse works via CapturedNode
-- [ ] Patchable CapturedNode: chained library calls as single block
-- [ ] Graph Compiler Phase 5.5 (Stream Capture) runs for CapturedNodes only
-- [ ] Dirty-Tracking: Recapture level triggers Recapture for CapturedNodes
-- [ ] CudaEngine.UpdateDirtyNodes() dispatches correctly by node type
-- [ ] Mixed graph (KernelNodes + CapturedNodes) compiles and executes
-- [ ] CUBLAS_POINTER_MODE_DEVICE scalar update avoids Recapture
+- [x] IGraphNode interface (polymorphic: KernelNode + CapturedNode)
+- [x] CapturedNode with stream capture → CUgraph, Capture()/Dispose() lifecycle
+- [x] CapturedNodeDescriptor (Inputs/Outputs/Scalars as CapturedParam)
+- [x] StreamCaptureHelper (CaptureToGraph, DestroyGraph, AddChildGraphNode, UpdateChildGraphNode)
+- [x] LibraryHandleCache caches cuBLAS/cuFFT/cuSPARSE/cuRAND/cuSOLVER handles
+- [x] AddCaptured() works in BlockBuilder (static + chained)
+- [x] CapturedHandle.In()/Out()/Scalar() return CapturedPin with flat indices
+- [x] Input\<T\>/Output\<T\> overloads accept CapturedPin
+- [x] CapturedEntry in BlockDescription.CapturedEntries
+- [x] GraphCompiler Phase 5b: capture on dedicated stream → AddChildGraphNode
+- [x] GraphCompiler Phase 5c: kernel node deps on captured node handles
+- [x] CompiledGraph stores capturedNodeHandles + RecaptureNode()
+- [x] DirtyTracker: AreCapturedNodesDirty, MarkCapturedNodeDirty(), ClearCapturedNodesDirty()
+- [x] DirtyCapturedNode record struct (BlockId, CapturedHandleId)
+- [x] CudaContext.OnCapturedNodeChanged() routes to DirtyTracker
+- [x] CudaEngine: Structure > Recapture > Parameters priority
+- [x] CudaEngine.RecaptureNodes() dispatches correctly by node type
+- [x] Mixed graph (KernelNodes + CapturedNodes) compiles and executes
+- [x] BlasOperations (Sgemm, Dgemm, Sgemv, Sscal)
+- [x] FftOperations (Forward1D, Inverse1D, R2C1D, C2R1D)
+- [x] SparseOperations (SpMV)
+- [x] RandOperations (GenerateUniform, GenerateNormal)
+- [x] SolveOperations (Sgetrf, Sgetrs)
+- [x] 44 tests passing (211 total)
 
 ### Phase 4b Complete
 - [ ] ILGPU NuGet added, PTXBackend accessible

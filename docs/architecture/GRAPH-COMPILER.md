@@ -18,12 +18,13 @@ CudaEngine.Update() detects structureDirty
     │  3. Buffer Allocation                │  ← Phase 1 (implemented)
     │  4. Wire Parameters                  │  ← Phase 1 (implemented)
     │  4.5 Memset Nodes (AppendBuffers)    │  ← Phase 3.1 (implemented)
-    │  5. CUDA Graph Build                 │  ← Phase 1 (implemented)
-    │  6. Instantiate                      │  ← Phase 1 (implemented)
+    │  5b. Stream Capture (CapturedNodes)  │  ← Phase 4a (implemented)
+    │  5c. Kernel node deps on captured    │  ← Phase 4a (implemented)
+    │  6. CUDA Graph Build                 │  ← Phase 1 (implemented)
+    │  7. Instantiate                      │  ← Phase 1 (implemented)
     │  ─── Planned ───────────────────── │
     │  Shape Propagation                   │  ← Phase 3 (planned)
     │  Liveness Analysis                   │  ← Phase 3 (planned)
-    │  Stream Capture (CapturedNodes)      │  ← Phase 4a (planned)
     │                                      │
     └─────────────────────────────────────┘
          │
@@ -36,7 +37,7 @@ CudaEngine.Update() detects structureDirty
 
 ## Compilation Phases
 
-> **Current implementation (Phase 1-3.1):** The compiler performs Validation → Topological Sort → Buffer Allocation → Wire Parameters → Memset Nodes (AppendBuffer counters) → CUDA Graph Build → Instantiate. Shape Propagation and Liveness Analysis are Phase 3 features. Stream Capture is Phase 4a.
+> **Current implementation (Phase 1-4a):** The compiler performs Validation → Topological Sort → Buffer Allocation → Wire Parameters → Memset Nodes (AppendBuffer counters) → Stream Capture (CapturedNodes) → Kernel dependency wiring → CUDA Graph Build → Instantiate. Shape Propagation and Liveness Analysis are Phase 3 features.
 
 ### Phase 1: Validation
 
@@ -161,25 +162,46 @@ Timeline:
 Buffer_A live range: [t0, t2] → can be released after t2
 ```
 
-### Stream Capture *(Phase 4a — not yet implemented)*
+### Phase 5b: Stream Capture (CapturedNodes)
 
-For CapturedNode descriptors (Library Calls like cuBLAS, cuFFT), the compiler executes Stream Capture to produce child graphs:
+For each `CapturedNode` in the graph description, the compiler performs stream capture on a **dedicated capture stream** (separate from the main execution stream) and inserts the result as a child graph node:
 
+```csharp
+// GraphCompiler — Phase 5b
+using var captureStream = new CudaStream();
+foreach (var capturedNode in desc.CapturedNodes)
+{
+    // 1. Perform stream capture: calls CaptureAction with buffer bindings
+    var childGraph = capturedNode.Capture(captureStream.Stream);
+
+    // 2. Collect dependencies from CapturedDependency records
+    var deps = new List<CUgraphNode>();
+    foreach (var dep in desc.CapturedDependencies.Where(d => d.TargetNodeId == capturedNode.Id))
+    {
+        // Source can be a kernel node or another captured node
+        if (kernelNodeHandles.TryGetValue(dep.SourceNodeId, out var kernelHandle))
+            deps.Add(kernelHandle);
+        if (capturedNodeHandles.TryGetValue(dep.SourceNodeId, out var capHandle))
+            deps.Add(capHandle);
+    }
+
+    // 3. Insert as child graph node
+    var childNode = StreamCaptureHelper.AddChildGraphNode(graph.Graph, deps.ToArray(), childGraph);
+    capturedNodeHandles[capturedNode.Id] = childNode;
+}
 ```
-For each CapturedNodeDescriptor:
-  cuStreamBeginCapture(stream, RELAXED)
-  descriptor.CaptureAction(stream)     // e.g. cublasSgemm(...)
-  cuStreamEndCapture(stream) → childGraph
-  Store childGraph for Phase 6
-```
 
-This phase only runs for CapturedNodes. KernelNodes (from filesystem PTX or NVRTC) skip this phase entirely. See `KERNEL-SOURCES.md` for the full CapturedNode design.
+This phase only runs for CapturedNodes. KernelNodes skip this phase entirely. The `CapturedNode` owns its captured `CUgraph` handle and destroys the previous one on recapture or dispose.
+
+### Phase 5c: Kernel Node Dependencies on Captured Nodes
+
+After captured nodes are inserted, the compiler builds the dependency map for kernel nodes. If a kernel node depends on a captured node (via `CapturedDependency`), the captured node's `CUgraphNode` handle is included in the kernel node's dependency array. This allows mixed graphs where kernel nodes consume outputs from captured library operations.
 
 ### Phase 6: CUDA Graph Build
 
 Constructs the actual CUDA Graph structure from topological order and dependencies:
 - **KernelNodes**: `cuGraphAddKernelNode` (standard path for both filesystem PTX and NVRTC-compiled kernels)
-- **CapturedNodes**: `cuGraphAddChildGraphNode` (using child graph from Phase 5.5)
+- **CapturedNodes**: Already inserted in Phase 5b as `cuGraphAddChildGraphNode`
 
 ### Phase 7: Instantiate
 
@@ -187,7 +209,22 @@ Constructs the actual CUDA Graph structure from topological order and dependenci
 CompiledGraph Instantiate(CudaGraph graph)
 {
     var exec = graph.Instantiate();
-    return new CompiledGraph { Executable = exec, ... };
+    return new CompiledGraph
+    {
+        Executable = exec,
+        // ...
+        capturedNodeHandles   // Dict<Guid, CUgraphNode> for Recapture updates
+    };
+}
+```
+
+`CompiledGraph` stores `capturedNodeHandles` alongside the existing `nodeHandles` and `memsetNodeHandles`. The `RecaptureNode()` method uses `StreamCaptureHelper.UpdateChildGraphNode()` to perform in-place child graph updates without a full graph rebuild:
+
+```csharp
+internal void RecaptureNode(Guid nodeId, CUgraph newChildGraph)
+{
+    var graphNode = _capturedNodeHandles[nodeId];
+    StreamCaptureHelper.UpdateChildGraphNode(_exec.Graph, graphNode, newChildGraph);
 }
 ```
 

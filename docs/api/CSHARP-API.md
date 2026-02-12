@@ -1,6 +1,6 @@
 # C# API Reference
 
-> **Status**: Phase 0 + Phase 1 + Phase 2 + Phase 3.1 implemented and tested (167 tests).
+> **Status**: Phase 0 + Phase 1 + Phase 2 + Phase 3.1 + Phase 4a implemented and tested (211 tests).
 > Types marked *(Phase 3+)* are planned but not yet implemented.
 
 ## Module Structure
@@ -20,6 +20,7 @@ VL.Cuda.Core
   │     Connection
   │     DirtyTracker
   │     DirtyParameter
+  │     DirtyCapturedNode
   │
   ├── Buffers
   │     GpuBuffer<T>
@@ -47,12 +48,22 @@ VL.Cuda.Core
   │     KernelHandle
   │     KernelPin
   │     KernelEntry
+  │     CapturedHandle
+  │     CapturedPin
+  │     CapturedPinCategory
+  │     CapturedEntry
   │     BlockDescription
   │     AppendBufferInfo
   │     AppendOutputPort
   │
   ├── Graph
+  │     IGraphNode (internal)
   │     KernelNode
+  │     CapturedNode
+  │     CapturedNodeDescriptor
+  │     CapturedParam
+  │     StreamCaptureHelper (internal)
+  │     CapturedDependency (internal)
   │     Edge
   │     GraphBuilder
   │     GraphCompiler
@@ -76,9 +87,23 @@ VL.Cuda.Core
   │     IHandle, IInputHandle, IOutputHandle
   │     InputHandle<T>, OutputHandle<T>
   │
-  ├── Captured (Phase 4a)
-  │     CapturedHandle, CapturedNodeDescriptor
-  │     StreamCaptureHelper, LibraryHandleCache
+  ├── Libraries
+  │     LibraryHandleCache
+  │
+  ├── Libraries.Blas
+  │     BlasOperations
+  │
+  ├── Libraries.FFT
+  │     FftOperations
+  │
+  ├── Libraries.Sparse
+  │     SparseOperations
+  │
+  ├── Libraries.Rand
+  │     RandOperations
+  │
+  ├── Libraries.Solve
+  │     SolveOperations
   │
   ├── Debug (Phase 3+)
   │     IDebugInfo, ProfilingPipeline
@@ -146,11 +171,12 @@ public sealed class CudaEngine : IDisposable
 
     /// <summary>
     /// Main update method. Call once per frame.
-    /// Priority: Structure dirty → Cold Rebuild; Parameters dirty → Hot Update; then Launch.
+    /// Priority: Structure dirty → Cold Rebuild; Captured dirty → Recapture; Parameters dirty → Hot Update; then Launch.
     ///
     /// 1. If IsStructureDirty → ColdRebuild (GraphBuilder → Compile → new CompiledGraph)
-    /// 2. Else if AreParametersDirty → Hot/Warm Update (CompiledGraph.UpdateScalar)
-    /// 3. If compiled graph exists → Launch + Synchronize + Distribute DebugInfo
+    /// 2. Else if AreCapturedNodesDirty → RecaptureNodes (re-stream-capture → UpdateChildGraphNode)
+    /// 3. Else if AreParametersDirty → Hot/Warm Update (CompiledGraph.UpdateScalar)
+    /// 4. If compiled graph exists → Launch + Synchronize + Distribute DebugInfo
     /// </summary>
     public void Update();
 
@@ -166,27 +192,34 @@ public sealed class CudaEngine : IDisposable
     // === Dispose ===
 
     /// <summary>
-    /// Disposes compiled graph, owned kernel nodes, stream, and CudaContext.
+    /// Disposes compiled graph, owned kernel nodes, owned captured nodes, stream, and CudaContext.
     /// </summary>
     public void Dispose();
 }
 ```
 
 **ColdRebuild pipeline** (internal):
-1. Dispose old CompiledGraph + KernelNodes + owned AppendBuffers
+1. Dispose old CompiledGraph + KernelNodes + CapturedNodes + owned AppendBuffers
 2. For each registered block: iterate `BlockDescription.KernelEntries` → create KernelNodes (via GraphBuilder) with grid dims
-3. Add intra-block connections (from `BlockDescription.InternalConnections` using kernel indices)
-4. Add inter-block connections (from `ConnectionGraph` using BlockPort → KernelNode mapping)
-5. Allocate and wire AppendBuffers (`AllocateAndWireAppendBuffer()` for each `AppendBufferInfo`)
-6. Add memset nodes for AppendBuffer counters (via `GraphBuilder.AddMemset()` + `AddMemsetDependency()`)
-7. Apply external buffer bindings
-8. Apply current parameter values to KernelNodes
-9. Compile via GraphCompiler → new CompiledGraph
-10. Distribute debug info (BlockState.OK or BlockState.Error) to all blocks
+3. For each registered block: iterate `BlockDescription.CapturedEntries` → create CapturedNodes (via GraphBuilder)
+4. Add intra-block connections (from `BlockDescription.InternalConnections` using kernel indices)
+5. Add inter-block connections (from `ConnectionGraph` using BlockPort → KernelNode/CapturedNode mapping)
+6. Allocate and wire AppendBuffers (`AllocateAndWireAppendBuffer()` for each `AppendBufferInfo`)
+7. Add memset nodes for AppendBuffer counters (via `GraphBuilder.AddMemset()` + `AddMemsetDependency()`)
+8. Apply external buffer bindings (for both KernelNodes and CapturedNodes)
+9. Apply current parameter values to KernelNodes
+10. Compile via GraphCompiler → new CompiledGraph (stream-captures CapturedNodes → ChildGraphNodes)
+11. Distribute debug info (BlockState.OK or BlockState.Error) to all blocks
 
 **Post-Launch** (internal):
 - `ReadbackAppendCounters()` — synchronously reads append counter values from GPU
 - `BuildStateMessage()` — constructs state message including append counts for debug info
+
+**RecaptureNodes** (internal):
+- Iterates `DirtyTracker.GetDirtyCapturedNodes()`
+- For each dirty captured node: maps `(blockId, capturedHandleId)` → `CapturedNode.Id`
+- Calls `CapturedNode.Capture(stream)` → re-stream-capture → new CUgraph
+- Calls `CompiledGraph.RecaptureNode(nodeId, newChildGraph)` → `cuGraphExecChildGraphNodeSetParams`
 
 **Hot/Warm Update** (internal):
 - Iterates `DirtyTracker.GetDirtyParameters()`
@@ -223,6 +256,7 @@ public sealed class CudaContext : IDisposable
     public BlockRegistry Registry { get; }
     public ConnectionGraph Connections { get; }
     public DirtyTracker Dirty { get; }
+    public LibraryHandleCache Libraries { get; }
 
     // === Block Registry Facade ===
 
@@ -250,6 +284,12 @@ public sealed class CudaContext : IDisposable
     /// Marks the parameter dirty for Hot/Warm Update.
     /// </summary>
     public void OnParameterChanged(Guid blockId, string paramName);
+
+    /// <summary>
+    /// Called when a captured node's parameters change and it needs recapture.
+    /// Marks the captured node dirty for Recapture Update.
+    /// </summary>
+    public void OnCapturedNodeChanged(Guid blockId, Guid capturedHandleId);
 
     // === Block Descriptions (for structure change detection) ===
 
@@ -340,13 +380,24 @@ public sealed class DirtyTracker
 {
     public bool IsStructureDirty { get; }       // starts true → first build
     public bool AreParametersDirty { get; }     // true if any parameters dirty
+    public bool AreCapturedNodesDirty { get; }  // true if any captured nodes need recapture
 
     public void Subscribe(BlockRegistry registry, ConnectionGraph connectionGraph);
     public void MarkParameterDirty(DirtyParameter param);
     public IReadOnlySet<DirtyParameter> GetDirtyParameters();
 
     /// <summary>
-    /// Clear structure dirty. Also clears parameters since rebuild applies all values.
+    /// Mark a captured node dirty for Recapture Update.
+    /// </summary>
+    public void MarkCapturedNodeDirty(DirtyCapturedNode node);
+
+    /// <summary>
+    /// Get the set of captured nodes that need recapture.
+    /// </summary>
+    public IReadOnlySet<DirtyCapturedNode> GetDirtyCapturedNodes();
+
+    /// <summary>
+    /// Clear structure dirty. Also clears parameters and captured nodes since rebuild applies all values.
     /// </summary>
     public void ClearStructureDirty();
 
@@ -354,6 +405,11 @@ public sealed class DirtyTracker
     /// Clear parameter dirty flags after Hot/Warm Update.
     /// </summary>
     public void ClearParametersDirty();
+
+    /// <summary>
+    /// Clear captured node dirty flags after Recapture Update.
+    /// </summary>
+    public void ClearCapturedNodesDirty();
 }
 ```
 
@@ -361,6 +417,15 @@ public sealed class DirtyTracker
 
 ```csharp
 public readonly record struct DirtyParameter(Guid BlockId, string ParamName);
+```
+
+### DirtyCapturedNode
+
+```csharp
+/// <summary>
+/// Identifies a captured node that needs recapture: which block and which captured operation.
+/// </summary>
+public readonly record struct DirtyCapturedNode(Guid BlockId, Guid CapturedHandleId);
 ```
 
 ---
@@ -727,7 +792,16 @@ public sealed class BlockBuilder
     /// </summary>
     public KernelHandle AddKernel(string ptxPath);
 
-    // === Buffer Ports ===
+    // === Add Captured (Library Call via Stream Capture) ===
+
+    /// <summary>
+    /// Add a captured library operation. Returns a handle for binding ports.
+    /// The captureAction is called during stream capture to record library calls.
+    /// </summary>
+    public CapturedHandle AddCaptured(Action<CUstream, CUdeviceptr[]> captureAction,
+        CapturedNodeDescriptor descriptor);
+
+    // === Buffer Ports (KernelPin) ===
 
     /// <summary>
     /// Define a buffer input port bound to a kernel parameter.
@@ -738,6 +812,18 @@ public sealed class BlockBuilder
     /// Define a buffer output port bound to a kernel parameter.
     /// </summary>
     public BlockPort Output<T>(string name, KernelPin pin) where T : unmanaged;
+
+    // === Buffer Ports (CapturedPin) ===
+
+    /// <summary>
+    /// Define a buffer input port bound to a captured operation parameter.
+    /// </summary>
+    public BlockPort Input<T>(string name, CapturedPin pin) where T : unmanaged;
+
+    /// <summary>
+    /// Define a buffer output port bound to a captured operation parameter.
+    /// </summary>
+    public BlockPort Output<T>(string name, CapturedPin pin) where T : unmanaged;
 
     // === Scalar Parameters ===
 
@@ -776,6 +862,7 @@ public sealed class BlockBuilder
     // === Read-only access ===
 
     public IReadOnlyList<KernelHandle> Kernels { get; }
+    public IReadOnlyList<CapturedHandle> CapturedHandles { get; }
     public IReadOnlyList<BlockPort> Inputs { get; }
     public IReadOnlyList<BlockPort> Outputs { get; }
     public IReadOnlyList<IBlockParameter> Parameters { get; }
@@ -867,6 +954,11 @@ public sealed class BlockDescription
     public IReadOnlyList<KernelEntry> KernelEntries { get; }
 
     /// <summary>
+    /// Captured library operation entries in AddCaptured order.
+    /// </summary>
+    public IReadOnlyList<CapturedEntry> CapturedEntries { get; }
+
+    /// <summary>
     /// Port entries: (Name, Direction, PinType).
     /// </summary>
     public IReadOnlyList<(string Name, PortDirection Direction, PinType Type)> Ports { get; }
@@ -887,11 +979,12 @@ public sealed class BlockDescription
         IReadOnlyList<KernelEntry> kernelEntries,
         IReadOnlyList<(string Name, PortDirection Direction, PinType Type)> ports,
         IReadOnlyList<(int SrcKernelIndex, int SrcParam, int TgtKernelIndex, int TgtParam)> internalConnections,
-        IReadOnlyList<AppendBufferInfo>? appendBuffers = null);
+        IReadOnlyList<AppendBufferInfo>? appendBuffers = null,
+        IReadOnlyList<CapturedEntry>? capturedEntries = null);
 
     /// <summary>
-    /// Structural equality: same kernels (path + grid), ports, connections, and append buffers.
-    /// HandleIds are ignored — they change every construction.
+    /// Structural equality: same kernels (path + grid), captured ops, ports, connections,
+    /// and append buffers. HandleIds are ignored — they change every construction.
     /// </summary>
     public bool StructuralEquals(BlockDescription? other);
 }
@@ -962,14 +1055,128 @@ public sealed class AppendOutputPort
 }
 ```
 
+### CapturedHandle
+
+```csharp
+/// <summary>
+/// Represents a captured library operation added to a block via BlockBuilder.AddCaptured().
+/// Provides In()/Out()/Scalar() to reference specific parameters for port binding.
+/// Analogous to KernelHandle for kernel operations.
+/// </summary>
+public sealed class CapturedHandle
+{
+    public Guid Id { get; }
+    public CapturedNodeDescriptor Descriptor { get; }
+    public Action<CUstream, CUdeviceptr[]> CaptureAction { get; }
+
+    public CapturedHandle(CapturedNodeDescriptor descriptor, Action<CUstream, CUdeviceptr[]> captureAction);
+
+    /// <summary>
+    /// Reference to an input parameter by index. Returns the flat buffer binding index.
+    /// Buffer bindings layout: [inputs..., outputs..., scalars...].
+    /// </summary>
+    public CapturedPin In(int index);
+
+    /// <summary>
+    /// Reference to an output parameter by index. Returns the flat buffer binding index.
+    /// Buffer bindings layout: [inputs..., outputs..., scalars...].
+    /// </summary>
+    public CapturedPin Out(int index);
+
+    /// <summary>
+    /// Reference to a scalar parameter by index. Returns the flat buffer binding index.
+    /// Buffer bindings layout: [inputs..., outputs..., scalars...].
+    /// </summary>
+    public CapturedPin Scalar(int index);
+}
+```
+
+### CapturedPin
+
+```csharp
+/// <summary>
+/// Reference to a specific parameter on a captured handle within a block.
+/// Analogous to KernelPin for KernelHandle.
+/// </summary>
+public readonly struct CapturedPin
+{
+    public Guid CapturedHandleId { get; }
+
+    /// <summary>
+    /// Flat index into the CapturedNode.BufferBindings array.
+    /// Layout: [inputs..., outputs..., scalars...].
+    /// </summary>
+    public int ParamIndex { get; }
+
+    /// <summary>
+    /// Which category this pin references: Input, Output, or Scalar.
+    /// </summary>
+    public CapturedPinCategory Category { get; }
+
+    public CapturedPin(Guid capturedHandleId, int paramIndex, CapturedPinCategory category);
+}
+```
+
+### CapturedPinCategory
+
+```csharp
+/// <summary>
+/// Identifies which parameter list a CapturedPin references.
+/// </summary>
+public enum CapturedPinCategory
+{
+    Input,
+    Output,
+    Scalar,
+}
+```
+
+### CapturedEntry
+
+```csharp
+/// <summary>
+/// A captured library operation entry in a block description.
+/// Stores the handle ID, descriptor, and capture action needed to recreate the CapturedNode.
+/// </summary>
+public sealed class CapturedEntry
+{
+    public Guid HandleId { get; }
+    public CapturedNodeDescriptor Descriptor { get; }
+    public Action<CUstream, CUdeviceptr[]> CaptureAction { get; }
+
+    public CapturedEntry(Guid handleId, CapturedNodeDescriptor descriptor,
+        Action<CUstream, CUdeviceptr[]> captureAction);
+
+    /// <summary>
+    /// Structural equality ignores HandleId (changes every construction).
+    /// Compares descriptor debug name and parameter counts.
+    /// </summary>
+    public bool StructuralEquals(CapturedEntry? other);
+}
+```
+
 ---
 
-## Graph (Phase 0 + Phase 1)
+## Graph (Phase 0 + Phase 1 + Phase 4a)
+
+### IGraphNode
+
+```csharp
+/// <summary>
+/// Common interface for all graph node types: KernelNode and CapturedNode.
+/// Allows GraphCompiler and CudaEngine to work polymorphically with both.
+/// </summary>
+internal interface IGraphNode : IDisposable
+{
+    Guid Id { get; }
+    string DebugName { get; }
+}
+```
 
 ### KernelNode
 
 ```csharp
-public sealed class KernelNode : IDisposable
+public sealed class KernelNode : IGraphNode, IDisposable
 {
     public Guid Id { get; }
     public string DebugName { get; }
@@ -991,6 +1198,161 @@ public sealed class KernelNode : IDisposable
 }
 ```
 
+### CapturedNode
+
+```csharp
+/// <summary>
+/// A graph node created by stream capture of library calls (cuBLAS, cuFFT, etc.).
+/// Inserted into the CUDA graph as a child graph node via AddChildGraphNode.
+/// Supports Recapture: re-execute the capture action and update the child graph
+/// without a full Cold Rebuild.
+/// </summary>
+public sealed class CapturedNode : IGraphNode, IDisposable
+{
+    public Guid Id { get; }
+    public string DebugName { get; set; }
+    public CapturedNodeDescriptor Descriptor { get; }
+
+    /// <summary>
+    /// The capture action executed during stream capture.
+    /// Receives the stream handle and buffer bindings (one CUdeviceptr per descriptor param).
+    /// Order: inputs first, then outputs, then scalars.
+    /// </summary>
+    internal Action<CUstream, CUdeviceptr[]> CaptureAction { get; }
+
+    /// <summary>
+    /// Buffer bindings set by CudaEngine before Capture(). Order matches descriptor:
+    /// [inputs..., outputs..., scalars...].
+    /// </summary>
+    internal CUdeviceptr[] BufferBindings { get; set; }
+
+    /// <summary>
+    /// The most recently captured child graph handle. Replaced on Recapture.
+    /// The CapturedNode owns this handle and destroys it on Dispose/Recapture.
+    /// </summary>
+    internal CUgraph CapturedGraph { get; }
+
+    /// <summary>
+    /// Whether this node has been captured at least once.
+    /// </summary>
+    internal bool HasCapturedGraph { get; }
+
+    public CapturedNode(
+        CapturedNodeDescriptor descriptor,
+        Action<CUstream, CUdeviceptr[]> captureAction,
+        string? debugName = null);
+
+    /// <summary>
+    /// Execute the capture action via stream capture and produce a child graph.
+    /// Disposes the previous captured graph if any.
+    /// </summary>
+    internal CUgraph Capture(CUstream stream);
+
+    public void Dispose();
+}
+```
+
+### CapturedNodeDescriptor
+
+```csharp
+/// <summary>
+/// Describes the input/output/scalar parameters of a captured library operation.
+/// Analogous to KernelDescriptor for KernelNodes, but for stream-captured operations.
+/// </summary>
+public sealed class CapturedNodeDescriptor
+{
+    public string DebugName { get; }
+    public IReadOnlyList<CapturedParam> Inputs { get; }
+    public IReadOnlyList<CapturedParam> Outputs { get; }
+    public IReadOnlyList<CapturedParam> Scalars { get; }
+
+    /// <summary>
+    /// Total parameter count across all categories.
+    /// </summary>
+    public int TotalParamCount { get; }
+
+    public CapturedNodeDescriptor(
+        string debugName,
+        IReadOnlyList<CapturedParam>? inputs = null,
+        IReadOnlyList<CapturedParam>? outputs = null,
+        IReadOnlyList<CapturedParam>? scalars = null);
+}
+```
+
+### CapturedParam
+
+```csharp
+/// <summary>
+/// Describes a single parameter of a captured library operation.
+/// </summary>
+public sealed class CapturedParam
+{
+    public string Name { get; }
+    public string Type { get; }
+    public bool IsPointer { get; }
+
+    public CapturedParam(string name, string type, bool isPointer = true);
+
+    /// <summary>
+    /// Create a pointer parameter (buffer input/output).
+    /// </summary>
+    public static CapturedParam Pointer(string name, string type);
+
+    /// <summary>
+    /// Create a scalar parameter (e.g., alpha/beta for BLAS).
+    /// </summary>
+    public static CapturedParam Scalar(string name, string type);
+}
+```
+
+### StreamCaptureHelper
+
+```csharp
+/// <summary>
+/// Thin helper for CUDA stream capture. Executes a work action between
+/// cuStreamBeginCapture and cuStreamEndCapture, returning the captured graph handle.
+/// </summary>
+internal static class StreamCaptureHelper
+{
+    /// <summary>
+    /// Execute a work action in stream capture mode and return the captured CUgraph handle.
+    /// The work action receives the stream handle and should direct all library calls to it.
+    /// The caller owns the returned CUgraph and must destroy it when done.
+    /// Uses CUstreamCaptureMode.Relaxed for multi-threaded capture support.
+    /// </summary>
+    public static CUgraph CaptureToGraph(CUstream stream, Action<CUstream> work);
+
+    /// <summary>
+    /// Destroy a CUgraph handle that was returned from CaptureToGraph.
+    /// </summary>
+    public static void DestroyGraph(CUgraph graph);
+
+    /// <summary>
+    /// Add a child graph node to a parent graph using a captured CUgraph.
+    /// </summary>
+    public static CUgraphNode AddChildGraphNode(CUgraph parentGraph,
+        CUgraphNode[]? dependencies, CUgraph childGraph);
+
+    /// <summary>
+    /// Update a child graph node in an executable graph (Recapture update).
+    /// Calls cuGraphExecChildGraphNodeSetParams.
+    /// </summary>
+    public static void UpdateChildGraphNode(CUgraphExec exec,
+        CUgraphNode node, CUgraph newChildGraph);
+}
+```
+
+### CapturedDependency
+
+```csharp
+/// <summary>
+/// Declares a dependency between a captured node and a kernel node (or vice versa).
+/// SourceNodeId must complete before TargetNodeId can begin.
+/// Both IDs can refer to either KernelNode or CapturedNode.
+/// </summary>
+internal readonly record struct CapturedDependency(Guid SourceNodeId, Guid TargetNodeId);
+```
+
 ### Edge
 
 ```csharp
@@ -1008,9 +1370,36 @@ public sealed class GraphBuilder
 {
     public GraphBuilder(DeviceContext device, ModuleCache moduleCache);
 
+    // === Kernel Nodes ===
+
     public KernelNode AddKernel(LoadedKernel loaded, string? debugName = null);
     public void AddEdge(KernelNode source, int sourceParam, KernelNode target, int targetParam);
     public void SetExternalBuffer(KernelNode node, int paramIndex, CUdeviceptr pointer);
+
+    // === Captured Nodes (Phase 4a) ===
+
+    /// <summary>
+    /// Add a captured library operation node. Created via stream capture during graph compilation.
+    /// </summary>
+    public CapturedNode AddCaptured(CapturedNodeDescriptor descriptor,
+        Action<CUstream, CUdeviceptr[]> captureAction, string? debugName = null);
+
+    /// <summary>
+    /// Declare that a kernel node depends on a captured node completing first.
+    /// </summary>
+    public void AddCapturedDependency(CapturedNode captured, KernelNode kernel);
+
+    /// <summary>
+    /// Declare that a captured node depends on a kernel node completing first.
+    /// </summary>
+    public void AddCapturedDependency(KernelNode kernel, CapturedNode captured);
+
+    /// <summary>
+    /// Assign an external buffer to a specific captured node parameter.
+    /// </summary>
+    public void SetExternalBuffer(CapturedNode node, int paramIndex, CUdeviceptr ptr);
+
+    // === Memset Nodes (Phase 3.1) ===
 
     /// <summary>
     /// Add a memset node to the graph. Used to zero-initialize append buffer counters
@@ -1024,8 +1413,12 @@ public sealed class GraphBuilder
     /// </summary>
     internal void AddMemsetDependency(MemsetDescriptor memset, KernelNode kernel);
 
+    // === Read-only access ===
+
     public IReadOnlyList<KernelNode> Nodes { get; }
     public IReadOnlyList<Edge> Edges { get; }
+    public IReadOnlyList<CapturedNode> CapturedNodes { get; }
+    internal IReadOnlyList<CapturedDependency> CapturedDependencies { get; }
 
     /// <summary>
     /// All memset descriptors added via AddMemset().
@@ -1104,6 +1497,8 @@ public sealed class GraphCompiler
 
     /// <summary>
     /// Validates, topologically sorts, allocates intermediate buffers, compiles to CUDA Graph.
+    /// For CapturedNodes: executes stream capture on each, inserts as ChildGraphNodes,
+    /// wires CapturedDependency edges, and applies external buffer bindings.
     /// </summary>
     public CompiledGraph Compile(GraphBuilder builder);
 }
@@ -1134,14 +1529,26 @@ public sealed class CompiledGraph : IDisposable
     public void UpdateGrid(Guid nodeId, uint gridX, uint gridY, uint gridZ);
 
     /// <summary>
+    /// Recapture Update: replace a captured node's child graph in the executable graph.
+    /// Used when a CapturedNode's parameters change and it needs re-stream-capture.
+    /// </summary>
+    internal void RecaptureNode(Guid nodeId, CUgraph newChildGraph);
+
+    /// <summary>
     /// Native handles for memset nodes in the compiled CUDA graph.
     /// Used internally to track memset → kernel dependencies.
     /// </summary>
     internal IReadOnlyDictionary<Guid, CUgraphNode> MemsetNodeHandles { get; }
 
     /// <summary>
-    /// Disposes CUgraph and CUgraphExec. Does NOT dispose KernelNodes.
-    /// KernelNode lifetime is owned by CudaEngine.
+    /// Native handles for captured (child graph) nodes in the compiled CUDA graph.
+    /// Used internally for Recapture updates.
+    /// </summary>
+    internal IReadOnlyDictionary<Guid, CUgraphNode> CapturedNodeHandles { get; }
+
+    /// <summary>
+    /// Disposes CUgraph and CUgraphExec. Does NOT dispose KernelNodes or CapturedNodes.
+    /// Node lifetime is owned by CudaEngine.
     /// </summary>
     public void Dispose();
 }
@@ -1275,6 +1682,278 @@ public class VectorAddBlock : ICudaBlock, IDisposable
 
 ---
 
+## Libraries (Phase 4a)
+
+### LibraryHandleCache
+
+```csharp
+/// <summary>
+/// Lazy-initialized cache for CUDA library handles. One instance per CudaContext.
+/// Handles are expensive to create, so we cache them and reuse across captures.
+/// Each handle is created on first access and disposed when the cache is disposed.
+/// </summary>
+public sealed class LibraryHandleCache : IDisposable
+{
+    /// <summary>
+    /// Get or create the cuBLAS handle.
+    /// </summary>
+    public CudaBlas GetOrCreateBlas();
+
+    /// <summary>
+    /// Get or create a cuFFT 1D plan with the given configuration.
+    /// Plans are cached by (nx, type, batch) since they are configuration-dependent.
+    /// </summary>
+    public CudaFFTPlan1D GetOrCreateFFT1D(int nx, cufftType type, int batch = 1);
+
+    /// <summary>
+    /// Get or create the cuSPARSE context.
+    /// </summary>
+    public CudaSparseContext GetOrCreateSparse();
+
+    /// <summary>
+    /// Get or create the cuRAND device generator.
+    /// </summary>
+    public CudaRandDevice GetOrCreateRand(GeneratorType type = GeneratorType.PseudoDefault);
+
+    /// <summary>
+    /// Get or create the cuSOLVER dense handle.
+    /// </summary>
+    public CudaSolveDense GetOrCreateSolveDense();
+
+    public void Dispose();
+}
+```
+
+### BlasOperations
+
+Static wrappers for cuBLAS. Each method returns a `CapturedHandle` registered on the `BlockBuilder`.
+
+```csharp
+/// <summary>
+/// High-level cuBLAS wrappers that produce CapturedHandle entries for BlockBuilder.
+/// Each operation wraps a stream-captured cuBLAS call as a CapturedNode.
+/// Buffer bindings follow descriptor order: [inputs..., outputs..., scalars...].
+/// </summary>
+public static class BlasOperations  // VL.Cuda.Core.Libraries.Blas
+{
+    /// <summary>
+    /// Single-precision matrix multiply: C = alpha*A*B + beta*C.
+    /// A is (M x K), B is (K x N), C is (M x N). Column-major layout.
+    /// Buffers: In[0]=A, In[1]=B, Out[0]=C.
+    /// </summary>
+    public static CapturedHandle Sgemm(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int m, int n, int k,
+        float alpha = 1.0f, float beta = 0.0f,
+        Operation transA = Operation.NonTranspose,
+        Operation transB = Operation.NonTranspose);
+
+    /// <summary>
+    /// Double-precision matrix multiply: C = alpha*A*B + beta*C.
+    /// Buffers: In[0]=A, In[1]=B, Out[0]=C.
+    /// </summary>
+    public static CapturedHandle Dgemm(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int m, int n, int k,
+        double alpha = 1.0, double beta = 0.0,
+        Operation transA = Operation.NonTranspose,
+        Operation transB = Operation.NonTranspose);
+
+    /// <summary>
+    /// Single-precision matrix-vector multiply: y = alpha*A*x + beta*y.
+    /// A is (M x N), x is (N), y is (M).
+    /// Buffers: In[0]=A, In[1]=x, Out[0]=y.
+    /// </summary>
+    public static CapturedHandle Sgemv(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int m, int n,
+        float alpha = 1.0f, float beta = 0.0f,
+        Operation transA = Operation.NonTranspose);
+
+    /// <summary>
+    /// Single-precision vector scaling: x = alpha * x.
+    /// Buffers: Out[0]=x (in-place).
+    /// </summary>
+    public static CapturedHandle Sscal(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int n, float alpha = 1.0f);
+}
+```
+
+### FftOperations
+
+Static wrappers for cuFFT. Each method returns a `CapturedHandle` registered on the `BlockBuilder`.
+
+```csharp
+/// <summary>
+/// High-level cuFFT wrappers that produce CapturedHandle entries for BlockBuilder.
+/// Each operation wraps a stream-captured cuFFT plan execution as a CapturedNode.
+/// </summary>
+public static class FftOperations  // VL.Cuda.Core.Libraries.FFT
+{
+    /// <summary>
+    /// 1D FFT Forward transform (out-of-place).
+    /// Buffers: In[0]=input, Out[0]=output.
+    /// </summary>
+    public static CapturedHandle Forward1D(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int nx, cufftType type = cufftType.C2C, int batch = 1);
+
+    /// <summary>
+    /// 1D FFT Inverse transform (out-of-place).
+    /// Buffers: In[0]=input, Out[0]=output.
+    /// </summary>
+    public static CapturedHandle Inverse1D(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int nx, cufftType type = cufftType.C2C, int batch = 1);
+
+    /// <summary>
+    /// 1D Real-to-Complex FFT (out-of-place).
+    /// Input: N real values, Output: N/2+1 complex values.
+    /// Buffers: In[0]=input (float*), Out[0]=output (float2*).
+    /// </summary>
+    public static CapturedHandle R2C1D(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int nx, int batch = 1);
+
+    /// <summary>
+    /// 1D Complex-to-Real inverse FFT (out-of-place).
+    /// Input: N/2+1 complex values, Output: N real values.
+    /// Buffers: In[0]=input (float2*), Out[0]=output (float*).
+    /// </summary>
+    public static CapturedHandle C2R1D(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int nx, int batch = 1);
+}
+```
+
+### SparseOperations
+
+Static wrappers for cuSPARSE. Each method returns a `CapturedHandle` registered on the `BlockBuilder`.
+
+```csharp
+/// <summary>
+/// High-level cuSPARSE wrappers that produce CapturedHandle entries for BlockBuilder.
+/// Sparse matrix operations via stream capture.
+/// </summary>
+public static class SparseOperations  // VL.Cuda.Core.Libraries.Sparse
+{
+    /// <summary>
+    /// Sparse matrix-vector multiply (SpMV): y = alpha*A*x + beta*y.
+    /// A is sparse CSR (M x N, nnz non-zeros), x and y are dense vectors.
+    /// Buffers: In[0]=csrValues, In[1]=csrRowOffsets, In[2]=csrColInd, In[3]=x,
+    ///          Out[0]=y, Out[1]=workspace.
+    /// </summary>
+    public static CapturedHandle SpMV(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int m, int n, int nnz, int workspaceSizeBytes);
+}
+```
+
+### RandOperations
+
+Static wrappers for cuRAND. Each method returns a `CapturedHandle` registered on the `BlockBuilder`.
+
+```csharp
+/// <summary>
+/// High-level cuRAND wrappers that produce CapturedHandle entries for BlockBuilder.
+/// Random number generation via stream capture.
+/// </summary>
+public static class RandOperations  // VL.Cuda.Core.Libraries.Rand
+{
+    /// <summary>
+    /// Generate uniform random float values in [0, 1).
+    /// Buffers: Out[0]=output.
+    /// </summary>
+    public static CapturedHandle GenerateUniform(
+        BlockBuilder builder, LibraryHandleCache libs, int count);
+
+    /// <summary>
+    /// Generate normal-distributed random float values.
+    /// Buffers: Out[0]=output.
+    /// </summary>
+    public static CapturedHandle GenerateNormal(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int count, float mean = 0.0f, float stddev = 1.0f);
+}
+```
+
+### SolveOperations
+
+Static wrappers for cuSOLVER. Each method returns a `CapturedHandle` registered on the `BlockBuilder`.
+
+```csharp
+/// <summary>
+/// High-level cuSOLVER wrappers that produce CapturedHandle entries for BlockBuilder.
+/// Dense linear algebra solvers via stream capture.
+/// </summary>
+public static class SolveOperations  // VL.Cuda.Core.Libraries.Solve
+{
+    /// <summary>
+    /// LU factorization of an M x N matrix: A = P * L * U.
+    /// Buffers: Out[0]=A (in-place LU), Out[1]=workspace, Out[2]=devIpiv, Out[3]=devInfo.
+    /// </summary>
+    public static CapturedHandle Sgetrf(
+        BlockBuilder builder, LibraryHandleCache libs, int m, int n);
+
+    /// <summary>
+    /// Solve a linear system A*X = B using LU factorization.
+    /// A must have been factored by Sgetrf first.
+    /// Buffers: In[0]=A (LU), In[1]=Ipiv, Out[0]=B (in-place solution X), Out[1]=Info.
+    /// </summary>
+    public static CapturedHandle Sgetrs(
+        BlockBuilder builder, LibraryHandleCache libs,
+        int n, int nrhs, Operation trans = Operation.NonTranspose);
+}
+```
+
+---
+
+## Constructor Pattern (Captured Block)
+
+Blocks that use library calls via stream capture follow this pattern. The `CapturedHandle` is used the same way as `KernelHandle`.
+
+```csharp
+public class MatMulBlock : ICudaBlock, IDisposable
+{
+    private readonly CudaContext _ctx;
+
+    public Guid Id { get; } = Guid.NewGuid();
+    public string TypeName => "MatMul";
+    public NodeContext NodeContext { get; }
+
+    public IReadOnlyList<IBlockPort> Inputs => _inputs;
+    public IReadOnlyList<IBlockPort> Outputs => _outputs;
+    public IReadOnlyList<IBlockParameter> Parameters => Array.Empty<IBlockParameter>();
+    public IBlockDebugInfo DebugInfo { get; set; }
+
+    private readonly List<IBlockPort> _inputs = new();
+    private readonly List<IBlockPort> _outputs = new();
+
+    public MatMulBlock(NodeContext nodeContext, CudaContext ctx, int m, int n, int k)
+    {
+        _ctx = ctx;
+        NodeContext = nodeContext;
+
+        var builder = new BlockBuilder(ctx, this);
+
+        // Use cuBLAS Sgemm via stream capture
+        var sgemm = BlasOperations.Sgemm(builder, ctx.Libraries, m, n, k);
+
+        _inputs.Add(builder.Input<float>("A", sgemm.In(0)));
+        _inputs.Add(builder.Input<float>("B", sgemm.In(1)));
+        _outputs.Add(builder.Output<float>("C", sgemm.Out(0)));
+
+        builder.Commit();
+        ctx.RegisterBlock(this);
+    }
+
+    public void Dispose() => _ctx.UnregisterBlock(Id);
+}
+```
+
+---
+
 ## Planned (Phase 3+)
 
 The following types are designed but not yet implemented:
@@ -1285,7 +1964,6 @@ The following types are designed but not yet implemented:
 - **Composite blocks** — AddChild / ConnectChildren / ExposeInput/Output (Phase 3)
 - **ProfilingPipeline** — Async GPU event readback (Phase 3+)
 - **IDebugInfo** — Full engine debug info (Phase 3+)
-- **CapturedHandle / StreamCaptureHelper** — cuBLAS/cuFFT via Stream Capture (Phase 4a)
 - **IlgpuCompiler** — ILGPU IR → PTX compilation (Phase 4b)
 - **NvrtcCache** — User CUDA C++ compilation (Phase 4b)
 - **CudaDX11Interop** — DX11/Stride graphics sharing (Phase 5)

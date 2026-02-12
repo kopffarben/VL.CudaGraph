@@ -9,15 +9,18 @@ namespace VL.Cuda.Core.Graph;
 
 /// <summary>
 /// Fluent API for constructing a CUDA graph description before compilation.
+/// Supports both KernelNodes (PTX kernels) and CapturedNodes (stream-captured library calls).
 /// </summary>
 public sealed class GraphBuilder
 {
     private readonly DeviceContext _device;
     private readonly ModuleCache _moduleCache;
     private readonly List<KernelNode> _nodes = new();
+    private readonly List<CapturedNode> _capturedNodes = new();
     private readonly List<Edge> _edges = new();
     private readonly Dictionary<(Guid NodeId, int ParamIndex), CUdeviceptr> _externalBuffers = new();
     private readonly List<MemsetDescriptor> _memsetDescriptors = new();
+    private readonly List<CapturedDependency> _capturedDependencies = new();
 
     public GraphBuilder(DeviceContext device, ModuleCache moduleCache)
     {
@@ -47,6 +50,41 @@ public sealed class GraphBuilder
     }
 
     /// <summary>
+    /// Add a captured library operation node. Created via stream capture during graph compilation.
+    /// </summary>
+    public CapturedNode AddCaptured(CapturedNodeDescriptor descriptor, Action<CUstream, CUdeviceptr[]> captureAction, string? debugName = null)
+    {
+        var node = new CapturedNode(descriptor, captureAction, debugName);
+        _capturedNodes.Add(node);
+        return node;
+    }
+
+    /// <summary>
+    /// Declare that a kernel node depends on a captured node completing first.
+    /// </summary>
+    public void AddCapturedDependency(CapturedNode captured, KernelNode kernel)
+    {
+        _capturedDependencies.Add(new CapturedDependency(captured.Id, kernel.Id));
+    }
+
+    /// <summary>
+    /// Declare that a captured node depends on a kernel node completing first.
+    /// </summary>
+    public void AddCapturedDependency(KernelNode kernel, CapturedNode captured)
+    {
+        _capturedDependencies.Add(new CapturedDependency(kernel.Id, captured.Id));
+    }
+
+    /// <summary>
+    /// Assign an external buffer to a specific captured node parameter.
+    /// Uses the same external buffer dictionary as kernel nodes.
+    /// </summary>
+    public void SetExternalBuffer(CapturedNode node, int paramIndex, CUdeviceptr ptr)
+    {
+        _externalBuffers[(node.Id, paramIndex)] = ptr;
+    }
+
+    /// <summary>
     /// Add a data dependency edge between two nodes.
     /// The target node will depend on the source node completing first.
     /// </summary>
@@ -72,8 +110,8 @@ public sealed class GraphBuilder
         var result = new ValidationResult();
         var nodeMap = _nodes.ToDictionary(n => n.Id);
 
-        // Check for empty graph
-        if (_nodes.Count == 0)
+        // Check for empty graph (no kernel nodes AND no captured nodes)
+        if (_nodes.Count == 0 && _capturedNodes.Count == 0)
         {
             result.AddError("Graph has no nodes");
             return result;
@@ -172,7 +210,9 @@ public sealed class GraphBuilder
             _nodes.ToList().AsReadOnly(),
             _edges.ToList().AsReadOnly(),
             new Dictionary<(Guid, int), CUdeviceptr>(_externalBuffers),
-            _memsetDescriptors.ToList().AsReadOnly());
+            _memsetDescriptors.ToList().AsReadOnly(),
+            _capturedNodes.ToList().AsReadOnly(),
+            _capturedDependencies.ToList().AsReadOnly());
     }
 
     /// <summary>
@@ -194,8 +234,10 @@ public sealed class GraphBuilder
     }
 
     public IReadOnlyList<KernelNode> Nodes => _nodes;
+    public IReadOnlyList<CapturedNode> CapturedNodes => _capturedNodes;
     public IReadOnlyList<Edge> Edges => _edges;
     internal IReadOnlyList<MemsetDescriptor> MemsetDescriptors => _memsetDescriptors;
+    internal IReadOnlyList<CapturedDependency> CapturedDependencies => _capturedDependencies;
 
     /// <summary>
     /// Kahn's algorithm for cycle detection. Returns true if the graph is acyclic.

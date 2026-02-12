@@ -6,6 +6,7 @@ using VL.Cuda.Core.Blocks.Builder;
 using VL.Cuda.Core.Buffers;
 using VL.Cuda.Core.Context.Services;
 using VL.Cuda.Core.Device;
+using VL.Cuda.Core.Libraries;
 using VL.Cuda.Core.PTX;
 
 namespace VL.Cuda.Core.Context;
@@ -27,6 +28,7 @@ public sealed class CudaContext : IDisposable
     public BlockRegistry Registry { get; }
     public ConnectionGraph Connections { get; }
     public DirtyTracker Dirty { get; }
+    public LibraryHandleCache Libraries { get; }
 
     public CudaContext(CudaEngineOptions options)
     {
@@ -36,6 +38,7 @@ public sealed class CudaContext : IDisposable
         Registry = new BlockRegistry();
         Connections = new ConnectionGraph();
         Dirty = new DirtyTracker();
+        Libraries = new LibraryHandleCache();
 
         Dirty.Subscribe(Registry, Connections);
     }
@@ -51,6 +54,7 @@ public sealed class CudaContext : IDisposable
         Registry = new BlockRegistry();
         Connections = new ConnectionGraph();
         Dirty = new DirtyTracker();
+        Libraries = new LibraryHandleCache();
 
         Dirty.Subscribe(Registry, Connections);
     }
@@ -86,6 +90,14 @@ public sealed class CudaContext : IDisposable
     public void OnParameterChanged(Guid blockId, string paramName)
     {
         Dirty.MarkParameterDirty(new DirtyParameter(blockId, paramName));
+    }
+
+    /// <summary>
+    /// Called when a captured node's parameters change and it needs recapture.
+    /// </summary>
+    public void OnCapturedNodeChanged(Guid blockId, Guid capturedHandleId)
+    {
+        Dirty.MarkCapturedNodeDirty(new DirtyCapturedNode(blockId, capturedHandleId));
     }
 
     /// <summary>
@@ -126,6 +138,7 @@ public sealed class CudaContext : IDisposable
         if (_disposed) return;
         _disposed = true;
 
+        Libraries.Dispose();
         Pool.Dispose();
         ModuleCache.Dispose();
         Device.Dispose();

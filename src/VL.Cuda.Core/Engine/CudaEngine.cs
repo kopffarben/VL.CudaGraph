@@ -17,7 +17,7 @@ namespace VL.Cuda.Core.Engine;
 /// <summary>
 /// The active component of the CUDA pipeline. Owns the CudaContext,
 /// compiles and launches the CUDA graph, and distributes debug info.
-/// One CudaEngine per pipeline.
+/// One CudaEngine per pipeline. Supports both KernelNodes and CapturedNodes.
 /// </summary>
 [ProcessNode(HasStateOutput = true)]
 public sealed class CudaEngine : IDisposable
@@ -30,6 +30,11 @@ public sealed class CudaEngine : IDisposable
     /// since CompiledGraph.Dispose() does NOT dispose KernelNodes.
     /// </summary>
     private readonly List<KernelNode> _ownedKernelNodes = new();
+
+    /// <summary>
+    /// All CapturedNodes created during ColdRebuild. We own their lifetime.
+    /// </summary>
+    private readonly List<CapturedNode> _ownedCapturedNodes = new();
 
     /// <summary>
     /// AppendBuffers allocated during ColdRebuild. Disposed on rebuild.
@@ -48,9 +53,14 @@ public sealed class CudaEngine : IDisposable
     private readonly Dictionary<(Guid BlockId, string ParamName), (Guid KernelNodeId, int ParamIndex)> _paramMapping = new();
 
     /// <summary>
-    /// Maps KernelHandle.Id → KernelNode.Id for wiring block ports to graph nodes.
+    /// Maps KernelHandle.Id / CapturedHandle.Id → graph node Id for wiring block ports to graph nodes.
     /// </summary>
     private readonly Dictionary<Guid, Guid> _handleToNodeId = new();
+
+    /// <summary>
+    /// Maps (blockId, capturedHandleId) → CapturedNode.Id for Recapture updates.
+    /// </summary>
+    private readonly Dictionary<(Guid BlockId, Guid HandleId), Guid> _capturedHandleToNodeId = new();
 
     private CompiledGraph? _compiledGraph;
     private bool _disposed;
@@ -93,7 +103,7 @@ public sealed class CudaEngine : IDisposable
 
     /// <summary>
     /// Main frame update. Call once per frame.
-    /// Priority: Structure > Parameters > Launch.
+    /// Priority: Structure > Recapture > Parameters > Launch.
     /// </summary>
     public void Update()
     {
@@ -103,6 +113,11 @@ public sealed class CudaEngine : IDisposable
         {
             ColdRebuild();
             Context.Dirty.ClearStructureDirty();
+        }
+        else if (Context.Dirty.AreCapturedNodesDirty)
+        {
+            RecaptureNodes();
+            Context.Dirty.ClearCapturedNodesDirty();
         }
         else if (Context.Dirty.AreParametersDirty)
         {
@@ -134,6 +149,10 @@ public sealed class CudaEngine : IDisposable
             node.Dispose();
         _ownedKernelNodes.Clear();
 
+        foreach (var node in _ownedCapturedNodes)
+            node.Dispose();
+        _ownedCapturedNodes.Clear();
+
         foreach (var ab in _ownedAppendBuffers)
             ab.Dispose();
         _ownedAppendBuffers.Clear();
@@ -141,6 +160,7 @@ public sealed class CudaEngine : IDisposable
 
         _paramMapping.Clear();
         _handleToNodeId.Clear();
+        _capturedHandleToNodeId.Clear();
 
         // 2. Check if there are any blocks
         if (Context.Registry.Count == 0)
@@ -177,8 +197,8 @@ public sealed class CudaEngine : IDisposable
                     if (_handleToNodeId.TryGetValue(srcHandleId, out var srcNodeId) &&
                         _handleToNodeId.TryGetValue(tgtHandleId, out var tgtNodeId))
                     {
-                        var srcNode = FindNode(srcNodeId);
-                        var tgtNode = FindNode(tgtNodeId);
+                        var srcNode = FindKernelNode(srcNodeId);
+                        var tgtNode = FindKernelNode(tgtNodeId);
                         if (srcNode != null && tgtNode != null)
                             graphBuilder.AddEdge(srcNode, srcParam, tgtNode, tgtParam);
                     }
@@ -199,8 +219,8 @@ public sealed class CudaEngine : IDisposable
                 if (_handleToNodeId.TryGetValue(srcPort.KernelNodeId, out var srcNodeId) &&
                     _handleToNodeId.TryGetValue(tgtPort.KernelNodeId, out var tgtNodeId))
                 {
-                    var srcNode = FindNode(srcNodeId);
-                    var tgtNode = FindNode(tgtNodeId);
+                    var srcNode = FindKernelNode(srcNodeId);
+                    var tgtNode = FindKernelNode(tgtNodeId);
                     if (srcNode != null && tgtNode != null)
                         graphBuilder.AddEdge(srcNode, srcPort.KernelParamIndex, tgtNode, tgtPort.KernelParamIndex);
                 }
@@ -218,9 +238,22 @@ public sealed class CudaEngine : IDisposable
 
                 if (_handleToNodeId.TryGetValue(port.KernelNodeId, out var nodeId))
                 {
-                    var node = FindNode(nodeId);
-                    if (node != null)
-                        graphBuilder.SetExternalBuffer(node, port.KernelParamIndex, pointer);
+                    var kernelNode = FindKernelNode(nodeId);
+                    if (kernelNode != null)
+                    {
+                        graphBuilder.SetExternalBuffer(kernelNode, port.KernelParamIndex, pointer);
+                    }
+                    else
+                    {
+                        // Wire buffer to captured node's BufferBindings array
+                        var capturedNode = FindCapturedNode(nodeId);
+                        if (capturedNode != null)
+                        {
+                            var paramIndex = port.KernelParamIndex;
+                            if (paramIndex >= 0 && paramIndex < capturedNode.BufferBindings.Length)
+                                capturedNode.BufferBindings[paramIndex] = pointer;
+                        }
+                    }
                 }
             }
 
@@ -258,15 +291,14 @@ public sealed class CudaEngine : IDisposable
     }
 
     /// <summary>
-    /// Create KernelNodes from block description's ordered kernel entries.
-    /// No reflection, no HashSet — uses the deterministic kernel list.
+    /// Create KernelNodes and CapturedNodes from block description.
     /// </summary>
     private void BuildBlockNodes(GraphBuilder graphBuilder, ICudaBlock block)
     {
         var desc = Context.GetBlockDescription(block.Id);
         if (desc == null) return;
 
-        // Create a KernelNode for each kernel entry (deterministic order from AddKernel calls)
+        // Create a KernelNode for each kernel entry
         foreach (var entry in desc.KernelEntries)
         {
             if (_handleToNodeId.ContainsKey(entry.HandleId)) continue;
@@ -274,13 +306,26 @@ public sealed class CudaEngine : IDisposable
             var loaded = Context.ModuleCache.GetOrLoad(entry.PtxPath);
             var kernelNode = graphBuilder.AddKernel(loaded, $"{block.TypeName}.{entry.EntryPoint}");
 
-            // Apply grid dimensions from block description
             kernelNode.GridDimX = entry.GridDimX;
             kernelNode.GridDimY = entry.GridDimY;
             kernelNode.GridDimZ = entry.GridDimZ;
 
             _ownedKernelNodes.Add(kernelNode);
             _handleToNodeId[entry.HandleId] = kernelNode.Id;
+        }
+
+        // Create a CapturedNode for each captured entry
+        foreach (var entry in desc.CapturedEntries)
+        {
+            if (_handleToNodeId.ContainsKey(entry.HandleId)) continue;
+
+            var capturedNode = graphBuilder.AddCaptured(
+                entry.Descriptor, entry.CaptureAction,
+                $"{block.TypeName}.{entry.Descriptor.DebugName}");
+
+            _ownedCapturedNodes.Add(capturedNode);
+            _handleToNodeId[entry.HandleId] = capturedNode.Id;
+            _capturedHandleToNodeId[(block.Id, entry.HandleId)] = capturedNode.Id;
         }
 
         // Build parameter mapping: (blockId, paramName) → (kernelNodeId, paramIndex)
@@ -296,11 +341,9 @@ public sealed class CudaEngine : IDisposable
 
     /// <summary>
     /// Extract kernel mapping from a BlockParameter without reflection.
-    /// Tries known types first, falls back to reflection for others.
     /// </summary>
     private static (Guid HandleId, int ParamIndex) GetParamKernelMapping(IBlockParameter param)
     {
-        // Fast path: check common concrete types directly
         switch (param)
         {
             case BlockParameter<float> p: return (p.KernelNodeId, p.KernelParamIndex);
@@ -315,7 +358,6 @@ public sealed class CudaEngine : IDisposable
             case BlockParameter<sbyte> p: return (p.KernelNodeId, p.KernelParamIndex);
         }
 
-        // Fallback: reflection for unknown BlockParameter<T> types
         var pt = param.GetType();
         if (pt.IsGenericType && pt.GetGenericTypeDefinition() == typeof(BlockParameter<>))
         {
@@ -336,7 +378,7 @@ public sealed class CudaEngine : IDisposable
         foreach (var param in block.Parameters)
         {
             if (!_paramMapping.TryGetValue((block.Id, param.Name), out var mapping)) continue;
-            var node = FindNode(mapping.KernelNodeId);
+            var node = FindKernelNode(mapping.KernelNodeId);
             if (node == null) continue;
             ApplyScalar(node, mapping.ParamIndex, param);
         }
@@ -379,7 +421,6 @@ public sealed class CudaEngine : IDisposable
 
             if (!_paramMapping.TryGetValue((dirty.BlockId, dirty.ParamName), out var mapping)) continue;
 
-            // Hot Update via CompiledGraph
             switch (param.Value)
             {
                 case float f: _compiledGraph.UpdateScalar(mapping.KernelNodeId, mapping.ParamIndex, f); break;
@@ -397,12 +438,34 @@ public sealed class CudaEngine : IDisposable
     }
 
     /// <summary>
+    /// Recapture Update: re-stream-capture affected CapturedNodes and update executable graph.
+    /// </summary>
+    private void RecaptureNodes()
+    {
+        if (_compiledGraph == null) return;
+
+        foreach (var dirty in Context.Dirty.GetDirtyCapturedNodes())
+        {
+            if (!_capturedHandleToNodeId.TryGetValue((dirty.BlockId, dirty.CapturedHandleId), out var nodeId))
+                continue;
+
+            var capturedNode = FindCapturedNode(nodeId);
+            if (capturedNode == null) continue;
+
+            // Re-capture the operation
+            var newGraph = capturedNode.Capture(_stream.Stream);
+
+            // Update the executable graph's child graph node
+            _compiledGraph.RecaptureNode(nodeId, newGraph);
+        }
+    }
+
+    /// <summary>
     /// Allocate an AppendBuffer for the given info, wire data+counter pointers
     /// as external buffers, and register a counter-reset memset node.
     /// </summary>
     private void AllocateAndWireAppendBuffer(GraphBuilder graphBuilder, AppendBufferInfo info)
     {
-        // Allocate type-erased (byte-based) append buffer: capacity * elementSize bytes
         int totalBytes = info.MaxCapacity * info.ElementSize;
         var dataBuffer = Context.Pool.Acquire<byte>(totalBytes);
         var counterBuffer = Context.Pool.Acquire<uint>(1);
@@ -419,7 +482,7 @@ public sealed class CudaEngine : IDisposable
         // Wire data pointer to the kernel parameter
         if (_handleToNodeId.TryGetValue(info.DataKernelHandleId, out var dataNodeId))
         {
-            var dataNode = FindNode(dataNodeId);
+            var dataNode = FindKernelNode(dataNodeId);
             if (dataNode != null)
                 graphBuilder.SetExternalBuffer(dataNode, info.DataParamIndex, appendBuffer.DataPointer);
         }
@@ -427,7 +490,7 @@ public sealed class CudaEngine : IDisposable
         // Wire counter pointer to the kernel parameter
         if (_handleToNodeId.TryGetValue(info.CounterKernelHandleId, out var counterNodeId))
         {
-            var counterNode = FindNode(counterNodeId);
+            var counterNode = FindKernelNode(counterNodeId);
             if (counterNode != null)
                 graphBuilder.SetExternalBuffer(counterNode, info.CounterParamIndex, appendBuffer.CounterPointer);
         }
@@ -436,23 +499,21 @@ public sealed class CudaEngine : IDisposable
         var memset = graphBuilder.AddMemset(
             appendBuffer.CounterPointer,
             value: 0,
-            elemSize: 4,  // uint32
+            elemSize: 4,
             width: 1,
             debugName: $"Reset {info.PortName} Counter");
 
-        // All kernel nodes that use this counter must depend on the memset
         if (_handleToNodeId.TryGetValue(info.DataKernelHandleId, out var depNodeId))
         {
-            var depNode = FindNode(depNodeId);
+            var depNode = FindKernelNode(depNodeId);
             if (depNode != null)
                 graphBuilder.AddMemsetDependency(memset, depNode);
         }
 
-        // If counter is on a different kernel, add dependency for that too
         if (info.CounterKernelHandleId != info.DataKernelHandleId &&
             _handleToNodeId.TryGetValue(info.CounterKernelHandleId, out var counterDepNodeId))
         {
-            var counterDepNode = FindNode(counterDepNodeId);
+            var counterDepNode = FindKernelNode(counterDepNodeId);
             if (counterDepNode != null)
                 graphBuilder.AddMemsetDependency(memset, counterDepNode);
         }
@@ -469,14 +530,16 @@ public sealed class CudaEngine : IDisposable
         }
     }
 
-    private KernelNode? FindNode(Guid nodeId)
+    private KernelNode? FindKernelNode(Guid nodeId)
         => _ownedKernelNodes.FirstOrDefault(n => n.Id == nodeId);
+
+    private CapturedNode? FindCapturedNode(Guid nodeId)
+        => _ownedCapturedNodes.FirstOrDefault(n => n.Id == nodeId);
 
     private void DistributeDebugInfo(BlockState state, string? message = null)
     {
         foreach (var block in Context.Registry.All)
         {
-            // Build AppendCounts for this block
             Dictionary<string, int>? appendCounts = null;
             foreach (var kvp in _appendBufferMapping)
             {
@@ -495,9 +558,6 @@ public sealed class CudaEngine : IDisposable
         }
     }
 
-    /// <summary>
-    /// Build state message including overflow warnings for append buffers.
-    /// </summary>
     private string? BuildStateMessage(string? baseMessage, Guid blockId)
     {
         var overflows = new List<string>();
@@ -532,6 +592,10 @@ public sealed class CudaEngine : IDisposable
         foreach (var node in _ownedKernelNodes)
             node.Dispose();
         _ownedKernelNodes.Clear();
+
+        foreach (var node in _ownedCapturedNodes)
+            node.Dispose();
+        _ownedCapturedNodes.Clear();
 
         foreach (var ab in _ownedAppendBuffers)
             ab.Dispose();

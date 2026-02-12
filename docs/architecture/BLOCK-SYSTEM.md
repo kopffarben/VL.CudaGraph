@@ -227,7 +227,43 @@ AppendOutputPort AppendOutput<T>(string name, KernelPin dataPin, KernelPin count
 void Connect(KernelPin source, KernelPin target);
 ```
 
-### Planned (Phase 3+)
+### Captured Operations (Implemented — Phase 4a)
+
+```csharp
+// Add a captured library operation. Returns a handle for binding ports.
+// The captureAction receives the stream and a flat buffer bindings array.
+CapturedHandle AddCaptured(Action<CUstream, CUdeviceptr[]> captureAction, CapturedNodeDescriptor descriptor);
+
+// Input/Output overloads accept CapturedPin for binding to captured operation parameters.
+BlockPort Input<T>(string name, CapturedPin pin) where T : unmanaged;
+BlockPort Output<T>(string name, CapturedPin pin) where T : unmanaged;
+```
+
+**CapturedHandle** provides `In()`, `Out()`, and `Scalar()` methods that return `CapturedPin` values pointing to flat buffer binding indices. Buffer bindings follow descriptor order: `[inputs..., outputs..., scalars...]`.
+
+```csharp
+var descriptor = new CapturedNodeDescriptor("cuBLAS.Sgemm",
+    inputs: new[] { CapturedParam.Pointer("A", "float*"), CapturedParam.Pointer("B", "float*") },
+    outputs: new[] { CapturedParam.Pointer("C", "float*") });
+
+var op = builder.AddCaptured((stream, buffers) =>
+{
+    var blas = libs.GetOrCreateBlas();
+    blas.Stream = stream;
+    CudaBlasNativeMethods.cublasSgemm_v2(blas.CublasHandle, ...
+        buffers[0], ..., buffers[1], ..., buffers[2], ...);
+}, descriptor);
+
+builder.Input<float>("A", op.In(0));    // flat index 0
+builder.Input<float>("B", op.In(1));    // flat index 1
+builder.Output<float>("C", op.Out(0));  // flat index 2 (inputs.Count + 0)
+```
+
+On `Commit()`, each `CapturedHandle` produces a `CapturedEntry` stored in `BlockDescription.CapturedEntries`. This contains the handle ID, descriptor, and capture action needed by `CudaEngine` to create `CapturedNode` instances during `ColdRebuild`.
+
+See `KERNEL-SOURCES.md` for the full three-source architecture and library operation wrappers.
+
+### Planned (Phase 3+ / Phase 4b)
 
 The following BlockBuilder methods are designed but not yet implemented:
 
@@ -239,15 +275,10 @@ InputHandle<T> ExposeInput<T>(string name, InputHandle<T> childInput);
 OutputHandle<T> ExposeOutput<T>(string name, OutputHandle<T> childOutput);
 BlockParameter<T> ExposeParameter<T>(string name, ICudaBlock child, string childParamName);
 
-// Phase 4a: Library Calls via Stream Capture
-CapturedHandle AddCaptured(string name, Action<CUstream> captureAction, CapturedOpDescriptor descriptor);
-
 // Phase 4b: Patchable Kernels (ILGPU IR + NVRTC)
 KernelHandle AddKernel(CUmodule ilgpuModule, string entryPoint);
 KernelHandle AddKernel(CUmodule nvrtcModule, string entryPoint, bool isNvrtc = true);
 ```
-
-See `KERNEL-SOURCES.md` for the full three-source architecture.
 
 ---
 
@@ -280,6 +311,53 @@ public sealed class KernelHandle
 Phase 2 uses simple `uint GridDimX/Y/Z` on KernelHandle. These are stored in `KernelEntry` within `BlockDescription` and applied to `KernelNode` during `ColdRebuild`.
 
 **Planned (Phase 3+):** `GridConfig` class with `GridSizeMode.Auto` (calculate from buffer size) and `GridSizeMode.Fixed`.
+
+---
+
+## CapturedHandle
+
+Represents a captured library operation added to a block via `BlockBuilder.AddCaptured()`:
+
+```csharp
+public sealed class CapturedHandle
+{
+    public Guid Id { get; }
+    public CapturedNodeDescriptor Descriptor { get; }
+    public Action<CUstream, CUdeviceptr[]> CaptureAction { get; }
+
+    // Access captured params by category index → returns flat buffer binding index
+    public CapturedPin In(int index);      // → flat index = index
+    public CapturedPin Out(int index);     // → flat index = Inputs.Count + index
+    public CapturedPin Scalar(int index);  // → flat index = Inputs.Count + Outputs.Count + index
+}
+```
+
+`CapturedPin` is analogous to `KernelPin` but references a flat index into the buffer bindings array rather than a kernel parameter index. The bindings array layout is `[inputs..., outputs..., scalars...]` matching the descriptor order.
+
+```csharp
+public readonly struct CapturedPin
+{
+    public Guid CapturedHandleId { get; }
+    public int ParamIndex { get; }            // Flat index into BufferBindings
+    public CapturedPinCategory Category { get; }  // Input, Output, or Scalar
+}
+```
+
+### CapturedEntry
+
+On `Commit()`, each `CapturedHandle` produces a `CapturedEntry` stored in `BlockDescription.CapturedEntries`:
+
+```csharp
+public sealed class CapturedEntry
+{
+    public Guid HandleId { get; }
+    public CapturedNodeDescriptor Descriptor { get; }
+    public Action<CUstream, CUdeviceptr[]> CaptureAction { get; }
+
+    // StructuralEquals ignores HandleId, compares debug name + param counts
+    public bool StructuralEquals(CapturedEntry? other);
+}
+```
 
 ---
 

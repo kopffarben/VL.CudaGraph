@@ -10,7 +10,7 @@ namespace VL.Cuda.Core.Graph;
 /// grid configuration, and parameter values in pinned native memory for
 /// the CUDA Graph API.
 /// </summary>
-public sealed class KernelNode : IDisposable
+public sealed class KernelNode : IGraphNode, IDisposable
 {
     private readonly IntPtr _paramBlock;   // array of IntPtr (one per parameter)
     private readonly IntPtr[] _paramSlots; // native alloc per parameter (value storage)

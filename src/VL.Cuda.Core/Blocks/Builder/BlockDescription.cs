@@ -1,6 +1,8 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using ManagedCuda.BasicTypes;
+using VL.Cuda.Core.Graph;
 
 namespace VL.Cuda.Core.Blocks.Builder;
 
@@ -104,6 +106,37 @@ public sealed class AppendOutputPort
 }
 
 /// <summary>
+/// A captured library operation entry in a block description.
+/// Stores the handle ID, descriptor, and capture action needed to recreate the CapturedNode.
+/// </summary>
+public sealed class CapturedEntry
+{
+    public Guid HandleId { get; }
+    public CapturedNodeDescriptor Descriptor { get; }
+    public Action<CUstream, CUdeviceptr[]> CaptureAction { get; }
+
+    public CapturedEntry(Guid handleId, CapturedNodeDescriptor descriptor, Action<CUstream, CUdeviceptr[]> captureAction)
+    {
+        HandleId = handleId;
+        Descriptor = descriptor;
+        CaptureAction = captureAction;
+    }
+
+    /// <summary>
+    /// Structural equality ignores HandleId (changes every construction).
+    /// Compares descriptor debug name and parameter counts.
+    /// </summary>
+    public bool StructuralEquals(CapturedEntry? other)
+    {
+        if (other is null) return false;
+        return Descriptor.DebugName == other.Descriptor.DebugName &&
+               Descriptor.Inputs.Count == other.Descriptor.Inputs.Count &&
+               Descriptor.Outputs.Count == other.Descriptor.Outputs.Count &&
+               Descriptor.Scalars.Count == other.Descriptor.Scalars.Count;
+    }
+}
+
+/// <summary>
 /// Immutable snapshot of a block's structural description.
 /// Used for change detection and graph rebuilding.
 /// </summary>
@@ -113,6 +146,11 @@ public sealed class BlockDescription
     /// Kernel entries in AddKernel order. Each stores HandleId, PTX path, grid dims.
     /// </summary>
     public IReadOnlyList<KernelEntry> KernelEntries { get; }
+
+    /// <summary>
+    /// Captured library operation entries in AddCaptured order.
+    /// </summary>
+    public IReadOnlyList<CapturedEntry> CapturedEntries { get; }
 
     /// <summary>
     /// Port entries: (Name, Direction, PinType) in order.
@@ -134,16 +172,18 @@ public sealed class BlockDescription
         IReadOnlyList<KernelEntry> kernelEntries,
         IReadOnlyList<(string Name, PortDirection Direction, PinType Type)> ports,
         IReadOnlyList<(int SrcKernelIndex, int SrcParam, int TgtKernelIndex, int TgtParam)> internalConnections,
-        IReadOnlyList<AppendBufferInfo>? appendBuffers = null)
+        IReadOnlyList<AppendBufferInfo>? appendBuffers = null,
+        IReadOnlyList<CapturedEntry>? capturedEntries = null)
     {
         KernelEntries = kernelEntries;
         Ports = ports;
         InternalConnections = internalConnections;
         AppendBuffers = appendBuffers ?? Array.Empty<AppendBufferInfo>();
+        CapturedEntries = capturedEntries ?? Array.Empty<CapturedEntry>();
     }
 
     /// <summary>
-    /// Structural equality: same kernels (path + grid), ports, and connections.
+    /// Structural equality: same kernels (path + grid), captured ops, ports, and connections.
     /// HandleIds are ignored — they change every construction.
     /// </summary>
     public bool StructuralEquals(BlockDescription? other)
@@ -152,6 +192,7 @@ public sealed class BlockDescription
         if (ReferenceEquals(this, other)) return true;
 
         if (KernelEntries.Count != other.KernelEntries.Count) return false;
+        if (CapturedEntries.Count != other.CapturedEntries.Count) return false;
         if (Ports.Count != other.Ports.Count) return false;
         if (InternalConnections.Count != other.InternalConnections.Count) return false;
         if (AppendBuffers.Count != other.AppendBuffers.Count) return false;
@@ -159,6 +200,12 @@ public sealed class BlockDescription
         for (int i = 0; i < KernelEntries.Count; i++)
         {
             if (!KernelEntries[i].StructuralEquals(other.KernelEntries[i]))
+                return false;
+        }
+
+        for (int i = 0; i < CapturedEntries.Count; i++)
+        {
+            if (!CapturedEntries[i].StructuralEquals(other.CapturedEntries[i]))
                 return false;
         }
 

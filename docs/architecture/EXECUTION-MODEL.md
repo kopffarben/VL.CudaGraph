@@ -87,9 +87,10 @@ Called every frame:
     cudaEngine.Update()
         │
         ├── 1. IsStructureDirty → ColdRebuild → ClearStructureDirty
-        ├── 2. Else AreParametersDirty → UpdateParameters → ClearParametersDirty
-        ├── 3. If compiled graph exists: Launch + Synchronize
-        └── 4. Distribute DebugInfo to all blocks (BlockState + LastExecutionTime)
+        ├── 2. Else AreCapturedNodesDirty → RecaptureNodes → ClearCapturedNodesDirty
+        ├── 3. Else AreParametersDirty → UpdateParameters → ClearParametersDirty
+        ├── 4. If compiled graph exists: Launch + Synchronize
+        └── 5. Distribute DebugInfo to all blocks (BlockState + LastExecutionTime)
 
 Dispose:
     → Disposes CompiledGraph, owned KernelNodes, stream, CudaContext
@@ -170,7 +171,7 @@ Structural changes (Cold Rebuild) happen during development only. During runtime
 
 ### Dirty Flags
 
-**Current implementation (Phase 2):**
+**Current implementation (Phase 2 + Phase 4a):**
 
 ```csharp
 // CudaContext is a facade — dirty state lives in DirtyTracker
@@ -190,21 +191,35 @@ class CudaContext
 
     // --- Parameter dirty (called by BlockParameter.ValueChanged event wiring) ---
     public void OnParameterChanged(Guid blockId, string paramName);
+
+    // --- CapturedNode dirty (called when a captured node's parameters change) ---
+    public void OnCapturedNodeChanged(Guid blockId, Guid capturedHandleId);
 }
 
 // DirtyTracker (subscribes to Registry + ConnectionGraph events)
 class DirtyTracker
 {
-    public bool IsStructureDirty { get; }    // starts true → first build
-    public bool AreParametersDirty { get; }  // true if any dirty params
+    public bool IsStructureDirty { get; }        // starts true → first build
+    public bool AreCapturedNodesDirty { get; }   // true if any captured nodes need recapture
+    public bool AreParametersDirty { get; }      // true if any dirty params
 
     public void Subscribe(BlockRegistry registry, ConnectionGraph connectionGraph);
     public void MarkParameterDirty(DirtyParameter param);
+    public void MarkCapturedNodeDirty(DirtyCapturedNode node);
     public IReadOnlySet<DirtyParameter> GetDirtyParameters();
-    public void ClearStructureDirty();   // also clears params (rebuild applies all)
+    public IReadOnlySet<DirtyCapturedNode> GetDirtyCapturedNodes();
+    public void ClearStructureDirty();       // also clears params + captured (rebuild applies all)
     public void ClearParametersDirty();
+    public void ClearCapturedNodesDirty();
 }
+
+// Identifies a captured node needing recapture
+public readonly record struct DirtyCapturedNode(Guid BlockId, Guid CapturedHandleId);
 ```
+
+The DirtyTracker now tracks **three levels** of dirty state with strict priority ordering: **Structure > CapturedNodes > Parameters**. `ClearStructureDirty()` clears all three levels since a Cold Rebuild applies all current values. `ClearCapturedNodesDirty()` only clears the recapture set. This ensures that a recapture update does not mask pending parameter changes, and vice versa.
+
+`CudaContext.OnCapturedNodeChanged()` routes to `DirtyTracker.MarkCapturedNodeDirty()` with a `DirtyCapturedNode` record struct that identifies both the block and the specific captured handle that needs recapture.
 
 **Planned additions (Phase 4b):**
 - `IsCodeDirty` / `MarkCodeDirty(Guid blockId)` — patchable kernel recompile tracking
@@ -236,18 +251,23 @@ class BlockBuilder
 
 ### Execution Flow Per Frame
 
-**Current implementation (Phase 2):**
+**Current implementation (Phase 2 + Phase 4a):**
 
 ```csharp
 class CudaEngine
 {
     public void Update()
     {
-        // Priority: Structure > Parameters > Launch
+        // Priority: Structure > CapturedNodes > Parameters > Launch
         if (Context.Dirty.IsStructureDirty)
         {
             ColdRebuild();
             Context.Dirty.ClearStructureDirty();
+        }
+        else if (Context.Dirty.AreCapturedNodesDirty)
+        {
+            RecaptureNodes();
+            Context.Dirty.ClearCapturedNodesDirty();
         }
         else if (Context.Dirty.AreParametersDirty)
         {
@@ -259,7 +279,30 @@ class CudaEngine
         {
             _compiledGraph.Launch(_stream);
             _stream.Synchronize();
+            ReadbackAppendCounters();
             DistributeDebugInfo(BlockState.OK);
+        }
+    }
+
+    private void RecaptureNodes()
+    {
+        if (_compiledGraph == null) return;
+
+        foreach (var dirty in Context.Dirty.GetDirtyCapturedNodes())
+        {
+            // Look up the CapturedNode by (blockId, capturedHandleId) → nodeId
+            if (!_capturedHandleToNodeId.TryGetValue(
+                    (dirty.BlockId, dirty.CapturedHandleId), out var nodeId))
+                continue;
+
+            var capturedNode = FindCapturedNode(nodeId);
+            if (capturedNode == null) continue;
+
+            // Re-stream-capture the operation with current buffer bindings
+            var newGraph = capturedNode.Capture(_stream.Stream);
+
+            // In-place update of the child graph node in the executable graph
+            _compiledGraph.RecaptureNode(nodeId, newGraph);
         }
     }
 
@@ -281,9 +324,8 @@ class CudaEngine
 }
 ```
 
-**Planned additions (Phase 4a+):**
+**Planned additions (Phase 4b+):**
 - `CodeRebuild()` — ILGPU IR recompile → targeted Cold rebuild (Phase 4b)
-- `UpdateDirtyNodes()` — dispatch by node type: KernelNode → Hot/Warm, CapturedNode → Recapture (Phase 4a)
 - `ProfilingPipeline.OnPostLaunch()` — async GPU event readback (Phase 3+)
 - `ReportDiagnostics()` — IVLRuntime integration (Phase 3+)
 

@@ -10,6 +10,7 @@ namespace VL.Cuda.Core.Graph;
 /// <summary>
 /// Wraps a CudaGraphExec (instantiated CUDA graph). Provides launch and
 /// in-place parameter updates (Hot/Warm) without graph rebuild.
+/// Also supports Recapture updates for CapturedNode child graphs.
 /// </summary>
 public sealed class CompiledGraph : IDisposable
 {
@@ -19,6 +20,7 @@ public sealed class CompiledGraph : IDisposable
     private readonly Dictionary<Guid, KernelNode> _kernelNodes;
     private readonly List<GpuBuffer<byte>> _intermediateBuffers;
     private readonly Dictionary<Guid, CUgraphNode> _memsetNodeHandles;
+    private readonly Dictionary<Guid, CUgraphNode> _capturedNodeHandles;
     private bool _disposed;
 
     internal CompiledGraph(
@@ -27,7 +29,8 @@ public sealed class CompiledGraph : IDisposable
         Dictionary<Guid, CUgraphNode> nodeHandles,
         Dictionary<Guid, KernelNode> kernelNodes,
         List<GpuBuffer<byte>> intermediateBuffers,
-        Dictionary<Guid, CUgraphNode>? memsetNodeHandles = null)
+        Dictionary<Guid, CUgraphNode>? memsetNodeHandles = null,
+        Dictionary<Guid, CUgraphNode>? capturedNodeHandles = null)
     {
         _exec = exec;
         _graph = graph;
@@ -35,6 +38,7 @@ public sealed class CompiledGraph : IDisposable
         _kernelNodes = kernelNodes;
         _intermediateBuffers = intermediateBuffers;
         _memsetNodeHandles = memsetNodeHandles ?? new Dictionary<Guid, CUgraphNode>();
+        _capturedNodeHandles = capturedNodeHandles ?? new Dictionary<Guid, CUgraphNode>();
     }
 
     /// <summary>
@@ -111,10 +115,25 @@ public sealed class CompiledGraph : IDisposable
         _exec.SetParams(graphNode, ref nodeParams);
     }
 
+    /// <summary>
+    /// Recapture Update: replace a captured node's child graph in the executable graph.
+    /// Used when a CapturedNode's parameters change and it needs re-stream-capture.
+    /// </summary>
+    internal void RecaptureNode(Guid nodeId, CUgraph newChildGraph)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (!_capturedNodeHandles.TryGetValue(nodeId, out var graphNode))
+            throw new ArgumentException($"Captured node {nodeId} not found in compiled graph");
+
+        StreamCaptureHelper.UpdateChildGraphNode(_exec.Graph, graphNode, newChildGraph);
+    }
+
     internal CudaGraphExec Exec => _exec;
     internal IReadOnlyDictionary<Guid, CUgraphNode> NodeHandles => _nodeHandles;
     internal IReadOnlyList<GpuBuffer<byte>> IntermediateBuffers => _intermediateBuffers;
     internal IReadOnlyDictionary<Guid, CUgraphNode> MemsetNodeHandles => _memsetNodeHandles;
+    internal IReadOnlyDictionary<Guid, CUgraphNode> CapturedNodeHandles => _capturedNodeHandles;
 
     public void Dispose()
     {

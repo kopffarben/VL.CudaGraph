@@ -14,6 +14,11 @@
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="ManagedCuda-13" Version="13.0.*" />
+    <PackageReference Include="ManagedCuda-CUBLAS" Version="13.0.*" />
+    <PackageReference Include="ManagedCuda-CUFFT" Version="13.0.*" />
+    <PackageReference Include="ManagedCuda-CUSPARSE" Version="13.0.*" />
+    <PackageReference Include="ManagedCuda-CURAND" Version="13.0.*" />
+    <PackageReference Include="ManagedCuda-CUSOLVE" Version="13.0.*" />
     <PackageReference Include="System.Text.Json" Version="8.*" />
     <PackageReference Include="VL.Core" Version="2025.7.*" />
   </ItemGroup>

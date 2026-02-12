@@ -11,6 +11,7 @@ namespace VL.Cuda.Core.Graph;
 /// <summary>
 /// Compiles a graph description into an executable CUDA graph.
 /// Phases: validate → topological sort → allocate intermediates → build CUgraph → instantiate.
+/// Supports both KernelNodes (PTX kernels) and CapturedNodes (stream-captured library calls).
 /// </summary>
 public sealed class GraphCompiler
 {
@@ -36,20 +37,26 @@ public sealed class GraphCompiler
         var desc = builder.Build();
         var nodeMap = desc.Nodes.ToDictionary(n => n.Id);
 
-        // 2. Topological sort (Kahn's algorithm)
-        var sortedNodes = TopologicalSort(desc.Nodes, desc.Edges);
+        // 2. Topological sort (Kahn's algorithm) — kernel nodes only
+        var sortedNodes = desc.Nodes.Count > 0
+            ? TopologicalSort(desc.Nodes, desc.Edges)
+            : new List<KernelNode>();
 
         // 3. Allocate intermediate buffers for edges without external buffers
         var intermediateBuffers = new List<GpuBuffer<byte>>();
-        var edgeBuffers = AllocateIntermediateBuffers(desc, intermediateBuffers);
+        var edgeBuffers = desc.Nodes.Count > 0
+            ? AllocateIntermediateBuffers(desc, intermediateBuffers)
+            : new Dictionary<(Guid, int), CUdeviceptr>();
 
         // 4. Wire all buffer pointers into kernel node params
-        WireParameters(desc, edgeBuffers, nodeMap);
+        if (desc.Nodes.Count > 0)
+            WireParameters(desc, edgeBuffers, nodeMap);
 
         // 5. Build CUgraph
         var graph = new ManagedCuda.CudaGraph();
         var graphNodeHandles = new Dictionary<Guid, CUgraphNode>();
         var memsetNodeHandles = new Dictionary<Guid, CUgraphNode>();
+        var capturedNodeHandles = new Dictionary<Guid, CUgraphNode>();
 
         // 5a. Insert memset nodes (e.g., AppendBuffer counter resets)
         foreach (var memset in desc.MemsetDescriptors)
@@ -84,14 +91,40 @@ public sealed class GraphCompiler
             }
         }
 
-        // 5b. Build dependency map: for each node, collect the CUDA graph nodes it depends on
+        // 5b. Capture and insert CapturedNodes as child graph nodes
+        using var captureStream = new CudaStream();
+        foreach (var capturedNode in desc.CapturedNodes)
+        {
+            // Perform stream capture
+            var childGraph = capturedNode.Capture(captureStream.Stream);
+
+            // Collect dependencies for this captured node from CapturedDependencies
+            var deps = new List<CUgraphNode>();
+            foreach (var dep in desc.CapturedDependencies)
+            {
+                if (dep.TargetNodeId == capturedNode.Id)
+                {
+                    // Source must complete before this captured node
+                    if (graphNodeHandles.TryGetValue(dep.SourceNodeId, out var srcHandle))
+                        deps.Add(srcHandle);
+                    if (capturedNodeHandles.TryGetValue(dep.SourceNodeId, out var capSrcHandle))
+                        deps.Add(capSrcHandle);
+                }
+            }
+
+            CUgraphNode[]? depArray = deps.Count > 0 ? deps.ToArray() : null;
+            var childNode = StreamCaptureHelper.AddChildGraphNode(graph.Graph, depArray, childGraph);
+            capturedNodeHandles[capturedNode.Id] = childNode;
+        }
+
+        // 5c. Build dependency map for kernel nodes: for each node, collect the CUDA graph nodes it depends on
         var nodeDependencies = BuildDependencyMap(desc.Edges, sortedNodes);
 
         foreach (var node in sortedNodes)
         {
             var nodeParams = node.BuildNodeParams();
 
-            // Collect all dependencies: edge-based + memset-based
+            // Collect all dependencies: edge-based + memset-based + captured-node-based
             var allDeps = new List<CUgraphNode>();
 
             if (nodeDependencies.TryGetValue(node.Id, out var depIds) && depIds.Count > 0)
@@ -106,16 +139,26 @@ public sealed class GraphCompiler
                 allDeps.AddRange(memsetDeps);
             }
 
-            CUgraphNode[]? deps = allDeps.Count > 0 ? allDeps.ToArray() : null;
+            // Check CapturedDependencies: captured node → this kernel node
+            foreach (var dep in desc.CapturedDependencies)
+            {
+                if (dep.TargetNodeId == node.Id && capturedNodeHandles.TryGetValue(dep.SourceNodeId, out var capHandle))
+                {
+                    allDeps.Add(capHandle);
+                }
+            }
 
-            var graphNode = graph.AddKernelNode(deps, nodeParams);
+            CUgraphNode[]? depsArr = allDeps.Count > 0 ? allDeps.ToArray() : null;
+
+            var graphNode = graph.AddKernelNode(depsArr, nodeParams);
             graphNodeHandles[node.Id] = graphNode;
         }
 
         // 6. Instantiate
         var exec = graph.Instantiate(CUgraphInstantiate_flags.None);
 
-        return new CompiledGraph(exec, graph, graphNodeHandles, nodeMap, intermediateBuffers, memsetNodeHandles);
+        return new CompiledGraph(exec, graph, graphNodeHandles, nodeMap, intermediateBuffers,
+            memsetNodeHandles, capturedNodeHandles);
     }
 
     /// <summary>
@@ -210,7 +253,6 @@ public sealed class GraphCompiler
             }
 
             // Also check if any target already has an external buffer we should use
-            // (This handles the case where the output buffer is externally managed)
             bool foundExternal = false;
             foreach (var edge in group)
             {
@@ -224,12 +266,9 @@ public sealed class GraphCompiler
             if (foundExternal) continue;
 
             // Need to allocate an intermediate buffer
-            // Determine size from the source node's parameter type
             var sourceNode = nodeMap[sourceNodeId];
             var sourceParam = sourceNode.LoadedKernel.Descriptor.Parameters[sourceParamIndex];
 
-            // Use the grid dimensions to estimate element count.
-            // For now, we use GridDimX * BlockDimX as the element count (1D assumption).
             int elementCount = (int)(sourceNode.GridDimX * sourceNode.BlockDimX);
             int elementSize = GetElementSize(sourceParam.Type);
             int totalBytes = elementCount * elementSize;
@@ -246,33 +285,30 @@ public sealed class GraphCompiler
     }
 
     /// <summary>
-    /// Wire buffer pointers into kernel node parameters:
-    /// - External buffers → set directly
-    /// - Edge buffers → set source output and target input to same pointer
+    /// Wire buffer pointers into kernel node parameters.
     /// </summary>
     private void WireParameters(
         GraphDescription desc,
         Dictionary<(Guid, int), CUdeviceptr> edgeBuffers,
         Dictionary<Guid, KernelNode> nodeMap)
     {
-        // First, set all external buffers
+        // First, set all external buffers (for kernel nodes only)
         foreach (var kvp in desc.ExternalBuffers)
         {
             var (nodeId, paramIndex) = kvp.Key;
-            nodeMap[nodeId].SetPointer(paramIndex, kvp.Value);
+            if (nodeMap.TryGetValue(nodeId, out var node))
+                node.SetPointer(paramIndex, kvp.Value);
         }
 
-        // Then, wire edge buffers: source output and all target inputs share the same pointer
+        // Then, wire edge buffers
         foreach (var edge in desc.Edges)
         {
             var key = (edge.SourceNodeId, edge.SourceParamIndex);
             if (edgeBuffers.TryGetValue(key, out var ptr))
             {
-                // Set source output (if not already set by external buffer)
                 if (!desc.ExternalBuffers.ContainsKey(key))
                     nodeMap[edge.SourceNodeId].SetPointer(edge.SourceParamIndex, ptr);
 
-                // Set target input (if not already set by external buffer)
                 var targetKey = (edge.TargetNodeId, edge.TargetParamIndex);
                 if (!desc.ExternalBuffers.ContainsKey(targetKey))
                     nodeMap[edge.TargetNodeId].SetPointer(edge.TargetParamIndex, ptr);

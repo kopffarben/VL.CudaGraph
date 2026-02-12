@@ -222,7 +222,7 @@ internal class NvrtcCache
 
 ## Source 3: Library Calls (CapturedNode)
 
-Library Calls are invocations of NVIDIA libraries (cuBLAS, cuFFT, cuDNN, cuRAND, NPP) that cannot be expressed as explicit kernel nodes. These libraries use internal, opaque kernels that are invisible to the CUDA Graph API.
+Library Calls are invocations of NVIDIA libraries (cuBLAS, cuFFT, cuSPARSE, cuRAND, cuSOLVER) that cannot be expressed as explicit kernel nodes. These libraries use internal, opaque kernels that are invisible to the CUDA Graph API. The current implementation provides wrappers for all five libraries with `CapturedNode` serving as the graph node type and `CapturedNodeDescriptor` describing the parameter layout.
 
 **Integration mechanism:** Stream Capture wraps the library call into a ChildGraphNode.
 
@@ -244,19 +244,31 @@ Graph:       CapturedNode (ChildGraphNode in CUDA Graph)
 
 **BlockBuilder usage:**
 ```csharp
-var op = builder.AddCaptured("MatMul", stream =>
+var descriptor = new CapturedNodeDescriptor("cuBLAS.Sgemm",
+    inputs: new[] { CapturedParam.Pointer("A", "float*"), CapturedParam.Pointer("B", "float*") },
+    outputs: new[] { CapturedParam.Pointer("C", "float*") });
+
+var op = builder.AddCaptured((stream, buffers) =>
 {
-    cublasSetStream(handle, stream);
-    cublasSgemm(handle, CUBLAS_OP_N, CUBLAS_OP_N,
-                M, N, K, alpha, A, lda, B, ldb, beta, C, ldc);
-}, new CapturedOpDescriptor
-{
-    DebugName = "cuBLAS_Sgemm",
-    Inputs = new[] { ("A", typeof(float)), ("B", typeof(float)) },
-    Outputs = new[] { ("C", typeof(float)) },
-    Scalars = new[] { ("M", typeof(int)), ("N", typeof(int)), ("K", typeof(int)),
-                      ("Alpha", typeof(float)), ("Beta", typeof(float)) }
-});
+    // buffers layout: [A, B, C] (inputs first, then outputs, then scalars)
+    var blas = libs.GetOrCreateBlas();
+    blas.Stream = stream;
+    CudaBlasNativeMethods.cublasSgemm_v2(blas.CublasHandle, transA, transB,
+        m, n, k, ref alpha, buffers[0], lda, buffers[1], ldb, ref beta, buffers[2], ldc);
+}, descriptor);
+
+// Bind block ports to captured operation parameters
+builder.Input<float>("A", op.In(0));    // CapturedPin → flat index 0
+builder.Input<float>("B", op.In(1));    // CapturedPin → flat index 1
+builder.Output<float>("C", op.Out(0));  // CapturedPin → flat index 2
+```
+
+**Or use the high-level BlasOperations wrapper:**
+```csharp
+var sgemm = BlasOperations.Sgemm(builder, libs, m: 128, n: 128, k: 128);
+builder.Input<float>("A", sgemm.In(0));
+builder.Input<float>("B", sgemm.In(1));
+builder.Output<float>("C", sgemm.Out(0));
 ```
 
 ### Patchable CapturedNode (Chained Library Calls)
@@ -284,25 +296,27 @@ Graph:       CapturedNode (ChildGraphNode) — one node, multiple ops inside
 
 **BlockBuilder usage:**
 ```csharp
-var chain = builder.AddCaptured("MatMulFFT", stream =>
+var descriptor = new CapturedNodeDescriptor("MatMulFFT_Chain",
+    inputs: new[] { CapturedParam.Pointer("A", "float*"), CapturedParam.Pointer("B", "float*") },
+    outputs: new[] { CapturedParam.Pointer("Result", "float2*") });
+
+var chain = builder.AddCaptured((stream, buffers) =>
 {
     // Step 1: Matrix multiply
-    cublasSetStream(blasHandle, stream);
-    cublasSgemm(blasHandle, ..., A, B, temp1);
+    var blas = libs.GetOrCreateBlas();
+    blas.Stream = stream;
+    CudaBlasNativeMethods.cublasSgemm_v2(blas.CublasHandle, ...,
+        buffers[0], ..., buffers[1], ..., temp1, ...);
 
-    // Step 2: Scale result
-    cublasSgeam(blasHandle, ..., temp1, temp2);
+    // Step 2: FFT
+    var plan = libs.GetOrCreateFFT1D(nx, cufftType.C2C);
+    CudaFFTNativeMethods.cufftSetStream(plan.Handle, stream);
+    plan.Exec(temp1, buffers[2], TransformDirection.Forward);
+}, descriptor);
 
-    // Step 3: FFT
-    cufftSetStream(fftPlan, stream);
-    cufftExecC2C(fftPlan, temp2, result, CUFFT_FORWARD);
-}, new CapturedOpDescriptor
-{
-    DebugName = "MatMulFFT_Chain",
-    Inputs = new[] { ("A", typeof(float)), ("B", typeof(float)) },
-    Outputs = new[] { ("Result", typeof(float)) },
-    Scalars = new[] { ("M", typeof(int)), ("N", typeof(int)), ("K", typeof(int)) }
-});
+builder.Input<float>("A", chain.In(0));
+builder.Input<float>("B", chain.In(1));
+builder.Output<float>("Result", chain.Out(0));
 ```
 
 **From VL's perspective:** One block with Inputs (A, B) and Output (Result). The internal chain is invisible — it's a patchable expression that compiles to a single CapturedNode.
@@ -320,37 +334,74 @@ var chain = builder.AddCaptured("MatMulFFT", stream =>
 
 ### Stream Capture Helper
 
-ManagedCuda exposes the stream capture P/Invoke bindings in `DriverAPINativeMethods.Streams` but does not wrap them in the `CudaStream` class. We use a thin internal helper:
+ManagedCuda exposes the stream capture P/Invoke bindings in `DriverAPINativeMethods.Streams` but does not wrap them in the `CudaStream` class. `StreamCaptureHelper` is a thin internal static class that wraps stream capture, child graph node insertion, and recapture update:
 
 ```csharp
 internal static class StreamCaptureHelper
 {
-    public static CUgraph CaptureToGraph(CUstream stream, Action<CUstream> work)
-    {
-        DriverAPINativeMethods.Streams.cuStreamBeginCapture(
-            stream, CUstreamCaptureMode.Relaxed);
+    // Capture a work action between Begin/EndCapture. Caller owns the returned CUgraph.
+    public static CUgraph CaptureToGraph(CUstream stream, Action<CUstream> work);
 
-        work(stream);
+    // Destroy a CUgraph returned from CaptureToGraph.
+    public static void DestroyGraph(CUgraph graph);
 
-        CUgraph graph = default;
-        DriverAPINativeMethods.Streams.cuStreamEndCapture(stream, ref graph);
-        return graph;
-    }
+    // Add a child graph node to a parent graph (used by GraphCompiler).
+    public static CUgraphNode AddChildGraphNode(
+        CUgraph parentGraph, CUgraphNode[]? dependencies, CUgraph childGraph);
+
+    // Update a child graph node in an executable graph (Recapture update).
+    public static void UpdateChildGraphNode(
+        CUgraphExec exec, CUgraphNode node, CUgraph newChildGraph);
 }
 ```
 
+Error handling: if the work action throws during capture, `StreamCaptureHelper` still calls `cuStreamEndCapture` and destroys the discarded graph to leave the stream in a valid state before re-throwing.
+
 ### Library Handle Caching
 
-Library handles (cublasHandle_t, cufftHandle, etc.) are expensive to create. They are cached per CudaContext:
+Library handles (cublasHandle_t, cufftHandle, etc.) are expensive to create. `LibraryHandleCache` provides lazy-initialized per-CudaContext caching for five CUDA library handle types:
 
 ```csharp
-internal class LibraryHandleCache
+public sealed class LibraryHandleCache : IDisposable
 {
-    private ConcurrentDictionary<Type, object> _handles;
+    // cuBLAS — single handle, reused across all BLAS operations
+    public CudaBlas GetOrCreateBlas();
 
-    public cublasHandle GetOrCreateBlas(CUstream stream);
-    public cufftHandle GetOrCreateFFT(CUstream stream, int size, cufftType type);
+    // cuFFT — plans cached by (nx, type, batch) since they are configuration-dependent
+    public CudaFFTPlan1D GetOrCreateFFT1D(int nx, cufftType type, int batch = 1);
+
+    // cuSPARSE — single context handle
+    public CudaSparseContext GetOrCreateSparse();
+
+    // cuRAND — device generator handle
+    public CudaRandDevice GetOrCreateRand(GeneratorType type = GeneratorType.PseudoDefault);
+
+    // cuSOLVER — dense solver handle
+    public CudaSolveDense GetOrCreateSolveDense();
 }
+```
+
+Each handle is created on first access and disposed when the cache is disposed. The cache is owned by `CudaContext` and shares the lifetime of the CUDA pipeline.
+
+### Library Operation Wrappers
+
+High-level static wrapper classes produce `CapturedHandle` entries that can be used directly with `BlockBuilder`:
+
+| Class | Operations | Library |
+|-------|-----------|---------|
+| `BlasOperations` | Sgemm, Dgemm, Sgemv, Sscal | cuBLAS |
+| `FftOperations` | Forward1D, Inverse1D, R2C1D, C2R1D | cuFFT |
+| `SparseOperations` | SpMV | cuSPARSE |
+| `RandOperations` | GenerateUniform, GenerateNormal | cuRAND |
+| `SolveOperations` | Sgetrf, Sgetrs | cuSOLVER |
+
+Each wrapper method takes a `BlockBuilder` and `LibraryHandleCache`, constructs the `CapturedNodeDescriptor`, and returns a `CapturedHandle` ready for port binding. Example:
+
+```csharp
+var sgemm = BlasOperations.Sgemm(builder, libs, m: 128, n: 128, k: 128);
+builder.Input<float>("A", sgemm.In(0));
+builder.Input<float>("B", sgemm.In(1));
+builder.Output<float>("C", sgemm.Out(0));
 ```
 
 ### PointerMode Requirement
@@ -404,38 +455,46 @@ Production particle system?                 → Filesystem PTX (Triton, pre-comp
 Both node types (with both variants) live in the same block system and graph compiler:
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  BlockBuilder                                                │
-│                                                              │
-│  .AddKernel(ptxPath, entry)       → KernelNodeDescriptor     │  Static KernelNode
-│  .AddKernel(ilgpuModule, entry)   → KernelNodeDescriptor     │  Patchable KernelNode
-│  .AddKernel(nvrtcModule, entry)   → KernelNodeDescriptor     │  User CUDA C++ (escape-hatch)
-│  .AddCaptured(name, action)       → CapturedNodeDescriptor   │  Static CapturedNode
-│  .AddCaptured(name, chainAction)  → CapturedNodeDescriptor   │  Patchable CapturedNode
-│                                                              │
-│  All produce INodeDescriptor → Graph Compiler handles all    │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  BlockBuilder                                                     │
+│                                                                   │
+│  .AddKernel(ptxPath)                       → KernelHandle         │  Static KernelNode
+│  .AddKernel(ilgpuModule, entry)            → KernelHandle         │  Patchable KernelNode *(4b)*
+│  .AddKernel(nvrtcModule, entry)            → KernelHandle         │  User CUDA C++ *(4b)*
+│  .AddCaptured(action, descriptor)          → CapturedHandle       │  Static CapturedNode
+│  .AddCaptured(chainAction, descriptor)     → CapturedHandle       │  Patchable CapturedNode
+│                                                                   │
+│  KernelHandle.In()/Out()       → KernelPin    (kernel param ref)  │
+│  CapturedHandle.In()/Out()/Scalar() → CapturedPin (flat index)    │
+│                                                                   │
+│  Both handle types → IGraphNode → Graph Compiler handles all      │
+└─────────────────────────────────────────────────────────────────┘
          │
          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Graph Compiler                                              │
-│                                                              │
-│  Phase 1-5: Same for all (validation, alloc, topo, shape,   │
-│             liveness)                                        │
-│  Phase 5.5: Stream Capture — only for CapturedNodes          │
-│  Phase 6:   CUDA Build — KernelNode via cuGraphAddKernelNode │
-│                          CapturedNode via AddChildGraphNode  │
-│  Phase 7:   Instantiate — same for all                       │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Graph Compiler                                                   │
+│                                                                   │
+│  Phase 1-4: Same for all (validation, alloc, topo, memset)        │
+│  Phase 5b:  Stream Capture — CapturedNodes on dedicated stream    │
+│             CapturedNode.Capture(stream) → AddChildGraphNode      │
+│  Phase 5c:  Kernel node deps can reference captured node handles  │
+│  Phase 6:   CUDA Build — KernelNode via cuGraphAddKernelNode      │
+│  Phase 7:   Instantiate — same for all                            │
+│                                                                   │
+│  CompiledGraph stores capturedNodeHandles: Dict<Guid, CUgraphNode>│
+└─────────────────────────────────────────────────────────────────┘
          │
          ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Dirty Tracking                                              │
-│                                                              │
-│  KernelNode:    Hot → Warm → Code → Cold                     │
-│  CapturedNode:  Recapture → Cold                             │
-│                                                              │
-│  Both managed by the same DirtyTracker, dispatched by        │
-│  CudaEngine based on node type.                              │
-└─────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  Dirty Tracking (DirtyTracker — three levels)                     │
+│                                                                   │
+│  Priority:     Structure > CapturedNodes > Parameters             │
+│                                                                   │
+│  KernelNode:    Hot → Warm → Code → Cold                          │
+│  CapturedNode:  Recapture → Cold                                  │
+│                                                                   │
+│  DirtyTracker.AreCapturedNodesDirty → CudaEngine.RecaptureNodes() │
+│  Both managed by the same DirtyTracker, dispatched by             │
+│  CudaEngine based on node type.                                   │
+└─────────────────────────────────────────────────────────────────┘
 ```
