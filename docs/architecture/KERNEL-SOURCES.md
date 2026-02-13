@@ -587,6 +587,60 @@ Production particle system?                 → Filesystem PTX (Triton, pre-comp
 
 ---
 
+## Device Graph Launch & Dispatch Indirect *(Phase 6 — planned)*
+
+> **Prerequisite:** Conditional Nodes (Phase 3.2). See `GRAPH-COMPILER.md` for the full three-level design.
+
+Device Graph Launch enables GPU kernels to control graph execution — including dynamically setting grid dimensions of other kernel nodes. This is the CUDA equivalent of DX11/DX12 **DispatchIndirect**.
+
+### ManagedCuda API Coverage (Verified)
+
+All required host-side APIs are present in ManagedCuda 13.0:
+
+| API | Purpose |
+|-----|---------|
+| `CUgraphInstantiate_flags.DeviceLaunch` | Enable device-side graph launch |
+| `cuGraphInstantiateWithParams()` | Instantiate with DeviceLaunch flag |
+| `cuGraphUpload()` | Upload graph to device after device-side modifications |
+| `CUlaunchAttributeID.DeviceUpdatableKernelNode` | Mark kernel as updateable from device |
+| `CUgraphDeviceNode` | Opaque handle passed to device kernels |
+| `cuGraphConditionalHandleCreate()` | Conditional control from device |
+| `CUgraphConditionalNodeType.If/While/Switch` | All conditional types |
+
+Device-side APIs (`cudaGraphLaunch`, `cudaGraphKernelNodeSetParam`, `cudaGraphSetConditional`) are **PTX intrinsics** called from within kernel code — they do not need .NET bindings.
+
+### Impact on Kernel Sources
+
+Device-updatable nodes and conditional handles affect all three kernel sources:
+
+| Source | Device Graph Impact |
+|--------|-------------------|
+| **Filesystem PTX** | PTX author includes `cudaGraphKernelNodeSetParam` / `cudaGraphSetConditional` intrinsics directly |
+| **Patchable Kernel (ILGPU)** | Dispatcher kernel is a special built-in PTX (not user-patchable). Target kernels are marked device-updatable via launch attributes |
+| **Library Call (CapturedNode)** | CapturedNodes inside conditional bodies — entire body is skipped/executed based on device-side condition |
+
+### New Node Type: DispatcherNode *(Phase 6)*
+
+A DispatcherNode is a specialized KernelNode that reads a GPU counter and sets the grid dimensions of a target kernel node. It bridges AppendBuffer output (variable count) with the next processing stage (exact thread count).
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  DispatcherNode (built-in PTX, device-updatable)         │
+│                                                          │
+│  Input:  uint* counter   (GPU pointer from AppendBuffer) │
+│  Input:  CUgraphDeviceNode targetNode                    │
+│  Param:  uint blockSize  (256 default)                   │
+│                                                          │
+│  PTX body:                                               │
+│    gridDim = ceil(*counter / blockSize)                   │
+│    cudaGraphKernelNodeSetParam(targetNode, gridDim, ...) │
+└─────────────────────────────────────────────────────────┘
+```
+
+This is a **system-provided kernel** — users don't write it. It's part of the VL.Cuda runtime.
+
+---
+
 ## Architecture Integration
 
 Both node types (with both variants) live in the same block system and graph compiler:

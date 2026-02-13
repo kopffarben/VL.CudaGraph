@@ -317,6 +317,191 @@ Timing data is collected by CudaEngine and distributed to blocks as DebugInfo.
 
 ---
 
+## Device Graph Launch & Dispatch Indirect *(Phase 6 — planned)*
+
+> **Note:** This section describes planned architecture for device-side graph control. It requires Conditional Nodes (Phase 3.2) as a prerequisite. All ManagedCuda APIs referenced below have been verified present in the NuGet package (CUDA 13.0).
+
+### The Problem: Dynamic Work Counts
+
+Many GPU patterns produce variable-length output (particle emission, stream compaction, spatial queries). The next kernel needs to process only the *active* elements — but the count lives on the GPU, not the CPU. Reading it back would stall the pipeline.
+
+```
+Frame:
+  Kernel 1: Emit → AppendBuffer (counter = 4231 on GPU)
+  Kernel 2: Forces → needs grid = ceil(4231 / 256) ... but 4231 is on GPU!
+```
+
+### Three Levels of Solution
+
+#### Level 1: Max-Grid + Early Return (Phase 3 — no special API)
+
+The simplest approach. Always launch with maximum grid size; threads beyond the active count exit immediately:
+
+```
+Kernel: forces(float4* particles, uint* counter, ...)
+{
+    uint idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= *counter) return;    // ← counter is a GPU pointer
+    // ... process only active elements
+}
+```
+
+- Grid = MaxCapacity / BlockSize (always the same, statically known)
+- Counter passed as **pointer parameter** (not readback value)
+- Wastes threads but GPU scheduler handles early-exit efficiently
+- Works within the existing CUDA Graph framework — no special APIs
+- Sufficient for up to ~1M elements; beyond that, wasted warps become measurable
+
+**VL user sees:** AppendBuffer's Counter Buffer exposed as a pointer pin that connects to the next block's Count input.
+
+```
+┌──────────────────┐         ┌──────────────────┐
+│ Emitter          │         │ Forces           │
+│                  │         │                  │
+│    Particles ○───┼────────▶┼─ Particles       │
+│    Counter   ○───┼────────▶┼─ Active Count    │  ← GPU pointer, not CPU uint
+└──────────────────┘         └──────────────────┘
+```
+
+#### Level 2: Conditional Nodes (Phase 3.2 — `cuGraphConditionalHandleCreate`)
+
+Conditional nodes allow GPU kernels to control graph execution flow. A "condition writer" kernel sets a condition handle that gates whether a body graph executes.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Conditional Handle (GPU-writable)                             │
+│                                                               │
+│  Kernel 1: Emit → AppendBuffer (counter = N)                 │
+│                                                               │
+│  Kernel 2: SetCondition                                       │
+│    cudaGraphSetConditional(handle, counter > 0 ? 1 : 0)      │
+│                                                               │
+│  IF (handle != 0)                                             │
+│    Kernel 3: Forces (grid = MaxCapacity / 256)                │
+│    Kernel 4: Integrate                                         │
+│  END IF                                                        │
+└──────────────────────────────────────────────────────────────┘
+```
+
+ManagedCuda APIs available:
+- `CudaGraph.CreateConditionalHandle(ctx, defaultValue, flags)` → `CUgraphConditionalHandle`
+- `CUgraphConditionalNodeType.If` / `.While` / `.Switch`
+- `CudaConditionalNodeParams` struct with handle, type, size, body graphs
+
+The `cudaGraphSetConditional(handle, value)` call is a **device-side API** — called from within the PTX kernel, not from .NET. This means condition-writer kernels must include this intrinsic in their PTX.
+
+#### Level 3: Device-Updatable Nodes + True Dispatch Indirect *(Phase 6 — planned)*
+
+The full solution: a GPU kernel dynamically sets the grid dimensions of a subsequent kernel node, achieving true dispatch indirect without any CPU involvement.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│ Graph instantiated with DeviceLaunch flag                     │
+│                                                               │
+│  Kernel 1: Emit → AppendBuffer (counter = 4231)              │
+│                                                               │
+│  Kernel 2: "Dispatcher" (device-updatable)                    │
+│    → reads counter from GPU                                   │
+│    → calls cudaGraphKernelNodeSetParam(devNode, gridDim, ...) │
+│    → sets Forces grid to ceil(4231 / 256) = 17                │
+│                                                               │
+│  Kernel 3: Forces (device-updatable, grid = dynamically set!) │
+│    → launches with exactly 17 blocks × 256 threads            │
+│    → zero wasted threads                                       │
+│                                                               │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**ManagedCuda APIs (verified present):**
+
+| API | Location | Purpose |
+|-----|----------|---------|
+| `CUgraphInstantiate_flags.DeviceLaunch = 4` | BasicTypes.cs | Instantiate for device-side launch |
+| `cuGraphInstantiateWithParams()` | DriverAPI.cs | Instantiate with flags + upload stream |
+| `cuGraphUpload()` | DriverAPI.cs | Upload modified graph to device memory |
+| `CUlaunchAttributeID.DeviceUpdatableKernelNode = 13` | BasicTypesEnum.cs | Mark kernel as device-updatable |
+| `CUgraphDeviceNode` | BasicTypesStructAsTypes.cs | Opaque handle for device-side updates |
+
+**Device-side APIs (called from PTX, NOT from .NET):**
+
+| API | Purpose |
+|-----|---------|
+| `cudaGraphLaunch(exec)` | Launch graph from device kernel |
+| `cudaGraphKernelNodeSetParam(devNode, ...)` | Update kernel node params from device |
+| `cudaGraphSetConditional(handle, value)` | Set conditional from device |
+
+**Restrictions for DeviceLaunch graphs:**
+- All nodes must reside on a **single CUcontext** (already our constraint)
+- Allowed node types: kernel, memcpy, memset, child graph, conditional
+- No CUDA Dynamic Parallelism inside kernel nodes
+- Must call `cuGraphUpload()` after device-side modifications before next launch
+- Device-updatable nodes cannot be removed or copied
+- Graph does not support multiple instantiation
+
+**Implementation approach:**
+
+```csharp
+// GraphCompiler — Phase 6 addition
+if (options.EnableDeviceLaunch)
+{
+    // 1. Mark dispatcher + target kernels as device-updatable via launch attributes
+    // 2. Instantiate with DeviceLaunch flag
+    var instantiateParams = new CudaGraphInstantiateParams
+    {
+        flags = (ulong)CUgraphInstantiate_flags.DeviceLaunch,
+        hUploadStream = stream.Stream
+    };
+    var exec = graph.Instantiate(ref instantiateParams);
+
+    // 3. After device-side updates, upload before launch
+    exec.Upload(stream);
+    exec.Launch(stream);
+}
+```
+
+**VL user sees (Author level):** A `DispatchIndirect` block that takes a Counter pointer and a target block, automatically wiring the dispatcher kernel:
+
+```
+┌──────────────────┐     ┌───────────────────┐     ┌──────────────────┐
+│ Emitter          │     │ DispatchIndirect   │     │ Forces           │
+│                  │     │                    │     │                  │
+│    Particles ○───┼────▶┼─ Buffer            │────▶┼─ Particles       │
+│    Counter   ○───┼────▶┼─ Count             │     │                  │
+└──────────────────┘     │    Block Size: 256 │     └──────────────────┘
+                         └───────────────────┘
+```
+
+### Comparison
+
+| Aspect | Level 1: Max-Grid | Level 2: Conditional | Level 3: Device-Updatable |
+|--------|-------------------|---------------------|--------------------------|
+| **API complexity** | None | Medium | High |
+| **Wasted threads** | Yes (early return) | Reduced (skip entire body) | None |
+| **Grid size** | Static (max) | Static (max in body) | Dynamic (exact) |
+| **CPU involvement** | None | None | None |
+| **PTX requirement** | Standard kernel | `cudaGraphSetConditional` intrinsic | `cudaGraphKernelNodeSetParam` intrinsic |
+| **Phase** | 3 (now) | 3.2 (conditional nodes) | 6 (future) |
+| **Sweet spot** | < 1M elements | Skip/don't-skip decisions | > 1M elements, zero waste |
+
+### Interaction with AppendBuffer
+
+AppendBuffer currently exposes two outputs: the data buffer and a CPU-readback count. For dispatch indirect, the counter buffer must also be accessible as a GPU pointer:
+
+```
+┌───────────────────────┐
+│  Emitter              │
+│                       │
+│       Particles ○──── │  GpuBuffer<Particle>  (data pointer)
+│  Particles Count ○─── │  uint (CPU readback, for tooltip/debug)
+│  Counter Buffer  ○─── │  GpuBuffer<uint>      (GPU pointer, for dispatch indirect)
+│                       │
+└───────────────────────┘
+```
+
+The Counter Buffer pin enables zero-readback chains: Emit → Forces → Integrate all use the GPU counter directly. The CPU readback Count pin remains available for debugging/display but is not on the critical path.
+
+---
+
 ## Error Handling
 
 Errors during compilation are caught by CudaEngine and distributed to affected blocks. The engine does not crash — it shows errors as tooltips and keeps the old compiled graph if available.

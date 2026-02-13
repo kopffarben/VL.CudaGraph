@@ -88,6 +88,12 @@ Filesystem PTX can be produced by any toolchain:
 1. Read `docs/architecture/GRAPHICS-INTEROP.md` — DX11/Stride sharing
 2. Implement: CUDA-DX11 buffer/texture sharing
 
+### Phase 6: Device Graph Launch & Dispatch Indirect
+1. Read `docs/architecture/GRAPH-COMPILER.md#device-graph-launch--dispatch-indirect` — Three levels of dynamic work
+2. Implement: AppendBuffer Counter as GPU pointer pin
+3. Implement: DispatcherNode (built-in PTX, reads counter, sets target grid via `cudaGraphKernelNodeSetParam`)
+4. Implement: DeviceLaunch graph instantiation + `cuGraphUpload()` integration
+
 ## Documentation Structure
 
 ```
@@ -161,6 +167,10 @@ src/
 | KernelSource discriminated union | FilesystemPtx / IlgpuMethod / NvrtcSource — clean dispatch in CudaEngine.LoadKernelFromSource |
 | Code dirty → Cold Rebuild | Simplest correct behavior; partial rebuild is future optimization |
 | LibraryHandleCache per CudaContext | Lazy-init expensive library handles (cuBLAS, cuFFT, etc.) — cached by config key for FFT plans |
+| Three-level dispatch indirect | Level 1: Max-Grid+early-return (Phase 3), Level 2: Conditional Nodes (Phase 3.2), Level 3: Device-updatable nodes (Phase 6) |
+| DispatcherNode as system-provided PTX | Built-in kernel reads GPU counter + calls `cudaGraphKernelNodeSetParam` — users don't write it |
+| DeviceLaunch flag for Phase 6 only | Normal graphs don't pay DeviceLaunch restrictions; opt-in when DispatcherNode is present |
+| ManagedCuda Device Graph APIs verified | All host-side APIs present (DeviceLaunch flag, cuGraphUpload, DeviceUpdatableKernelNode, ConditionalHandle). Device-side APIs are PTX intrinsics |
 
 ## Execution Model Summary
 

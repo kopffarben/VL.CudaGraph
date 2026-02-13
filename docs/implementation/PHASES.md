@@ -18,6 +18,8 @@ Phase 4a: Library Calls (Stream Capture)
 Phase 4b: Patchable Kernels (ILGPU IR + NVRTC escape-hatch)
     ↓
 Phase 5: Graphics Interop
+    ↓
+Phase 6: Device Graph Launch & Dispatch Indirect
 ```
 
 ---
@@ -535,6 +537,87 @@ shared.UnmapFromCuda();
 1. DX11 buffer sharing
 2. DX11 texture sharing
 3. Full pipeline: CUDA compute → Stride render
+
+---
+
+## Phase 6: Device Graph Launch & Dispatch Indirect
+
+**Goal**: Device-side graph control — GPU kernels dynamically set grid dimensions and control flow, enabling true dispatch indirect without CPU involvement.
+
+**Prerequisites**: Phase 3.2 (Conditional Nodes), Phase 5 (Graphics Interop — optional but recommended)
+
+> See `GRAPH-COMPILER.md` and `KERNEL-SOURCES.md` for the full architecture design.
+
+### Motivation
+
+Many GPU patterns produce variable-length output (particle emission, stream compaction, spatial queries). Without dispatch indirect, subsequent kernels must either (a) launch with max grid size and waste threads, or (b) read the count back to CPU causing a pipeline stall. Device Graph Launch eliminates both problems.
+
+### Tasks
+
+| Task | Description | Depends On |
+|------|-------------|------------|
+| 6.1 | AppendBuffer Counter Buffer as GPU pointer pin (expose `GpuBuffer<uint>` alongside CPU readback) | Phase 3.1 |
+| 6.2 | Device-updatable kernel node launch attributes (`CUlaunchAttributeID.DeviceUpdatableKernelNode`) | 6.1 |
+| 6.3 | DeviceLaunch graph instantiation (`CUgraphInstantiate_flags.DeviceLaunch`) | 6.2 |
+| 6.4 | `cuGraphUpload()` integration in CudaEngine after device-side modifications | 6.3 |
+| 6.5 | DispatcherNode — built-in PTX kernel that reads counter + calls `cudaGraphKernelNodeSetParam` | 6.3 |
+| 6.6 | BlockBuilder.AddDispatcher(counterPin, targetKernel, blockSize) | 6.5 |
+| 6.7 | GraphCompiler: detect DispatcherNode → mark target as device-updatable → DeviceLaunch instantiation | 6.6 |
+| 6.8 | VL `DispatchIndirect` node (Consumer level — connects AppendBuffer counter to next block) | 6.7 |
+| 6.9 | Integration tests: Emit → DispatchIndirect → Forces → Integrate chain | 6.8 |
+| 6.10 | Performance benchmark: Max-Grid vs Conditional vs DispatchIndirect at various element counts | 6.9 |
+
+### Deliverables
+
+```csharp
+// Should work:
+
+// Level 1 (Phase 3, already possible): Max-Grid + Counter Pointer
+var kernel = builder.AddKernel("forces.ptx");
+builder.Input<float4>("Particles", kernel.In(0));
+builder.Input<uint>("ActiveCount", kernel.In(1));    // GPU pointer to counter
+kernel.GridDimX = maxParticles / 256;                // always max
+
+// Level 3 (Phase 6): True Dispatch Indirect
+var emit = builder.AddKernel("emit.ptx");
+var forces = builder.AddKernel("forces.ptx");
+var dispatcher = builder.AddDispatcher(
+    counterPin: emit.AppendCounter(),   // GPU counter from AppendBuffer
+    targetKernel: forces,               // kernel whose grid will be set dynamically
+    blockSize: 256);
+// GraphCompiler handles: DeviceLaunch flag, device-updatable attributes, Upload()
+```
+
+### Key Constraints
+
+- All nodes must be on a **single CUcontext** (already our constraint)
+- No CUDA Dynamic Parallelism inside device-updatable kernels
+- Device-updatable nodes **cannot be removed** from the graph
+- Graph with DeviceLaunch flag does **not support multiple instantiation**
+- Must call `cuGraphUpload()` before launch after device-side modifications
+- DispatcherNode PTX is a **system-provided kernel** (not user-written)
+
+### ManagedCuda APIs (Verified Present)
+
+| API | Status |
+|-----|--------|
+| `CUgraphInstantiate_flags.DeviceLaunch` | Present |
+| `cuGraphInstantiateWithParams()` | Present |
+| `cuGraphUpload()` | Present + managed wrapper |
+| `CUlaunchAttributeID.DeviceUpdatableKernelNode` | Present |
+| `CUgraphDeviceNode` | Present |
+| `cuGraphConditionalHandleCreate()` | Present + managed wrapper |
+| Device-side APIs (PTX intrinsics) | N/A (called from kernel code) |
+
+### Success Criteria
+
+- [ ] AppendBuffer Counter exposed as GPU pointer pin
+- [ ] DispatcherNode PTX kernel reads counter + sets target grid
+- [ ] DeviceLaunch instantiation works with mixed graphs (kernel + captured + dispatcher)
+- [ ] `cuGraphUpload()` called automatically by CudaEngine
+- [ ] VL DispatchIndirect node connects AppendBuffer → next processing block
+- [ ] Zero CPU readback in Emit → Forces → Integrate chain
+- [ ] Performance improvement measurable at > 100K elements vs Max-Grid approach
 
 ---
 
