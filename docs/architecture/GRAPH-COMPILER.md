@@ -25,6 +25,9 @@ CudaEngine.Update() detects structureDirty
     │  ─── Planned ───────────────────── │
     │  Shape Propagation                   │  ← Phase 3 (planned)
     │  Liveness Analysis                   │  ← Phase 3 (planned)
+    │  GridSize Auto Resolution            │  ← Phase 3 (planned)
+    │  FrameDelay Buffer Allocation        │  ← Phase 3 (planned)
+    │  Implicit Buffer Dependencies        │  ← Phase 3 (planned)
     │                                      │
     └─────────────────────────────────────┘
          │

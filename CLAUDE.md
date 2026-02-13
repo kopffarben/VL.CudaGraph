@@ -105,6 +105,7 @@ docs/
     CORE-RUNTIME.md                    ← Buffer, Context, Stream
     GRAPH-COMPILER.md                  ← Graph building & execution
     VL-INTEGRATION.md                  ← VL-specific patterns
+    VL-UX.md                           ← VL visual UX (Region, CudaFunction, FrameDelay)
     BLOCK-SYSTEM.md                    ← ICudaBlock, composition
     KERNEL-SOURCES.md                  ← Three sources, two node types, static + patchable
     PTX-LOADER.md                      ← PTX file parsing, kernel loading
@@ -171,6 +172,17 @@ src/
 | DispatcherNode as system-provided PTX | Built-in kernel reads GPU counter + calls `cudaGraphKernelNodeSetParam` — users don't write it |
 | DeviceLaunch flag for Phase 6 only | Normal graphs don't pay DeviceLaunch restrictions; opt-in when DispatcherNode is present |
 | ManagedCuda Device Graph APIs verified | All host-side APIs present (DeviceLaunch flag, cuGraphUpload, DeviceUpdatableKernelNode, ConditionalHandle). Device-side APIs are PTX intrinsics |
+| CudaGraph = VL Region | Not a standalone node — Region with ctx-in/ctx-out on every internal node (like VL.ImGui) |
+| Context threading pattern | First input = ctx, first output = ctx. Execution order follows context links |
+| DAG branching via PinGroup | Ctx input is a PinGroup (Ctrl+/Ctrl-). Buffer links create implicit dependencies |
+| CudaFunction: Definition + Invoke | Defined outside CudaGraph Region, invoked inside via Invoke node. Supports Inline (default) or SubGraph mode |
+| IF/WHILE = Sub-Regions (SubGraph) | CUDA conditional nodes require child graphs — always SubGraph, never Inline |
+| Upload/Download as Region-internal nodes | Compile to Memcpy graph nodes. Scalars go directly as kernel params (Hot Update) |
+| Buffer passing = explicit pins | Buffers flow through CudaFunction pins at every level. No implicit scope capture |
+| Workspace buffers invisible | CudaFunction internal buffers (cuBLAS workspace, cuFFT plan) managed by BufferPool, invisible to user |
+| FrameDelay = double buffer + pointer swap | Two GpuBuffers swapped each frame. Virtual node (no CUDA Graph node). Swap = Warm Update |
+| GridSize Auto | Default: derived from first buffer input length. Override via explicit pin. Error if no buffer and no explicit size |
+| Link-type via VL generics | `GpuBuffer<T>` is a generic type — VL type system enforces GPU/CPU separation automatically |
 
 ## Execution Model Summary
 

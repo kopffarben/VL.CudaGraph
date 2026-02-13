@@ -277,6 +277,23 @@ Key learnings:
 | 3.1h | CudaEngine auto-readback of append counts after launch | Done |
 | 3.1i | BlockDebugInfo.AppendCounts (Dictionary\<string, uint\>) | Done |
 
+### VL UX Architecture — COMPLETE (2026-02-13)
+
+Architecture design for the VL visual UX. See `docs/architecture/VL-UX.md` for the full specification.
+
+| Decision | Description |
+|----------|-------------|
+| CudaGraph = Region | VL Region with ctx-in/ctx-out threading (like VL.ImGui) |
+| DAG branching | PinGroup on ctx input + implicit buffer dependencies |
+| CudaFunction | Definition outside Region + Invoke inside, Inline/SubGraph mode |
+| IF/WHILE | Sub-Regions, always SubGraph (CUDA conditional = child graph) |
+| Upload/Download | Nodes inside Region → Memcpy graph nodes |
+| Buffer passing | Explicit pins at every level, no scope capture |
+| Workspace buffers | Invisible, BufferPool-managed |
+| FrameDelay | Double-buffer + pointer swap (virtual node, Warm Update) |
+| GridSize Auto | ceil(firstBuffer.Length / blockSize), override via pin |
+| Link-type | VL generics (`GpuBuffer<T>`) enforce GPU/CPU separation |
+
 ### Remaining Tasks (Phase 3.2+)
 
 | Task | Description | Depends On |
@@ -289,6 +306,11 @@ Key learnings:
 | 3.7 | Implement composite blocks | 3.4 |
 | 3.8 | Implement serialization | 3.7 |
 | 3.9 | Advanced tests | 3.8 |
+| 3.10 | CudaGraph Region (ctx threading, BCPs, Upload/Download nodes) | 3.2 |
+| 3.11 | CudaFunction (Definition + Invoke, Inline/SubGraph) | 3.10 |
+| 3.12 | FrameDelay (double-buffer + pointer swap) | 3.10 |
+| 3.13 | GridSize Auto resolution | 3.10 |
+| 3.14 | Implicit buffer dependency edges in GraphCompiler | 3.10 |
 
 ### Deliverables
 

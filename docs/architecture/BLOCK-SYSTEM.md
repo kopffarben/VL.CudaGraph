@@ -597,6 +597,40 @@ public class Level1Block : ICudaBlock
 
 ---
 
+## Context Threading & DAG Branching *(Architecture — see VL-UX.md)*
+
+Inside the CudaGraph Region, every block node follows the **context threading pattern**:
+
+- **First input pin**: context (PinGroup — execution ordering)
+- **First output pin**: context (single — signals completion)
+- **Remaining pins**: buffer I/O and scalar parameters
+
+### PinGroup on Context Input
+
+The context input is a `PinGroup` (`[Pin(PinGroupKind = PinGroupKind.Collection)]`). Users add/remove dependency pins with Ctrl+/Ctrl-. Default is one pin.
+
+```csharp
+[ProcessNode]
+public class CudaKernelNode
+{
+    [Pin(PinGroupKind = PinGroupKind.Collection)]
+    public IEnumerable<CudaContext> ContextInputs { get; }  // Multiple ctx-in
+
+    public CudaContext ContextOutput { get; }                // Single ctx-out
+    // ... buffer pins, scalar pins
+}
+```
+
+### Implicit Buffer Dependencies
+
+Buffer links create implicit execution dependencies. If KernelB reads KernelA's output `GpuBuffer<T>`, B automatically depends on A. The ctx PinGroup is only needed for non-data ordering (e.g., two independent memsets before a kernel).
+
+### Graph Compiler Resolution
+
+The GraphCompiler reads both ctx links and buffer links to build CUDA Graph dependency edges. See `VL-UX.md` for the full DAG branching design.
+
+---
+
 ## Best Practices
 
 1. **Keep blocks focused**: One block = one logical operation
@@ -607,3 +641,5 @@ public class Level1Block : ICudaBlock
 6. **Match VL patterns**: Fit with visual programming style
 7. **Constructor = Setup**: All description happens in the constructor
 8. **Always Dispose**: Unregister from CudaContext to trigger rebuild
+9. **Context threading**: First pin in = ctx, first pin out = ctx (inside CudaGraph Region)
+10. **Buffer links = implicit deps**: Don't require redundant ctx links for data-connected nodes

@@ -93,6 +93,15 @@ VL.Cuda.Core
   ├── Device
   │     DeviceContext
   │
+  ├── Region (Phase 3+ — planned, see VL-UX.md)
+  │     CudaGraphRegion
+  │     CudaFunction
+  │     CudaFunctionInvoke
+  │     UploadNode
+  │     DownloadNode
+  │     FrameDelayNode
+  │     GridSizeMode (Auto, Fixed)
+  │
   ├── Handles (Phase 3+)
   │     IHandle, IInputHandle, IOutputHandle
   │     InputHandle<T>, OutputHandle<T>

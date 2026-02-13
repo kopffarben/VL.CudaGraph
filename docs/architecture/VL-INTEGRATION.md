@@ -3,30 +3,36 @@
 ## Execution Model
 
 > **See `EXECUTION-MODEL.md` for the full execution model.**
+> **See `VL-UX.md` for the visual UX architecture** (Region design, CudaFunction, FrameDelay, DAG branching).
 > **See `KERNEL-SOURCES.md` for the three kernel sources (Filesystem PTX, Patchable Kernels, Library Calls).**
 > **See `../vl.reference/` for VL platform reference** (.vl file format, StandardLibs APIs, layout conventions).
 
-The key insight: Blocks are **passive** — they describe GPU work but never execute it. A single **CudaEngine** node compiles and launches the CUDA Graph each frame.
+The key insight: Blocks are **passive** — they describe GPU work but never execute it. A single **CudaEngine** (the CudaGraph Region boundary) compiles and launches the CUDA Graph each frame.
+
+### Region-Based Architecture
+
+The CudaGraph is a **VL Region** (like VL.ImGui). GPU nodes live inside the region, connected by context links (execution order) and buffer links (data flow). The CudaEngine sits at the region boundary.
 
 ```
 VL Patch:
 
-┌──────────────┐
-│  CudaEngine  │──── Context ──────────────────────┐
-│  (active)    │                                    │
-└──────────────┘                                    │
-                                                    │
-       ┌────────────────────────────────────────────┤
-       │              │              │              │
-       ▼              ▼              ▼              │
-┌──────────┐   ┌──────────┐  ┌──────────┐         │
-│ Emitter  │──▶│ Forces   │─▶│Integrate │         │
-│(passive) │   │(passive) │  │(passive) │         │
-│ ctx ◀────────│ ctx ◀───────│ ctx ◀────┘─────────┘
-└──────────┘   └──────────┘  └──────────┘
+┌─ CudaGraph Region ──────────────────────────────────────┐
+│                                                          │
+│  ctx in ──▶ [Emitter] ──▶ [Forces] ──▶ [Integrate] ──▶ ctx out
+│                                                          │
+│  BCP In: Spread<float> ──Upload──▶ GpuBuffer<float>    │
+│  BCP Out: GpuBuffer<float> ──Download──▶ Spread<float> │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
 ```
 
-The CudaContext flows from Engine to Blocks via VL pin connections. Blocks register themselves in their constructor and unregister on Dispose.
+Every node inside the region follows the context threading pattern:
+- **First input pin**: context (execution order)
+- **First output pin**: context (signals completion)
+
+Buffer links between nodes create **implicit dependencies** — if KernelB reads KernelA's output, B automatically runs after A without needing a ctx link.
+
+See `VL-UX.md` for the full Region design, DAG branching (PinGroup on ctx input), CudaFunction, FrameDelay, and GridSize Auto.
 
 ---
 
@@ -404,52 +410,42 @@ This is important for multi-machine installations where VL's clock can be set ex
 
 ---
 
-## Feedback Pattern
+## Feedback Pattern — FrameDelay
 
-For stateful operations (accumulation, simulation), VL uses explicit feedback:
+For stateful operations (accumulation, simulation), a **FrameDelay** node provides GPU-side persistence without CPU roundtrip. It uses double-buffering internally — two GpuBuffers swapped each frame.
 
-### FrameDelay Pattern
+> **See `VL-UX.md` for the full FrameDelay design.**
 
-```
-┌─────────────────────────────────────────────────────────────┐
-│                                                              │
-│   ┌────────────┐     ┌────────────┐     ┌────────────┐      │
-│   │FrameDelay  │     │  Simulate  │     │            │      │
-│   │            │     │            │     │            │      │
-│───┤ In    Out ─┼────▶┤ In    Out ─┼────▶┤            │      │
-│   └────────────┘     └────────────┘     │            │      │
-│         ▲                               │            │      │
-│         └───────────────────────────────┼────────────┘      │
-│                    feedback link        │                    │
-│                                         ▼                    │
-│                                    Output                    │
-└─────────────────────────────────────────────────────────────┘
-```
+### Mechanism
 
-### PingPong Pattern (Double Buffering)
+- Frame N: kernel writes buffer A, FrameDelay outputs buffer B (previous frame's result)
+- Frame N+1: kernel writes buffer B, FrameDelay outputs buffer A
+- **No copy** — only pointer swap between launches (Warm Update)
 
-For operations that read and write the same logical data:
-
-```csharp
-public class PingPongBlock : ICudaBlock
-{
-    private GpuBuffer<T> _bufferA;
-    private GpuBuffer<T> _bufferB;
-    private bool _ping;
-
-    public GpuBuffer<T> CurrentRead => _ping ? _bufferA : _bufferB;
-    public GpuBuffer<T> CurrentWrite => _ping ? _bufferB : _bufferA;
-
-    public void Swap() => _ping = !_ping;
-}
-```
+### VL View
 
 ```
-Frame 0: Read A, Write B
-Frame 1: Read B, Write A (swapped)
-Frame 2: Read A, Write B (swapped)
-...
+┌─ CudaGraph Region ─────────────────────────────────────┐
+│                                                          │
+│  ctx ──▶ [Forces] ──▶ [Integrate] ──▶ ctx out          │
+│              ▲              │                             │
+│              │              ▼                             │
+│          ┌──────────────────────┐                        │
+│          │     FrameDelay       │                        │
+│          │  In ◀──── Out ──────▶│  (previous frame)      │
+│          │  Init: Memset(0)     │                        │
+│          └──────────────────────┘                        │
+│                                                          │
+└──────────────────────────────────────────────────────────┘
 ```
+
+### Implementation
+
+FrameDelay is a **virtual node** — it generates no CUDA Graph node. The GraphCompiler:
+1. Allocates two buffers from BufferPool
+2. Binds the "read" buffer to dependent kernel params
+3. Swaps buffer pointers between graph launches (CudaEngine.Update)
+4. The swap triggers a Warm Update (`cuGraphExecKernelNodeSetParams`)
 
 ---
 
