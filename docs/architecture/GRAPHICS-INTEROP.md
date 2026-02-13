@@ -80,6 +80,20 @@ This allows VL nodes outside the CUDA system to safely hold references to GPU bu
 
 ---
 
+## Stride Source Reference
+
+The Stride 3D engine source is available as a read-only git submodule at `src/References/stride/`.
+Use it to understand Stride's DX11 resource management, rendering pipeline, and graphics device internals
+when implementing the interop layer. Key areas:
+
+- `sources/engine/Stride.Graphics/` — Graphics device, buffers, textures, resource management
+- `sources/engine/Stride.Rendering/` — Rendering pipeline, render features
+- `sources/engine/Stride.Games/` — Game loop, graphics device manager
+
+> **Do not modify** any file in `src/References/stride/` — it is an upstream repo.
+
+---
+
 ## Requirements
 
 ### Target Renderer

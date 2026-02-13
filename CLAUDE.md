@@ -126,6 +126,8 @@ src/
     VL.StandardLibs/                   ← VL.Core source (API reference)
     managedCuda/                       ← ManagedCuda source (API reference)
     ILGPU/                             ← ILGPU compiler source (API reference)
+    The-Gray-Book/                     ← VL documentation, design guidelines
+    stride/                            ← Stride 3D engine source (Graphics Interop reference)
 ```
 
 ## Key Design Decisions
@@ -217,11 +219,13 @@ src/References/
   managedCuda/         — ManagedCuda CUDA bindings (git submodule)
   ILGPU/               — ILGPU .NET GPU compiler (git submodule)
   The-Gray-Book/       — Official VL documentation, design guidelines, best practices (git submodule)
+  stride/              — Stride 3D engine source (git submodule, Graphics Interop API reference)
 ```
 
 **Purpose:** These submodules exist solely as API reference for development.
 Search the source code to understand how VL.Core APIs (NodeContext, AppHost,
-ResourceProvider, IVLRuntime, etc.) and ManagedCuda APIs actually work. The-Gray-Book
+ResourceProvider, IVLRuntime, etc.), ManagedCuda APIs, and Stride internals
+(DX11 interop, resource management, rendering pipeline) actually work. The-Gray-Book
 contains official VL design guidelines, naming conventions, and best practices.
 
 **Rules:**
