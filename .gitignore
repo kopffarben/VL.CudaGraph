@@ -9,6 +9,6 @@ bin/
 
 .vl/
 /lib/
-src/References/
+# src/References/
 /tools/vvvv_gamma*/
 /tools/*.zip
