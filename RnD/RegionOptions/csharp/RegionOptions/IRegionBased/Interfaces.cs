@@ -13,7 +13,7 @@ public interface LFOInterface
 
 public interface PureFunctionInterface
 {
-    void Update(bool Enable);
+    void Update();
 }
 
 public interface ForeachRegionInterface

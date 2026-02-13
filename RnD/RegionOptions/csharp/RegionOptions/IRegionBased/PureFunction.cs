@@ -76,7 +76,7 @@ public class PureFunctionInvoker : IDisposable
 public class PureFunction : IRegion<LFOInterface>
 {
     private NodeContext _nodeContext;
-    public Func<LFOInterface>? _patchInlayFactory;
+    internal Func<LFOInterface>? _patchInlayFactory;
 
     /// <summary>
     /// Initializes a new instance of the <see cref="PureFunction"/> class.
