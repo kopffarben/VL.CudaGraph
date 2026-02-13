@@ -24,4 +24,11 @@ public sealed class KernelParamDescriptor
     /// Whether this parameter is a pointer (buffer) vs a scalar value.
     /// </summary>
     public bool IsPointer { get; init; }
+
+    /// <summary>
+    /// Explicit size in bytes for this parameter slot. When 0, the size is
+    /// computed automatically (IntPtr.Size for pointers, type-based for scalars).
+    /// Used for ILGPU ArrayView struct params (16 bytes: pointer + length packed).
+    /// </summary>
+    public int SizeBytes { get; init; }
 }

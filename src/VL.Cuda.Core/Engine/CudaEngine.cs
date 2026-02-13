@@ -11,6 +11,7 @@ using VL.Cuda.Core.Context;
 using VL.Cuda.Core.Context.Services;
 using VL.Core.Import;
 using VL.Cuda.Core.Graph;
+using VL.Cuda.Core.PTX;
 
 namespace VL.Cuda.Core.Engine;
 
@@ -103,7 +104,7 @@ public sealed class CudaEngine : IDisposable
 
     /// <summary>
     /// Main frame update. Call once per frame.
-    /// Priority: Structure > Recapture > Parameters > Launch.
+    /// Priority: Structure > Code > Recapture > Parameters > Launch.
     /// </summary>
     public void Update()
     {
@@ -111,6 +112,13 @@ public sealed class CudaEngine : IDisposable
 
         if (Context.Dirty.IsStructureDirty)
         {
+            ColdRebuild();
+            Context.Dirty.ClearStructureDirty();
+        }
+        else if (Context.Dirty.IsCodeDirty)
+        {
+            CodeRebuild();
+            // CodeRebuild marks structure dirty, which triggers ColdRebuild
             ColdRebuild();
             Context.Dirty.ClearStructureDirty();
         }
@@ -291,6 +299,31 @@ public sealed class CudaEngine : IDisposable
     }
 
     /// <summary>
+    /// Code Rebuild: invalidate affected compiler caches and trigger a Cold Rebuild.
+    /// Called when kernel source code changes (ILGPU recompile or NVRTC recompile).
+    /// </summary>
+    private void CodeRebuild()
+    {
+        foreach (var entry in Context.Dirty.GetDirtyCodeEntries())
+        {
+            switch (entry.NewSource)
+            {
+                case PTX.KernelSource.IlgpuMethod ilgpu:
+                    Context.IlgpuCompiler.Invalidate(ilgpu.MethodHash);
+                    break;
+                case PTX.KernelSource.NvrtcSource nvrtc:
+                    Context.NvrtcCache.Invalidate(nvrtc.SourceHash);
+                    break;
+                case PTX.KernelSource.FilesystemPtx fs:
+                    Context.ModuleCache.Evict(fs.PtxPath);
+                    break;
+            }
+        }
+        Context.Dirty.ClearCodeDirty();
+        // Structure is now dirty → ColdRebuild will follow
+    }
+
+    /// <summary>
     /// Create KernelNodes and CapturedNodes from block description.
     /// </summary>
     private void BuildBlockNodes(GraphBuilder graphBuilder, ICudaBlock block)
@@ -303,12 +336,17 @@ public sealed class CudaEngine : IDisposable
         {
             if (_handleToNodeId.ContainsKey(entry.HandleId)) continue;
 
-            var loaded = Context.ModuleCache.GetOrLoad(entry.PtxPath);
+            var loaded = LoadKernelFromSource(entry);
             var kernelNode = graphBuilder.AddKernel(loaded, $"{block.TypeName}.{entry.EntryPoint}");
 
             kernelNode.GridDimX = entry.GridDimX;
             kernelNode.GridDimY = entry.GridDimY;
             kernelNode.GridDimZ = entry.GridDimZ;
+
+            // For ILGPU kernels, initialize the implicit kernel_length param
+            // and ArrayView struct length fields.
+            if (entry.Source is KernelSource.IlgpuMethod)
+                InitializeIlgpuParams(kernelNode, loaded.Descriptor);
 
             _ownedKernelNodes.Add(kernelNode);
             _handleToNodeId[entry.HandleId] = kernelNode.Id;
@@ -337,6 +375,22 @@ public sealed class CudaEngine : IDisposable
                 _paramMapping[(block.Id, param.Name)] = (nodeId, paramIndex);
             }
         }
+    }
+
+    /// <summary>
+    /// Load a kernel from its source type: filesystem PTX, ILGPU method, or NVRTC source.
+    /// </summary>
+    private LoadedKernel LoadKernelFromSource(Blocks.Builder.KernelEntry entry)
+    {
+        return entry.Source switch
+        {
+            KernelSource.FilesystemPtx fs => Context.ModuleCache.GetOrLoad(fs.PtxPath),
+            KernelSource.IlgpuMethod ilgpu => Context.IlgpuCompiler.GetOrCompile(
+                ilgpu.KernelMethod, entry.Descriptor!),
+            KernelSource.NvrtcSource nvrtc => Context.NvrtcCache.GetOrCompile(
+                nvrtc.CudaSource, nvrtc.EntryPoint, entry.Descriptor!),
+            _ => throw new InvalidOperationException($"Unknown KernelSource type: {entry.Source.GetType().Name}"),
+        };
     }
 
     /// <summary>
@@ -527,6 +581,32 @@ public sealed class CudaEngine : IDisposable
         foreach (var ab in _ownedAppendBuffers)
         {
             ab.ReadCount();
+        }
+    }
+
+    /// <summary>
+    /// Initialize ILGPU-specific kernel parameters:
+    /// - Param 0 (_kernel_length): set to GridDimX * BlockDimX (total element count)
+    /// - ArrayView struct params (SizeBytes=16): set length field to long.MaxValue
+    /// </summary>
+    private static void InitializeIlgpuParams(Graph.KernelNode node, KernelDescriptor descriptor)
+    {
+        for (int i = 0; i < descriptor.Parameters.Count; i++)
+        {
+            var param = descriptor.Parameters[i];
+
+            if (param.Name == "_kernel_length")
+            {
+                // Set kernel length to total thread count (Index1D upper bound)
+                var kernelLength = (int)(node.GridDimX * node.BlockDimX);
+                node.SetScalar(i, kernelLength);
+            }
+            else if (param.IsPointer && param.SizeBytes == 16)
+            {
+                // Initialize ArrayView struct: zero pointer, MaxValue length
+                // Pointer will be overwritten when external buffers are bound
+                node.SetArrayView(i, default, long.MaxValue);
+            }
         }
     }
 

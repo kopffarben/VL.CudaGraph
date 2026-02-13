@@ -54,9 +54,13 @@ public sealed class KernelNode : IGraphNode, IDisposable
 
         for (int i = 0; i < _paramCount; i++)
         {
-            // Each slot needs enough space for the largest possible param.
-            // Pointers (CUdeviceptr) are 8 bytes; scalars are at most 8 bytes (double/long).
-            int slotSize = desc.Parameters[i].IsPointer ? IntPtr.Size : GetScalarSize(desc.Parameters[i].Type);
+            // Each slot needs enough space for the parameter.
+            // Use explicit SizeBytes if set (e.g. 16 for ILGPU ArrayView structs),
+            // otherwise: pointers = IntPtr.Size, scalars = type-based.
+            var param = desc.Parameters[i];
+            int slotSize = param.SizeBytes > 0
+                ? param.SizeBytes
+                : (param.IsPointer ? IntPtr.Size : GetScalarSize(param.Type));
             _paramSlots[i] = Marshal.AllocHGlobal(slotSize);
 
             // Zero-initialize
@@ -76,6 +80,18 @@ public sealed class KernelNode : IGraphNode, IDisposable
         ValidateIndex(index);
         // CUdeviceptr.Pointer is a SizeT which wraps a ulong
         Marshal.WriteIntPtr(_paramSlots[index], new IntPtr((long)(ulong)ptr.Pointer));
+    }
+
+    /// <summary>
+    /// Set an ILGPU ArrayView struct parameter: writes the device pointer at offset 0
+    /// and the length at offset 8 in the 16-byte struct slot.
+    /// </summary>
+    public unsafe void SetArrayView(int index, CUdeviceptr ptr, long length)
+    {
+        ValidateIndex(index);
+        var slot = (byte*)_paramSlots[index];
+        *(long*)slot = (long)(ulong)ptr.Pointer;
+        *(long*)(slot + 8) = length;
     }
 
     /// <summary>

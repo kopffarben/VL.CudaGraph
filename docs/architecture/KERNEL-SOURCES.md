@@ -93,19 +93,26 @@ Graph:       Normal KernelNode — same as Filesystem PTX from here on
 
 **BlockBuilder usage:**
 ```csharp
-// Patchable kernels use the same AddKernel path,
-// but the PTX comes from ILGPU instead of a file.
-var kernel = builder.AddKernel(ilgpuModule, "user_kernel", debugName: "MatMulPatch");
-builder.Input<float>("A", kernel.In(0));
-builder.Input<float>("B", kernel.In(1));
-builder.Output<float>("C", kernel.Out(2));
+// Patchable kernel via ILGPU: pass the C# method + user-facing descriptor.
+// IlgpuCompiler auto-expands the descriptor for ILGPU's PTX layout.
+// KernelHandle.In()/Out() indices are auto-remapped (+1 for _kernel_length).
+var descriptor = new KernelDescriptor { EntryPoint = "user_kernel", BlockSize = 256 };
+descriptor.Parameters.Add(new KernelParamDescriptor { Name = "A", IsPointer = true, Direction = ParamDirection.In });
+descriptor.Parameters.Add(new KernelParamDescriptor { Name = "B", IsPointer = true, Direction = ParamDirection.In });
+descriptor.Parameters.Add(new KernelParamDescriptor { Name = "C", IsPointer = true, Direction = ParamDirection.Out });
+
+var kernel = builder.AddKernel(myKernelMethod, descriptor);
+kernel.GridDimX = 1024;
+builder.Input<float>("A", kernel.In(0));   // remapped to PTX param 1 (ArrayView struct)
+builder.Input<float>("B", kernel.In(1));   // remapped to PTX param 2
+builder.Output<float>("C", kernel.Out(2)); // remapped to PTX param 3
 ```
 
 **Update behavior:**
-- Hot/Warm: Same as Filesystem PTX — full parameter patchability
-- Code: User edits the node-set → ILGPU IR rebuild → new PTX → new CUmodule → Cold rebuild of affected block only (not the entire graph)
+- Hot/Warm: Same as Filesystem PTX -- full parameter patchability
+- Code: User edits the C# method or node-set -> `CudaContext.OnCodeChanged()` -> Code dirty -> IlgpuCompiler cache invalidated -> Cold Rebuild (full graph rebuild in current implementation)
 
-**Key constraint:** `cuGraphExecKernelNodeSetParams` cannot swap the `CUfunction` itself. A code change always requires a Cold rebuild of the block. However, all parameter updates remain Hot/Warm — only the kernel logic change triggers a rebuild.
+**Key constraint:** `cuGraphExecKernelNodeSetParams` cannot swap the `CUfunction` itself. A code change always requires a Cold rebuild. However, all parameter updates remain Hot/Warm -- only the kernel logic change triggers a rebuild. Partial rebuild (recompiling only the affected block) is a future optimization.
 
 ### Abstraction Level: Element-Wise (ShaderFX Model)
 
@@ -180,43 +187,173 @@ Constant(42)      →   CreatePrimitiveValue(location, 42)
 
 ### Escape-Hatch: NVRTC for User CUDA C++
 
-For users who want to load their own CUDA C++ code at runtime (not through the VL visual node-set), NVRTC remains available:
+For users who want to load their own CUDA C++ code at runtime (not through the VL visual node-set), NVRTC remains available via `BlockBuilder.AddKernelFromCuda()`:
 
 ```csharp
 // User-written CUDA C++ (not generated from VL nodes)
 string userCudaSource = File.ReadAllText("my_kernel.cu");
+var descriptor = new KernelDescriptor { EntryPoint = "my_kernel", BlockSize = 256, ... };
 
-var module = nvrtcCache.GetOrCompile(userCudaSource, "my_kernel", sm_75);
-var kernel = builder.AddKernel(module, "my_kernel");
+var kernel = builder.AddKernelFromCuda(userCudaSource, "my_kernel", descriptor);
+builder.Input<float>("A", kernel.In(0));
+builder.Output<float>("B", kernel.Out(1));
 ```
 
-This path uses `NvrtcCache` (CUDA C++ → PTX via `nvrtcCompileProgram()`).
+This path uses `NvrtcCache` (CUDA C++ -> PTX via `CudaRuntimeCompiler` -> `PtxLoader.LoadFromBytes()`). The compute architecture (`compute_XY`) is auto-derived from `DeviceContext`. Compilation errors include the NVRTC log for diagnostics.
 
 ### Compilation Caching
 
 Both ILGPU and NVRTC compilation results are cached:
 
 ```csharp
-internal class IlgpuCompiler
+internal sealed class IlgpuCompiler : IDisposable
 {
-    // Key: hash of IR description (node-set topology + types)
-    // Value: compiled PTX string + CUmodule
-    private ConcurrentDictionary<string, CachedModule> _cache;
+    // ILGPU Context + PTXBackend (no CUDA accelerator, pure compiler mode)
+    private readonly IlgpuContext _ilgpuContext;
+    private readonly PTXBackend _backend;
+    private readonly DeviceContext _device;
 
-    public CUmodule GetOrCompile(IKernelIRDescription irDesc, int targetSM);
-    public void Invalidate(string descriptionHash);
+    // Key: SHA256 hash of method (AssemblyQualifiedName.Name.MetadataToken)
+    // Value: LoadedKernel (CUmodule + expanded KernelDescriptor)
+    private ConcurrentDictionary<string, LoadedKernel> _cache;
+
+    public LoadedKernel GetOrCompile(MethodInfo kernelMethod, KernelDescriptor descriptor);
+    public bool Invalidate(string methodHash);
+    public int CacheCount { get; }
+
+    // Internal: compile to PTX string + entry point name
+    internal (string PtxString, string EntryPointName) CompileToStringWithName(MethodInfo method);
+
+    // Internal: expand descriptor for ILGPU PTX layout
+    // Param 0: implicit _kernel_length (int32, 4 bytes)
+    // Params 1..N: user params, ArrayView<T> → 16-byte struct {ptr, length}
+    internal static KernelDescriptor ExpandDescriptorForIlgpu(KernelDescriptor original, string entryPointName);
+
+    // Internal: compute index remap (user indices shift by 1 for _kernel_length)
+    internal static int[] ComputeIndexRemap(KernelDescriptor original);
+
+    // Internal: SHA256 hash from MethodInfo
+    internal static string ComputeMethodHash(MethodInfo method);
 }
 
-internal class NvrtcCache
+internal sealed class NvrtcCache : IDisposable
 {
-    // Key: hash of CUDA C++ source string
-    // Value: compiled CUmodule
-    private ConcurrentDictionary<string, CachedModule> _cache;
+    // Key: SHA256 hash of CUDA C++ source string
+    // Value: LoadedKernel (CUmodule + KernelDescriptor)
+    private ConcurrentDictionary<string, LoadedKernel> _cache;
 
-    public CUmodule GetOrCompile(string cudaSource, string entryPoint, int targetSM);
-    public void Invalidate(string sourceHash);
+    public LoadedKernel GetOrCompile(string cudaSource, string entryPoint, KernelDescriptor descriptor);
+    public bool Invalidate(string sourceHash);
+    public int CacheCount { get; }
+
+    // Internal: compile to PTX bytes via CudaRuntimeCompiler
+    internal byte[] CompileToBytes(string cudaSource, string entryPoint);
+    internal static string ComputeSourceKey(string source);
 }
 ```
+
+Both compilers produce a `LoadedKernel` via `PtxLoader.LoadFromBytes()` — the same path as filesystem PTX, just with bytes instead of a file path. Both are owned by `CudaContext` and share the pipeline lifetime.
+
+### KernelSource Discriminated Union
+
+All three kernel sources are represented by a discriminated union (`KernelSource`), stored in `KernelHandle.Source` and `KernelEntry.Source`:
+
+```csharp
+public abstract class KernelSource
+{
+    public abstract string GetCacheKey();    // stable key for deduplication
+    public abstract string GetDebugName();   // human-readable name for diagnostics
+
+    public sealed class FilesystemPtx : KernelSource
+    {
+        public string PtxPath { get; }
+        // GetCacheKey() → "file:{fullPath}"
+    }
+
+    public sealed class IlgpuMethod : KernelSource
+    {
+        public string MethodHash { get; }
+        public MethodInfo KernelMethod { get; }
+        // GetCacheKey() → "ilgpu:{methodHash}"
+    }
+
+    public sealed class NvrtcSource : KernelSource
+    {
+        public string SourceHash { get; }
+        public string CudaSource { get; }
+        public string EntryPoint { get; }
+        // GetCacheKey() → "nvrtc:{sourceHash}"
+    }
+}
+```
+
+`CudaEngine.LoadKernelFromSource()` dispatches on the variant to route to the correct loader:
+```csharp
+return entry.Source switch
+{
+    KernelSource.FilesystemPtx fs    => Context.ModuleCache.GetOrLoad(fs.PtxPath),
+    KernelSource.IlgpuMethod ilgpu   => Context.IlgpuCompiler.GetOrCompile(ilgpu.KernelMethod, entry.Descriptor!),
+    KernelSource.NvrtcSource nvrtc   => Context.NvrtcCache.GetOrCompile(nvrtc.CudaSource, nvrtc.EntryPoint, entry.Descriptor!),
+};
+```
+
+### ILGPU Parameter Layout
+
+ILGPU compiles implicitly-grouped kernels with a different parameter layout than filesystem PTX:
+
+```
+Param 0:  _kernel_length  (.b32, 4 bytes) — implicit total element count (Index1D upper bound)
+Param 1+: User parameters where each ArrayView<T> → 16-byte struct {void* ptr, long length}
+          Scalars remain their natural size (4/8 bytes)
+```
+
+`IlgpuCompiler.ExpandDescriptorForIlgpu()` transforms the user-provided descriptor to match this layout. `IlgpuCompiler.ComputeIndexRemap()` produces an index translation table so `KernelHandle.In()/Out()` transparently remaps user-facing indices to expanded PTX indices (all shift by +1 for the implicit `_kernel_length`).
+
+`CudaEngine.InitializeIlgpuParams()` sets the implicit parameters during ColdRebuild:
+- `_kernel_length` is set to `GridDimX * BlockDimX` (total thread count)
+- ArrayView structs get their length field set to `long.MaxValue` (pointers are overwritten by external buffer binding)
+
+### Code Dirty Level
+
+When a kernel's source code changes (e.g., user edits the C# method for an ILGPU kernel, or modifies a CUDA C++ string for NVRTC), the block calls `CudaContext.OnCodeChanged()`:
+
+```csharp
+// In CudaContext:
+public void OnCodeChanged(Guid blockId, Guid handleId, KernelSource newSource)
+{
+    Dirty.MarkCodeDirty(new DirtyCodeEntry(blockId, handleId, newSource));
+}
+
+// DirtyCodeEntry identifies which kernel changed and what the new source is:
+public readonly record struct DirtyCodeEntry(Guid BlockId, Guid KernelHandleId, KernelSource NewSource);
+```
+
+`CudaEngine.Update()` checks Code dirty after Structure but before CapturedNodes/Parameters:
+
+```
+Priority: Structure > Code > CapturedNodes > Parameters
+```
+
+`CudaEngine.CodeRebuild()` invalidates the affected compiler caches, then triggers a full ColdRebuild:
+
+```csharp
+private void CodeRebuild()
+{
+    foreach (var entry in Context.Dirty.GetDirtyCodeEntries())
+    {
+        switch (entry.NewSource)
+        {
+            case KernelSource.IlgpuMethod ilgpu:  Context.IlgpuCompiler.Invalidate(ilgpu.MethodHash); break;
+            case KernelSource.NvrtcSource nvrtc:   Context.NvrtcCache.Invalidate(nvrtc.SourceHash); break;
+            case KernelSource.FilesystemPtx fs:    Context.ModuleCache.Evict(fs.PtxPath); break;
+        }
+    }
+    Context.Dirty.ClearCodeDirty();
+    // Structure is now dirty → ColdRebuild will follow
+}
+```
+
+**Current behavior:** Code dirty always triggers a full Cold Rebuild. Partial rebuild (recompiling only the affected block while keeping the rest of the graph) is a future optimization.
 
 ---
 
@@ -486,15 +623,17 @@ Both node types (with both variants) live in the same block system and graph com
          │
          ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│  Dirty Tracking (DirtyTracker — three levels)                     │
+│  Dirty Tracking (DirtyTracker — four levels)                      │
 │                                                                   │
-│  Priority:     Structure > CapturedNodes > Parameters             │
+│  Priority:     Structure > Code > CapturedNodes > Parameters      │
 │                                                                   │
 │  KernelNode:    Hot → Warm → Code → Cold                          │
 │  CapturedNode:  Recapture → Cold                                  │
 │                                                                   │
+│  DirtyTracker.IsCodeDirty → CudaEngine.CodeRebuild()              │
+│    Invalidates compiler cache → marks structure dirty → ColdRebuild│
 │  DirtyTracker.AreCapturedNodesDirty → CudaEngine.RecaptureNodes() │
-│  Both managed by the same DirtyTracker, dispatched by             │
+│  All managed by the same DirtyTracker, dispatched by              │
 │  CudaEngine based on node type.                                   │
 └─────────────────────────────────────────────────────────────────┘
 ```

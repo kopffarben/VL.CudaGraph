@@ -155,6 +155,9 @@ src/
 | Three user levels | Consumer (use blocks), Composer (patch GPU nodes), Author (write PTX) |
 | Raw CUgraph handles for CapturedNode | ManagedCuda.CudaGraph(CUgraph) constructor is internal in NuGet — use raw handles via DriverAPINativeMethods |
 | Flat buffer binding indices | CapturedHandle.In/Out/Scalar return flat index into BufferBindings[]: [inputs..., outputs..., scalars...] |
+| ILGPU ArrayView as 16-byte struct | ArrayView<T> compiles to `.param .align 8 .b8[16]` (ptr+length packed), NOT separate params |
+| KernelSource discriminated union | FilesystemPtx / IlgpuMethod / NvrtcSource — clean dispatch in CudaEngine.LoadKernelFromSource |
+| Code dirty → Cold Rebuild | Simplest correct behavior; partial rebuild is future optimization |
 | LibraryHandleCache per CudaContext | Lazy-init expensive library handles (cuBLAS, cuFFT, etc.) — cached by config key for FFT plans |
 
 ## Execution Model Summary
@@ -175,12 +178,15 @@ CudaContext = facade over event-coupled services
     → BlockRegistry (fires StructureChanged) → DirtyTracker subscribes
     → ConnectionGraph (fires StructureChanged) → DirtyTracker subscribes
     → DirtyTracker, BufferPool, ModuleCache, DeviceContext
+    → IlgpuCompiler, NvrtcCache (owned, disposed with context)
 
 Update Levels (KernelNode — Filesystem PTX & Patchable Kernels):
     Hot    (scalar changed)         → cuGraphExecKernelNodeSetParams, ~0 cost
     Warm   (pointer/grid changed)   → cuGraphExecKernelNodeSetParams, cheap
-    Code   (ILGPU IR recompile)     → ~1-10ms → New CUmodule → Cold rebuild of affected block
+    Code   (ILGPU IR recompile)     → Invalidate cache → Cold Rebuild (full graph; partial is future optimization)
     Cold   (structure changed)      → Full graph rebuild, expensive but OK during development
+
+CudaEngine.Update() priority: Structure > Code > CapturedNodes > Parameters
 
 Update Levels (CapturedNode — Library Calls, static + patchable chained):
     Recapture (param changed)       → Recapture + cuGraphExecChildGraphNodeSetParams, medium

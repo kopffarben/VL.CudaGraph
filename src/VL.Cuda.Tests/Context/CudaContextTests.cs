@@ -116,7 +116,7 @@ public class CudaContextTests : IDisposable
     {
         var blockId = Guid.NewGuid();
         var desc = new VL.Cuda.Core.Blocks.Builder.BlockDescription(
-            new[] { new VL.Cuda.Core.Blocks.Builder.KernelEntry(Guid.NewGuid(), "test.ptx", "kernel1", 1, 1, 1) },
+            new[] { new VL.Cuda.Core.Blocks.Builder.KernelEntry(Guid.NewGuid(), new VL.Cuda.Core.PTX.KernelSource.FilesystemPtx("test.ptx"), "kernel1", 1, 1, 1) },
             new[] { ("In", PortDirection.Input, PinType.Buffer<float>()) },
             Array.Empty<(int, int, int, int)>());
 

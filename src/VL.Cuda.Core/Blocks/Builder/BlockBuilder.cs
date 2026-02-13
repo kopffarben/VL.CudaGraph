@@ -1,12 +1,14 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Reflection;
 using System.Runtime.InteropServices;
 using ManagedCuda.BasicTypes;
 using VL.Cuda.Core.Buffers;
 using VL.Cuda.Core.Context;
 using VL.Cuda.Core.Graph;
 using VL.Cuda.Core.PTX;
+using VL.Cuda.Core.PTX.Compilation;
 
 namespace VL.Cuda.Core.Blocks.Builder;
 
@@ -41,6 +43,41 @@ public sealed class BlockBuilder
         EnsureNotCommitted();
         var loaded = _context.ModuleCache.GetOrLoad(ptxPath);
         var handle = new KernelHandle(ptxPath, loaded.Descriptor);
+        _kernels.Add(handle);
+        return handle;
+    }
+
+    /// <summary>
+    /// Add a kernel from an ILGPU-compiled C# method. Returns a handle for binding ports.
+    /// The method must follow ILGPU kernel conventions (Index1D first parameter, etc.).
+    /// The user-provided descriptor is stored for recompilation; the In()/Out() indices
+    /// are auto-remapped to account for ILGPU's (pointer, length) parameter expansion.
+    /// </summary>
+    public KernelHandle AddKernel(MethodInfo kernelMethod, KernelDescriptor descriptor)
+    {
+        EnsureNotCommitted();
+        // Compile and load (IlgpuCompiler auto-expands the descriptor internally)
+        _context.IlgpuCompiler.GetOrCompile(kernelMethod, descriptor);
+        var methodHash = IlgpuCompiler.ComputeMethodHash(kernelMethod);
+        var source = new KernelSource.IlgpuMethod(methodHash, kernelMethod);
+        // Compute index remap: user-facing indices → expanded PTX indices
+        var indexRemap = IlgpuCompiler.ComputeIndexRemap(descriptor);
+        // Store the ORIGINAL descriptor (for recompilation in KernelEntry)
+        var handle = new KernelHandle(source, descriptor, indexRemap);
+        _kernels.Add(handle);
+        return handle;
+    }
+
+    /// <summary>
+    /// Add a kernel from CUDA C++ source compiled via NVRTC. Returns a handle for binding ports.
+    /// </summary>
+    public KernelHandle AddKernelFromCuda(string cudaSource, string entryPoint, KernelDescriptor descriptor)
+    {
+        EnsureNotCommitted();
+        var loaded = _context.NvrtcCache.GetOrCompile(cudaSource, entryPoint, descriptor);
+        var sourceHash = NvrtcCache.ComputeSourceKey(cudaSource);
+        var source = new KernelSource.NvrtcSource(sourceHash, cudaSource, entryPoint);
+        var handle = new KernelHandle(source, loaded.Descriptor);
         _kernels.Add(handle);
         return handle;
     }
@@ -232,10 +269,13 @@ public sealed class BlockBuilder
 
     private BlockDescription BuildDescription()
     {
-        // Build kernel entries with HandleId and grid dims
+        // Build kernel entries with HandleId and grid dims.
+        // Store the descriptor for non-filesystem sources (ILGPU/NVRTC) so
+        // CudaEngine can recompile on cache invalidation.
         var kernelEntries = _kernels.Select(k => new KernelEntry(
-            k.Id, k.PtxPath, k.Descriptor.EntryPoint,
-            k.GridDimX, k.GridDimY, k.GridDimZ)).ToList();
+            k.Id, k.Source, k.Descriptor.EntryPoint,
+            k.GridDimX, k.GridDimY, k.GridDimZ,
+            k.Source is KernelSource.FilesystemPtx ? null : k.Descriptor)).ToList();
 
         // Build captured entries
         var capturedEntries = _capturedHandles.Select(c => new CapturedEntry(

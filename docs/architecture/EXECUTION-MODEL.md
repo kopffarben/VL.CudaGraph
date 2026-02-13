@@ -87,10 +87,11 @@ Called every frame:
     cudaEngine.Update()
         │
         ├── 1. IsStructureDirty → ColdRebuild → ClearStructureDirty
-        ├── 2. Else AreCapturedNodesDirty → RecaptureNodes → ClearCapturedNodesDirty
-        ├── 3. Else AreParametersDirty → UpdateParameters → ClearParametersDirty
-        ├── 4. If compiled graph exists: Launch + Synchronize
-        └── 5. Distribute DebugInfo to all blocks (BlockState + LastExecutionTime)
+        ├── 2. Else IsCodeDirty → CodeRebuild (invalidate caches) → ColdRebuild → ClearStructureDirty
+        ├── 3. Else AreCapturedNodesDirty → RecaptureNodes → ClearCapturedNodesDirty
+        ├── 4. Else AreParametersDirty → UpdateParameters → ClearParametersDirty
+        ├── 5. If compiled graph exists: Launch + Synchronize
+        └── 6. Distribute DebugInfo to all blocks (BlockState + LastExecutionTime)
 
 Dispose:
     → Disposes CompiledGraph, owned KernelNodes, stream, CudaContext
@@ -169,9 +170,11 @@ VL compiles .vl files on-the-fly to C# and supports Hot-Swap: when the user edit
 
 Structural changes (Cold Rebuild) happen during development only. During runtime of an exported application, only Hot Updates and Warm Updates occur. The graph rebuild may take several milliseconds, which is acceptable during interactive development.
 
+Code changes (Code Rebuild) also happen during development only -- when the user edits a patchable kernel's C# method (ILGPU) or CUDA C++ source (NVRTC). The Code Rebuild invalidates the affected compiler cache and triggers a full Cold Rebuild. ILGPU recompilation adds ~1-10ms; NVRTC adds ~100ms-2s. Partial rebuild (recompiling only the affected block) is a future optimization.
+
 ### Dirty Flags
 
-**Current implementation (Phase 2 + Phase 4a):**
+**Current implementation (Phase 2 + Phase 4a + Phase 4b):**
 
 ```csharp
 // CudaContext is a facade — dirty state lives in DirtyTracker
@@ -181,6 +184,8 @@ class CudaContext
     public DirtyTracker Dirty { get; }
     public BlockRegistry Registry { get; }
     public ConnectionGraph Connections { get; }
+    internal IlgpuCompiler IlgpuCompiler { get; }
+    internal NvrtcCache NvrtcCache { get; }
 
     // --- Facade methods that trigger structure dirty ---
     // Delegate to Registry/ConnectionGraph, which fire StructureChanged → DirtyTracker subscribes
@@ -194,35 +199,44 @@ class CudaContext
 
     // --- CapturedNode dirty (called when a captured node's parameters change) ---
     public void OnCapturedNodeChanged(Guid blockId, Guid capturedHandleId);
+
+    // --- Code dirty (called when kernel source code changes — ILGPU/NVRTC/PTX) ---
+    public void OnCodeChanged(Guid blockId, Guid handleId, KernelSource newSource);
 }
 
 // DirtyTracker (subscribes to Registry + ConnectionGraph events)
 class DirtyTracker
 {
     public bool IsStructureDirty { get; }        // starts true → first build
+    public bool IsCodeDirty { get; }             // true if any kernels need recompilation
     public bool AreCapturedNodesDirty { get; }   // true if any captured nodes need recapture
     public bool AreParametersDirty { get; }      // true if any dirty params
 
     public void Subscribe(BlockRegistry registry, ConnectionGraph connectionGraph);
     public void MarkParameterDirty(DirtyParameter param);
     public void MarkCapturedNodeDirty(DirtyCapturedNode node);
+    public void MarkCodeDirty(DirtyCodeEntry entry);
     public IReadOnlySet<DirtyParameter> GetDirtyParameters();
     public IReadOnlySet<DirtyCapturedNode> GetDirtyCapturedNodes();
-    public void ClearStructureDirty();       // also clears params + captured (rebuild applies all)
+    public IReadOnlySet<DirtyCodeEntry> GetDirtyCodeEntries();
+    public void ClearStructureDirty();       // also clears code + params + captured (rebuild applies all)
+    public void ClearCodeDirty();            // clears code entries only
     public void ClearParametersDirty();
     public void ClearCapturedNodesDirty();
 }
 
 // Identifies a captured node needing recapture
 public readonly record struct DirtyCapturedNode(Guid BlockId, Guid CapturedHandleId);
+
+// Identifies a kernel whose source code changed
+public readonly record struct DirtyCodeEntry(Guid BlockId, Guid KernelHandleId, KernelSource NewSource);
 ```
 
-The DirtyTracker now tracks **three levels** of dirty state with strict priority ordering: **Structure > CapturedNodes > Parameters**. `ClearStructureDirty()` clears all three levels since a Cold Rebuild applies all current values. `ClearCapturedNodesDirty()` only clears the recapture set. This ensures that a recapture update does not mask pending parameter changes, and vice versa.
+The DirtyTracker tracks **four levels** of dirty state with strict priority ordering: **Structure > Code > CapturedNodes > Parameters**. `ClearStructureDirty()` clears all four levels since a Cold Rebuild applies all current values. `ClearCodeDirty()` clears only the code entries. `ClearCapturedNodesDirty()` only clears the recapture set. This ensures that a recapture update does not mask pending parameter changes, and vice versa.
 
 `CudaContext.OnCapturedNodeChanged()` routes to `DirtyTracker.MarkCapturedNodeDirty()` with a `DirtyCapturedNode` record struct that identifies both the block and the specific captured handle that needs recapture.
 
-**Planned additions (Phase 4b):**
-- `IsCodeDirty` / `MarkCodeDirty(Guid blockId)` — patchable kernel recompile tracking
+`CudaContext.OnCodeChanged()` routes to `DirtyTracker.MarkCodeDirty()` with a `DirtyCodeEntry` record struct that identifies the block, the kernel handle, and the new `KernelSource` (used by `CudaEngine.CodeRebuild()` to invalidate the correct compiler cache).
 
 ### Block Structure Change Detection
 
@@ -251,16 +265,23 @@ class BlockBuilder
 
 ### Execution Flow Per Frame
 
-**Current implementation (Phase 2 + Phase 4a):**
+**Current implementation (Phase 2 + Phase 4a + Phase 4b):**
 
 ```csharp
 class CudaEngine
 {
     public void Update()
     {
-        // Priority: Structure > CapturedNodes > Parameters > Launch
+        // Priority: Structure > Code > CapturedNodes > Parameters > Launch
         if (Context.Dirty.IsStructureDirty)
         {
+            ColdRebuild();
+            Context.Dirty.ClearStructureDirty();
+        }
+        else if (Context.Dirty.IsCodeDirty)
+        {
+            CodeRebuild();
+            // CodeRebuild invalidates caches, then ColdRebuild recompiles from new source
             ColdRebuild();
             Context.Dirty.ClearStructureDirty();
         }
@@ -282,6 +303,23 @@ class CudaEngine
             ReadbackAppendCounters();
             DistributeDebugInfo(BlockState.OK);
         }
+    }
+
+    private void CodeRebuild()
+    {
+        // Invalidate affected compiler caches based on the KernelSource variant
+        foreach (var entry in Context.Dirty.GetDirtyCodeEntries())
+        {
+            switch (entry.NewSource)
+            {
+                case KernelSource.IlgpuMethod ilgpu:  Context.IlgpuCompiler.Invalidate(ilgpu.MethodHash); break;
+                case KernelSource.NvrtcSource nvrtc:   Context.NvrtcCache.Invalidate(nvrtc.SourceHash); break;
+                case KernelSource.FilesystemPtx fs:    Context.ModuleCache.Evict(fs.PtxPath); break;
+            }
+        }
+        Context.Dirty.ClearCodeDirty();
+        // ColdRebuild will follow — it reloads kernels via LoadKernelFromSource()
+        // which re-compiles from the new source (cache was just invalidated)
     }
 
     private void RecaptureNodes()
@@ -324,8 +362,7 @@ class CudaEngine
 }
 ```
 
-**Planned additions (Phase 4b+):**
-- `CodeRebuild()` — ILGPU IR recompile → targeted Cold rebuild (Phase 4b)
+**Planned additions (Phase 5+):**
 - `ProfilingPipeline.OnPostLaunch()` — async GPU event readback (Phase 3+)
 - `ReportDiagnostics()` — IVLRuntime integration (Phase 3+)
 

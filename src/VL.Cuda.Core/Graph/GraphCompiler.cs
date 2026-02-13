@@ -286,6 +286,8 @@ public sealed class GraphCompiler
 
     /// <summary>
     /// Wire buffer pointers into kernel node parameters.
+    /// For ILGPU ArrayView struct params (SizeBytes=16), uses SetArrayView
+    /// to write both pointer and length into the 16-byte struct slot.
     /// </summary>
     private void WireParameters(
         GraphDescription desc,
@@ -297,7 +299,7 @@ public sealed class GraphCompiler
         {
             var (nodeId, paramIndex) = kvp.Key;
             if (nodeMap.TryGetValue(nodeId, out var node))
-                node.SetPointer(paramIndex, kvp.Value);
+                SetBufferOnNode(node, paramIndex, kvp.Value);
         }
 
         // Then, wire edge buffers
@@ -307,13 +309,26 @@ public sealed class GraphCompiler
             if (edgeBuffers.TryGetValue(key, out var ptr))
             {
                 if (!desc.ExternalBuffers.ContainsKey(key))
-                    nodeMap[edge.SourceNodeId].SetPointer(edge.SourceParamIndex, ptr);
+                    SetBufferOnNode(nodeMap[edge.SourceNodeId], edge.SourceParamIndex, ptr);
 
                 var targetKey = (edge.TargetNodeId, edge.TargetParamIndex);
                 if (!desc.ExternalBuffers.ContainsKey(targetKey))
-                    nodeMap[edge.TargetNodeId].SetPointer(edge.TargetParamIndex, ptr);
+                    SetBufferOnNode(nodeMap[edge.TargetNodeId], edge.TargetParamIndex, ptr);
             }
         }
+    }
+
+    /// <summary>
+    /// Set a buffer pointer on a kernel node, handling both plain pointer params
+    /// and ILGPU ArrayView struct params (SizeBytes=16).
+    /// </summary>
+    private static void SetBufferOnNode(KernelNode node, int paramIndex, CUdeviceptr ptr)
+    {
+        var param = node.LoadedKernel.Descriptor.Parameters[paramIndex];
+        if (param.SizeBytes == 16)
+            node.SetArrayView(paramIndex, ptr, long.MaxValue);
+        else
+            node.SetPointer(paramIndex, ptr);
     }
 
     private static int GetElementSize(string typeStr)

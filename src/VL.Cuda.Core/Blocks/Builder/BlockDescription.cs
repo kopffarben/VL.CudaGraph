@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Linq;
 using ManagedCuda.BasicTypes;
 using VL.Cuda.Core.Graph;
+using VL.Cuda.Core.PTX;
 
 namespace VL.Cuda.Core.Blocks.Builder;
 
@@ -14,31 +15,40 @@ namespace VL.Cuda.Core.Blocks.Builder;
 public sealed class KernelEntry
 {
     public Guid HandleId { get; }
-    public string PtxPath { get; }
+    public KernelSource Source { get; }
     public string EntryPoint { get; }
     public uint GridDimX { get; }
     public uint GridDimY { get; }
     public uint GridDimZ { get; }
 
-    public KernelEntry(Guid handleId, string ptxPath, string entryPoint,
-        uint gridDimX, uint gridDimY, uint gridDimZ)
+    /// <summary>
+    /// The user-provided kernel descriptor. For filesystem PTX this is null
+    /// (the descriptor comes from the JSON sidecar). For ILGPU/NVRTC this
+    /// stores the descriptor so CudaEngine can recompile on cache miss.
+    /// </summary>
+    public KernelDescriptor? Descriptor { get; }
+
+    public KernelEntry(Guid handleId, KernelSource source, string entryPoint,
+        uint gridDimX, uint gridDimY, uint gridDimZ,
+        KernelDescriptor? descriptor = null)
     {
         HandleId = handleId;
-        PtxPath = ptxPath;
+        Source = source;
         EntryPoint = entryPoint;
         GridDimX = gridDimX;
         GridDimY = gridDimY;
         GridDimZ = gridDimZ;
+        Descriptor = descriptor;
     }
 
     /// <summary>
     /// Structural equality ignores HandleId (changes every construction).
-    /// Compares PTX path, entry point, and grid dimensions.
+    /// Compares source cache key, entry point, and grid dimensions.
     /// </summary>
     public bool StructuralEquals(KernelEntry? other)
     {
         if (other is null) return false;
-        return PtxPath == other.PtxPath &&
+        return Source.GetCacheKey() == other.Source.GetCacheKey() &&
                EntryPoint == other.EntryPoint &&
                GridDimX == other.GridDimX &&
                GridDimY == other.GridDimY &&

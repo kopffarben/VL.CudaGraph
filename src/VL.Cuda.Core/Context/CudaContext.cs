@@ -8,12 +8,13 @@ using VL.Cuda.Core.Context.Services;
 using VL.Cuda.Core.Device;
 using VL.Cuda.Core.Libraries;
 using VL.Cuda.Core.PTX;
+using VL.Cuda.Core.PTX.Compilation;
 
 namespace VL.Cuda.Core.Context;
 
 /// <summary>
 /// Facade over all CUDA pipeline services. Owns DeviceContext, BufferPool,
-/// ModuleCache, BlockRegistry, ConnectionGraph, DirtyTracker.
+/// ModuleCache, BlockRegistry, ConnectionGraph, DirtyTracker, IlgpuCompiler, NvrtcCache.
 /// Created and owned by CudaEngine.
 /// </summary>
 public sealed class CudaContext : IDisposable
@@ -29,6 +30,8 @@ public sealed class CudaContext : IDisposable
     public ConnectionGraph Connections { get; }
     public DirtyTracker Dirty { get; }
     public LibraryHandleCache Libraries { get; }
+    internal IlgpuCompiler IlgpuCompiler { get; }
+    internal NvrtcCache NvrtcCache { get; }
 
     public CudaContext(CudaEngineOptions options)
     {
@@ -39,6 +42,8 @@ public sealed class CudaContext : IDisposable
         Connections = new ConnectionGraph();
         Dirty = new DirtyTracker();
         Libraries = new LibraryHandleCache();
+        IlgpuCompiler = new IlgpuCompiler(Device);
+        NvrtcCache = new NvrtcCache(Device);
 
         Dirty.Subscribe(Registry, Connections);
     }
@@ -55,6 +60,8 @@ public sealed class CudaContext : IDisposable
         Connections = new ConnectionGraph();
         Dirty = new DirtyTracker();
         Libraries = new LibraryHandleCache();
+        IlgpuCompiler = new IlgpuCompiler(Device);
+        NvrtcCache = new NvrtcCache(Device);
 
         Dirty.Subscribe(Registry, Connections);
     }
@@ -84,7 +91,7 @@ public sealed class CudaContext : IDisposable
     }
 
     /// <summary>
-    /// Called by BlockParameter.ValueChanged → BlockBuilder wiring.
+    /// Called by BlockParameter.ValueChanged -> BlockBuilder wiring.
     /// Marks the parameter dirty for Hot/Warm Update.
     /// </summary>
     public void OnParameterChanged(Guid blockId, string paramName)
@@ -98,6 +105,15 @@ public sealed class CudaContext : IDisposable
     public void OnCapturedNodeChanged(Guid blockId, Guid capturedHandleId)
     {
         Dirty.MarkCapturedNodeDirty(new DirtyCapturedNode(blockId, capturedHandleId));
+    }
+
+    /// <summary>
+    /// Called when a kernel's source code changes and needs recompilation.
+    /// Triggers Code Rebuild -> Cold Rebuild in CudaEngine.
+    /// </summary>
+    public void OnCodeChanged(Guid blockId, Guid handleId, KernelSource newSource)
+    {
+        Dirty.MarkCodeDirty(new DirtyCodeEntry(blockId, handleId, newSource));
     }
 
     /// <summary>
@@ -139,6 +155,8 @@ public sealed class CudaContext : IDisposable
         _disposed = true;
 
         Libraries.Dispose();
+        IlgpuCompiler.Dispose();
+        NvrtcCache.Dispose();
         Pool.Dispose();
         ModuleCache.Dispose();
         Device.Dispose();
